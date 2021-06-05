@@ -7,16 +7,17 @@ import re
 import numpy as np
 import pylab as plt
 
+
 def hash(x):
     if isinstance(x, int):
         return x
     return x.__hash__()
 
+
 hash_map = {Repository.Repository: lambda x: hash(x.name),
             Issue.Issue: lambda x: hash(x.number),
             NamedUser.NamedUser: lambda x: hash(x.login),
             Label.Label: lambda x: hash(x.name)}
-
 
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
@@ -25,12 +26,13 @@ def get_issues(repo):
               for issue in repo.get_issues(state='all')]
     return issues
 
+
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def search_issues(repo, labels, assignees):
     issues = {}
     for assignee in assignees:
         for label in labels:
-            _issues = repo.get_issues(state='all',labels=[label],assignee=assignee)
+            _issues = repo.get_issues(state='all', labels=[label], assignee=assignee)
             for issue in _issues:
                 if issue.number not in issues:
                     issues[issue.number] = issue
@@ -76,14 +78,15 @@ def label_in_labels(label, labels):
 def render_data():
     _refresh = 0
 
-
     if st.sidebar.button("Refresh GitHub Data"):
         caching.clear_cache()
 
-    token = st.sidebar.text_input("Github token: ")
+    token = st.sidebar.text_input("Github token: ", help="A github token giving you read access to the repo.")
+
+    repo_name = st.sidebar.text_input("Repo :", 'Touch-Physio/Touch-Meta', help="Repo in format `owner/repo`")
 
     g = Github(token)
-    repo = g.get_repo('Touch-Physio/Touch-Meta')
+    repo = g.get_repo(repo_name)
 
     epic_regex = st.sidebar.text_input("Epic Regex (use <title> for title placeholder):", "EP - <title>")
     epic_regex = epic_regex.replace("<title>", "(.+?)")
@@ -175,15 +178,16 @@ def render_report(repo, epic_regex, storypoint_regex):
                                    label=label)
                 if closed:
                     if label_color_described['closed']:
-                        ax.scatter(closed_at, position+0.5,marker='o', c='black', s=50)
+                        ax.scatter(closed_at, position + 0.5, marker='o', c='black', s=50)
                     else:
                         label_color_described['closed'] = True
-                        ax.scatter(closed_at, position+0.5,marker='o', c='black', s=50, label='Closed')
+                        ax.scatter(closed_at, position + 0.5, marker='o', c='black', s=50, label='Closed')
         ax.legend(loc='lower left')
         ax.set_xlim(report_start_date, report_end_date)
         ax.set_yticks(np.arange(len(issues_to_report)) + 0.5)
         ax.set_yticklabels(
             [f"#{id}-{story_points(issues_to_report[id], storypoint_regex)}SP" for id in issues_to_report], rotation=0)
-        ax.set_title(f"Story board for {', '.join([user.login for user in users_to_report])}\n({', '.join([lab.name for lab in epics_to_report])})")
+        ax.set_title(
+            f"Story board for {', '.join([user.login for user in users_to_report])}\n({', '.join([lab.name for lab in epics_to_report])})")
         plt.tight_layout()
         st.write(fig)
