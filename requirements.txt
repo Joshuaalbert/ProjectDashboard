@@ -1,0 +1,7 @@
+streamlit
+graphviz
+matplotlib
+scipy
+numpy
+networkx
+PyGithub

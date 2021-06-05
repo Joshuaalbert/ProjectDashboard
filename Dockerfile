@@ -1,6 +1,6 @@
 FROM continuumio/miniconda3
 
-RUN apt-get update && apt-get install -y graphviz wget
+RUN apt-get update && apt-get install -y graphviz
 
 
 
@@ -11,7 +11,7 @@ SHELL ["/bin/bash", "--login", "-c"]
 RUN conda init bash
 RUN echo "conda activate app_env" > ~/.bashrc
 
-RUN pip install streamlit graphviz matplotlib scipy numpy networkx PyGithub
+RUN pip install -r requirements.txt
 
 
 
