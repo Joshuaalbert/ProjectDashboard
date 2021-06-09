@@ -17,7 +17,8 @@ def hash(x):
 hash_map = {Repository.Repository: lambda x: hash(x.name),
             Issue.Issue: lambda x: hash(x.number),
             NamedUser.NamedUser: lambda x: hash(x.login),
-            Label.Label: lambda x: hash(x.name)}
+            Label.Label: lambda x: hash(x.name),
+            datetime.datetime: lambda x: hash(x.timestamp())}
 
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
@@ -85,19 +86,17 @@ def render_data():
 
     repo_name = st.sidebar.text_input("Repo :", 'Touch-Physio/Touch-Meta', help="Repo in format `owner/repo`")
 
-    try:
-        g = Github(token)
-        repo = g.get_repo(repo_name)
 
-        epic_regex = st.sidebar.text_input("Epic Regex (use <title> for title placeholder):", "EP - <title>")
-        epic_regex = epic_regex.replace("<title>", "(.+?)")
+    g = Github(token)
+    repo = g.get_repo(repo_name)
 
-        storypoint_regex = st.sidebar.text_input("Story Point Regex (use <value> for value placeholder):", "<value>SPs")
-        storypoint_regex = storypoint_regex.replace("<value>", "(.+?)")
+    epic_regex = st.sidebar.text_input("Epic Regex (use <title> for title placeholder):", "EP - <title>")
+    epic_regex = epic_regex.replace("<title>", "(.+?)")
 
-        render_report(repo, epic_regex, storypoint_regex)
-    except:
-        st.write(f"Token: {token} is invalid.")
+    storypoint_regex = st.sidebar.text_input("Story Point Regex (use <value> for value placeholder):", "<value>SPs")
+    storypoint_regex = storypoint_regex.replace("<value>", "(.+?)")
+
+    render_report(repo, epic_regex, storypoint_regex)
 
 
 def render_report(repo, epic_regex, storypoint_regex):
