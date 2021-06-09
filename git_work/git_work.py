@@ -133,61 +133,62 @@ def render_report(repo, epic_regex, storypoint_regex):
                                             max_value=datetime.datetime.now())
     report_end_date = datetime.datetime(year=report_end_date.year, month=report_end_date.month, day=report_end_date.day)
     if st.sidebar.button("Report") and (len(users_to_report) > 0) and (len(epics_to_report) > 0):
-        issues_to_report = search_issues(repo, epics_to_report, users_to_report)
+        for user in users_to_report:
+            issues_to_report = search_issues(repo, epics_to_report, [user])
 
-        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        # nodes
-        label_color_described = {label: False for label in tracking_label_names}
-        label_color_described['closed'] = False
-        for position, issue_number in enumerate(issues_to_report):
-            closed = issues_to_report[issue_number].state == 'closed'
-            if closed:
-                closed_at = issues_to_report[issue_number].closed_at
-            events = get_events(issues_to_report[issue_number])
-            # for each tracking label get the sequence of label and unlabels
-            event_log = {label: [] for label in tracking_label_names}
-            for event in events:
-                if (event.event == 'labeled') or (event.event == 'unlabeled'):
-                    if event.label.name in tracking_label_names:
-                        if closed:
-                            # event_log[event.label.name].append(min([event.created_at, closed_at]))
-                            event_log[event.label.name].append(event.created_at)
-                        else:
-                            event_log[event.label.name].append(event.created_at)
-            for label in tracking_label_names:
-                xranges = []
-                if (len(event_log[label]) % 2 == 1):
-                    # give end of block date (not real unlabeling)
-                    event_log[label].append(report_end_date)
-                for block_idx in range(0, len(event_log[label]), 2):
-                    if event_log[label][block_idx + 1] > report_end_date:
-                        continue
-                    if event_log[label][block_idx + 1] < report_start_date:
-                        continue
-                    if closed:
-                        event_log[label][block_idx + 1] = min([event_log[label][block_idx + 1], closed_at])
-                        pass
-                    xranges.append(
-                        (event_log[label][block_idx], event_log[label][block_idx + 1] - event_log[label][block_idx]))
-                yrange = (position, 1)
-                if label_color_described[label]:
-                    ax.broken_barh(xranges, yrange, color=f"#{color_map[label]}", edgecolor='black', alpha=1.)
-                else:
-                    label_color_described[label] = True
-                    ax.broken_barh(xranges, yrange, color=f"#{color_map[label]}", edgecolor='black', alpha=1.,
-                                   label=label)
+            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+            # nodes
+            label_color_described = {label: False for label in tracking_label_names}
+            label_color_described['closed'] = False
+            for position, issue_number in enumerate(issues_to_report):
+                closed = issues_to_report[issue_number].state == 'closed'
                 if closed:
-                    if label_color_described['closed']:
-                        ax.scatter(closed_at, position + 0.5, marker='o', c='black', s=50)
+                    closed_at = issues_to_report[issue_number].closed_at
+                events = get_events(issues_to_report[issue_number])
+                # for each tracking label get the sequence of label and unlabels
+                event_log = {label: [] for label in tracking_label_names}
+                for event in events:
+                    if (event.event == 'labeled') or (event.event == 'unlabeled'):
+                        if event.label.name in tracking_label_names:
+                            if closed:
+                                # event_log[event.label.name].append(min([event.created_at, closed_at]))
+                                event_log[event.label.name].append(event.created_at)
+                            else:
+                                event_log[event.label.name].append(event.created_at)
+                for label in tracking_label_names:
+                    xranges = []
+                    if (len(event_log[label]) % 2 == 1):
+                        # give end of block date (not real unlabeling)
+                        event_log[label].append(report_end_date)
+                    for block_idx in range(0, len(event_log[label]), 2):
+                        if event_log[label][block_idx + 1] > report_end_date:
+                            continue
+                        if event_log[label][block_idx + 1] < report_start_date:
+                            continue
+                        if closed:
+                            event_log[label][block_idx + 1] = min([event_log[label][block_idx + 1], closed_at])
+                            pass
+                        xranges.append(
+                            (event_log[label][block_idx], event_log[label][block_idx + 1] - event_log[label][block_idx]))
+                    yrange = (position, 1)
+                    if label_color_described[label]:
+                        ax.broken_barh(xranges, yrange, color=f"#{color_map[label]}", edgecolor='black', alpha=1.)
                     else:
-                        label_color_described['closed'] = True
-                        ax.scatter(closed_at, position + 0.5, marker='o', c='black', s=50, label='Closed')
-        ax.legend(loc='lower left')
-        ax.set_xlim(report_start_date, report_end_date)
-        ax.set_yticks(np.arange(len(issues_to_report)) + 0.5)
-        ax.set_yticklabels(
-            [f"#{id}-{story_points(issues_to_report[id], storypoint_regex)}SP" for id in issues_to_report], rotation=0)
-        ax.set_title(
-            f"Story board for {', '.join([user.login for user in users_to_report])}\n({', '.join([lab.name for lab in epics_to_report])})")
-        plt.tight_layout()
-        st.write(fig)
+                        label_color_described[label] = True
+                        ax.broken_barh(xranges, yrange, color=f"#{color_map[label]}", edgecolor='black', alpha=1.,
+                                       label=label)
+                    if closed:
+                        if label_color_described['closed']:
+                            ax.scatter(closed_at, position + 0.5, marker='o', c='black', s=50)
+                        else:
+                            label_color_described['closed'] = True
+                            ax.scatter(closed_at, position + 0.5, marker='o', c='black', s=50, label='Closed')
+            ax.legend(loc='lower left')
+            ax.set_xlim(report_start_date, report_end_date)
+            ax.set_yticks(np.arange(len(issues_to_report)) + 0.5)
+            ax.set_yticklabels(
+                [f"#{id}-{story_points(issues_to_report[id], storypoint_regex)}SP" for id in issues_to_report], rotation=0)
+            ax.set_title(
+                f"Story board for {', '.join([user.login for user in [user]])}\n({', '.join([lab.name for lab in epics_to_report])})")
+            plt.tight_layout()
+            st.write(fig)
