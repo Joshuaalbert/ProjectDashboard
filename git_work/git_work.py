@@ -85,16 +85,19 @@ def render_data():
 
     repo_name = st.sidebar.text_input("Repo :", 'Touch-Physio/Touch-Meta', help="Repo in format `owner/repo`")
 
-    g = Github(token)
-    repo = g.get_repo(repo_name)
+    try:
+        g = Github(token)
+        repo = g.get_repo(repo_name)
 
-    epic_regex = st.sidebar.text_input("Epic Regex (use <title> for title placeholder):", "EP - <title>")
-    epic_regex = epic_regex.replace("<title>", "(.+?)")
+        epic_regex = st.sidebar.text_input("Epic Regex (use <title> for title placeholder):", "EP - <title>")
+        epic_regex = epic_regex.replace("<title>", "(.+?)")
 
-    storypoint_regex = st.sidebar.text_input("Story Point Regex (use <value> for value placeholder):", "<value>SPs")
-    storypoint_regex = storypoint_regex.replace("<value>", "(.+?)")
+        storypoint_regex = st.sidebar.text_input("Story Point Regex (use <value> for value placeholder):", "<value>SPs")
+        storypoint_regex = storypoint_regex.replace("<value>", "(.+?)")
 
-    render_report(repo, epic_regex, storypoint_regex)
+        render_report(repo, epic_regex, storypoint_regex)
+    except:
+        st.write(f"Token: {token} is invalid.")
 
 
 def render_report(repo, epic_regex, storypoint_regex):
