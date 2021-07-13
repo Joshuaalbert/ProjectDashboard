@@ -456,7 +456,7 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
                                                                     filter(lambda issue: assignee in issue.assignees, closed_issues))))
                                             for assignee in list(devs)}
                     for dev in story_points_per_dev.keys():
-                        st.markdown(f" -[x] {dev} closed {story_points_per_dev[dev]} story points of {name}.")
+                        st.markdown(f" - [x] {dev} closed {story_points_per_dev[dev]} story points of {name}.")
 
 
 
@@ -478,8 +478,25 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
                     dates.append(_date)
                     _date += datetime.timedelta(days=1.)
 
-                ax.set_title("Bug story points added to backlog")
-                ax.plot(dates, story_points, c=f"#{color_map['user_story']}", label="User story curation", lw=2.)
+                ax.plot(dates, story_points, c=f"#{color_map[user_story_label]}", label="User story curation", lw=2.)
+
+                dates = []
+                story_points = []
+                _date = report_start_date
+                while _date < report_end_date:
+                    filtered_issues = list(filter(
+                        lambda issue: was_labeled_on_date(issue, 'backlog', _date) and not is_closed_on_date(issue,
+                                                                                                             _date),
+                        dev_issues))
+                    _story_points = sum(filter(lambda x: x is not None, [
+                        get_story_points(issue, storypoint_regex) for issue
+                        in
+                        filtered_issues]))
+                    story_points.append(_story_points)
+                    dates.append(_date)
+                    _date += datetime.timedelta(days=1.)
+
+                ax.plot(dates, story_points, c=f"#{color_map[dev_ticket_labels[0]]}", label="Dev ticket curation", lw=2.)
 
                 dates = []
                 story_points = []
@@ -497,8 +514,8 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
                     dates.append(_date)
                     _date += datetime.timedelta(days=1.)
 
-                ax.set_title("Bug story points added to backlog")
-                ax.plot(dates, story_points, c=f"#{color_map['bug']}", label="Bug curation", lw=2.)
+                ax.set_title(f"Curation of {epic.name} (Story Points added to backlog)")
+                ax.plot(dates, story_points, c=f"#{color_map[bug_label]}", label="Bug curation", lw=2.)
                 ax.legend()
                 st.write(fig)
 
@@ -634,7 +651,7 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
                 st.subheader("Tickets still open after report period")
                 open_issues = list(filter(lambda issue: issue.state == 'open', user_issues))
                 open_issues = list(filter(
-                    lambda issue: has_assignee_on_date(issue,user, report_end_date),
+                    lambda issue: has_assignee_on_date(issue, user, report_end_date),
                     open_issues))
                 num_closed = len(open_issues)
                 st.markdown(f"{num_closed} still open")
@@ -645,7 +662,8 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
 
 
                 st.subheader("Story board")
-                for bar_idx, issue in enumerate(user_issues):
+                _story_board_issues = closed_issues + open_issues
+                for bar_idx, issue in enumerate(_story_board_issues):
                     events = list(get_events(issue))
                     current_labels = dict()
                     xranges = []
@@ -653,10 +671,8 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
                     yrange = (bar_idx, 1)
                     for tracking_label in tracking_label_names:
                         for event in events:
-                            if issue.state == 'closed':
-                                if event.created_at > report_end_date:
-                                    break
-
+                            if event.created_at > report_end_date:
+                                break
                             if event.event == 'labeled':
                                 if event.label.name == tracking_label:
                                     current_labels[event.label.name] = event.created_at
@@ -665,21 +681,27 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
                                     xranges.append((current_labels[event.label.name], event.created_at - current_labels[event.label.name]))
                                     colors.append(f"#{color_map[tracking_label]}")
                                     del current_labels[event.label.name]
-                        for label in current_labels.keys():
-                            if issue.state == 'closed':
-                                _end_date = issue.closed_at
-                            else:
-                                _end_date = report_end_date
-                            xranges.append((current_labels[label], _end_date - current_labels[label]))
-                            colors.append(f"#{color_map[label]}")
+                    for label in current_labels.keys():
+                        xranges.append((current_labels[label], report_end_date - current_labels[label]))
+                        colors.append(f"#{color_map[label]}")
+                    if issue.state is 'closed':
+                        _xranges = []
+                        _colors = []
+                        for (x_start, x_len), color in zip(xranges, colors):
+                            if x_start <= issue.closed_at:
+                                _end = min(issue.closed_at, x_start + x_len)
+                                _xranges.append((x_start, _end - x_start))
+                                _colors.append(color)
+                        xranges = _xranges
+                        colors = _colors
                     ax.broken_barh(xranges, yrange, color=colors, edgecolor='black', alpha=1.)
                     if issue.state == 'closed':
                         ax.scatter(issue.closed_at, bar_idx+0.5, c='black', s=100, marker="o")
                 ax.legend(loc='lower left')
                 ax.set_xlim(report_start_date, report_end_date)
-                ax.set_yticks(np.arange(len(user_issues)) + 0.5)
+                ax.set_yticks(np.arange(len(_story_board_issues)) + 0.5)
                 ax.set_yticklabels(
-                    [f"#{issue.number}-{get_story_points(issue, storypoint_regex)}SPs" for issue in user_issues],
+                    [f"#{issue.number}-{get_story_points(issue, storypoint_regex)}SPs" for issue in _story_board_issues],
                     rotation=0)
                 plt.setp(ax.get_xticklabels(), Rotation=30, horizontalalignment='right')
                 ax.set_title(
