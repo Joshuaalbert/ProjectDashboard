@@ -653,6 +653,10 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
                     yrange = (bar_idx, 1)
                     for tracking_label in tracking_label_names:
                         for event in events:
+                            if issue.state == 'closed':
+                                if event.created_at > report_end_date:
+                                    break
+
                             if event.event == 'labeled':
                                 if event.label.name == tracking_label:
                                     current_labels[event.label.name] = event.created_at
@@ -662,7 +666,11 @@ def render_report(data, data_file, repo, epic_regex, storypoint_regex):
                                     colors.append(f"#{color_map[tracking_label]}")
                                     del current_labels[event.label.name]
                         for label in current_labels.keys():
-                            xranges.append((current_labels[label], report_end_date - current_labels[label]))
+                            if issue.state == 'closed':
+                                _end_date = issue.closed_at
+                            else:
+                                _end_date = report_end_date
+                            xranges.append((current_labels[label], _end_date - current_labels[label]))
                             colors.append(f"#{color_map[label]}")
                     ax.broken_barh(xranges, yrange, color=colors, edgecolor='black', alpha=1.)
                     if issue.state == 'closed':
