@@ -7,3 +7,4 @@ PyGithub
 jax
 jaxlib
 numpy
+pygraphviz
