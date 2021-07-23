@@ -223,19 +223,6 @@ def render_data():
     if st.sidebar.button("Refresh GitHub Data"):
         caching.clear_cache()
 
-    data_file = st.text_input("Data file: ", "save_file.json", help="JSON file to store information in.")
-
-    files = st.file_uploader("Upload data file", type=['json'], accept_multiple_files=True)
-    if files is not None:
-        data = dict()
-        for file in files:
-            _data = json.load(file)
-            data.update(_data)
-        save_data(data, data_file)
-
-    data = load_data(data_file)
-
-    st.markdown(get_table_download_link(data_file), unsafe_allow_html=True)
 
     token = st.sidebar.text_input("Github token: ", help="A github token giving you read access to the repo.")
 
@@ -251,7 +238,7 @@ def render_data():
     storypoint_regex = st.sidebar.text_input("Story Point Regex (use <value> for value placeholder):", "<value>SPs")
     storypoint_regex = storypoint_regex.replace("<value>", "(.+?)")
 
-    render_report(data, data_file, repo, epic_regex, storypoint_regex)
+    render_report(repo, epic_regex, storypoint_regex)
 
 def safe_index(list, item):
     if item not in list:
@@ -343,7 +330,7 @@ def is_closed_on_date(issue:Issue.Issue, date):
 
 
 
-def render_report(data, data_file, repo, epic_regex, storypoint_regex):
+def render_report(repo, epic_regex, storypoint_regex):
     repo_labels = get_labels(repo)
     repo_label_names = [lab.name for lab in repo_labels]
 
