@@ -4,3 +4,6 @@ scipy
 numpy
 networkx
 PyGithub
+jax
+jaxlib
+numpy
