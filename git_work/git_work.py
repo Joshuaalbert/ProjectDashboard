@@ -671,7 +671,7 @@ def render_report(repo, epic_regex, storypoint_regex):
                     for label in current_labels.keys():
                         xranges.append((current_labels[label], report_end_date - current_labels[label]))
                         colors.append(f"#{color_map[label]}")
-                    if issue.state is 'closed':
+                    if issue.state == 'closed':
                         _xranges = []
                         _colors = []
                         for (x_start, x_len), color in zip(xranges, colors):
