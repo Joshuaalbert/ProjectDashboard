@@ -8,3 +8,4 @@ jax
 jaxlib
 numpy
 pygraphviz
+graphviz
