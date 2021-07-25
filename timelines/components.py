@@ -23,7 +23,7 @@ def get_table_download_link(save_file):
 
     b64 = base64.b64encode(val.encode())  # .decode()
     # b64 = base64.b64encode(val)  # val looks like b'...'
-    return f'<a href="data:application/octet-stream;base64,{b64.decode()}" download="extract.xlsx">Download State File</a>'  # decode b'abc' => abc
+    return f'<a href="data:application/octet-stream;base64,{b64.decode()}" download="{save_file}">Download State File</a>'  # decode b'abc' => abc
 
 
 def render_components():

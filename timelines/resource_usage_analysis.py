@@ -279,7 +279,7 @@ def plot_role_usage(G, data, hours_per_role, ax):
                 (start_date + datetime.timedelta(days=_start_range), datetime.timedelta(days=_end_range - _start_range)))
             hour_req = hours_per_role[bar_idx, _start_range] / num_per_role[role]
             if np.isnan(hour_req):
-                hour_req = 0
+                hour_req = 0.
             annotations.append(f"{round(hour_req, 1)}")  # hr / b.day / res.
             facecolors.append(colour_hours(hour_req))
         yrange = (bar_idx, 1)
@@ -305,7 +305,10 @@ def plot_role_usage(G, data, hours_per_role, ax):
 
 
 def plot_gantt_chart(G, critical_path, display_resources, ax):
-    resource_nodes = [node for node in G.nodes if (any([resource in G.nodes[node]['resources'] for resource in display_resources]) or (len(G.nodes[node]['roles']) == 0))]
+    if len(display_resources) > 0:
+        resource_nodes = [node for node in G.nodes if (any([resource in G.nodes[node]['resources'] for resource in display_resources]) or (len(G.nodes[node]['roles']) == 0))]
+    else:
+        resource_nodes = list(G.nodes)
     order = []
     for bar_idx, process in enumerate(filter(lambda node: node in resource_nodes, nx.topological_sort(G))):
         order.append(process)
@@ -368,8 +371,8 @@ def plot_costs_per_resource(G, data, cost_per_resource, rewards):
     fig, ax = plt.subplots(1,1, figsize=(8,6))
     total_cost = np.zeros(num_days)-rewards
     cum_cost_per_resource = {resource:np.cumsum(cost_per_resource[resource]) for resource in data['resources']}
-    vmin = min([cum_cost_per_resource[resource][-1] for resource in data['resources']])
-    vmax = max([cum_cost_per_resource[resource][-1] for resource in data['resources']])
+    vmin = min([cum_cost_per_resource[resource][-1] for resource in data['resources']], default=0)
+    vmax = max([cum_cost_per_resource[resource][-1] for resource in data['resources']], default=0)
     for resource in sorted(data['resources'],
                            key=lambda res:cum_cost_per_resource[res][-1],
                            reverse=True):
