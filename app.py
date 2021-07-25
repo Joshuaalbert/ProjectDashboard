@@ -1,6 +1,7 @@
+import streamlit as st
 from git_work.git_work import render_data
 from timelines.components import render_components
-import streamlit as st
+
 
 
 def main():
