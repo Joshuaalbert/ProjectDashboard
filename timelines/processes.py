@@ -89,11 +89,11 @@ def render_processes(data, save_file):
                 _default_commitment = data['processes'][new_process]['commitment'][role]
             else:
                 _default_commitment = 0
-            # if commitment_per_week:
-            #     if new_process_duration == 0:
-            #         _default_commitment = 0
-            #     else:
-            #         _default_commitment = (_default_commitment * 5) // new_process_duration
+            if commitment_per_week:
+                if new_process_duration == 0:
+                    _default_commitment = 0
+                else:
+                    _default_commitment = (_default_commitment * 5) // new_process_duration
             _commitment = st.slider(f"Hours {role}:", 0, 90, _default_commitment, step=1,
                                     help="Hours of the resource performing this role, either total or per week.")
             if commitment_per_week:

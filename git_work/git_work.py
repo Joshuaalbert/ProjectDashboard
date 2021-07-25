@@ -327,6 +327,22 @@ def is_closed_on_date(issue:Issue.Issue, date):
             closed = True
     return closed
 
+@st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
+def time_with_label(issue:Issue.Issue, label):
+    events = list(get_events(issue))
+    _total_time = datetime.timedelta(days=0.)
+    _on_time = None
+
+    for event in events:
+        if event.event == 'labeled':
+            if event.label.name == label:
+                _on_time = event.created_at
+        if event.event == 'unlabeled':
+            if event.label.name == label:
+                _total_time += event.created_at - _on_time
+                _on_time = None
+    return _total_time
+
 
 
 
@@ -404,9 +420,11 @@ def render_report(repo, epic_regex, storypoint_regex):
     with st.beta_expander(f"Dev tickets missing story points:"):
         dev_tickets_missing_container = st.beta_container()
 
+    sum_labels = st.sidebar.multiselect("Labels to measure time in: ", tracking_labels, [], help="Sum up time in these labels.")
+
     run_report = st.sidebar.button("Run Report")
     # for each epic print numbers of bugs, user stories, and dev tickets that have been created and closed during this period.
-    st.header("Report per Epic")
+    st.header("Report")
     if run_report and (len(epics_to_report) > 0):
         all_user_stories = []
         all_bugs = []
@@ -694,4 +712,29 @@ def render_report(repo, epic_regex, storypoint_regex):
                 ax.set_title(
                     f"Story board for {', '.join([user.login for user in [user]])}\n({', '.join([lab.name for lab in epics_to_report])})")
                 plt.tight_layout()
+                st.write(fig)
+        st.header("Velocity estimation")
+        if len(sum_labels) > 0:
+            for issues, name in zip([all_user_stories, all_bugs, all_dev_tickets], ['user stories', 'bugs', 'dev tickets']):
+                _close_times = []
+                _story_points = []
+                _time_with_label = []
+                for issue in filter(lambda issue: issue.state == 'closed', issues):
+                    _story_point = get_story_points(issue,storypoint_regex)
+                    if _story_point is None:
+                        continue
+                    _time_with_label.append(sum([time_with_label(issue, lab.name).total_seconds()/86400. for lab in sum_labels], 0))
+                    _story_points.append(_story_point)
+                    _close_times.append(issue.closed_at)
+                fig, ax = plt.subplots(1,1,figsize=(6,6))
+                y = list(map(lambda x, y: x/y, _time_with_label, _story_points))
+                ax.scatter(_close_times, y)
+                print(np.percentile(y, [10,50,90]))
+                ax.axhline(np.median(y), c='black', ls='dashed', label=f'Median Vel.={round(float(np.median(y)),2)} days/SP')
+                ax.axhline(np.percentile(y, 10), c='green', ls='dotted', label=f'10% Vel.={round(float(np.percentile(y, 10)),2)} days/SP')
+                ax.axhline(np.percentile(y, 90), c='red', ls='dotted', label=f'90% Vel.={round(float(np.percentile(y, 90)),2)} days/SP')
+                ax.legend()
+                ax.set_title(f"Velocity chart of {name}")
+                ax.set_ylabel("Velocity [days/story point]")
+                ax.set_xlabel("Close date")
                 st.write(fig)
