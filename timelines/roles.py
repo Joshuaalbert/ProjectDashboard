@@ -7,7 +7,7 @@ def render_roles(data, save_file):
     ###
     # roles
     with st.sidebar.beta_expander("Roles"):
-        new_role = st.text_input("New role: ", help="Add a new role type.", key=0)
+        new_role = st.text_input("New role: ", help="Add a new role type.")
         if st.button("Add role") and (new_role != ""):
             if new_role not in data['roles']:
                 data['roles'].append(new_role)

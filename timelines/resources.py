@@ -43,7 +43,7 @@ def render_resources(data, save_file):
                                                    cost_per_week=cost_per_week)
             flush_state(save_file, data)
 
-        delete_resources = st.multiselect("Delete resources: ", list(data['resources']), key=0)
+        delete_resources = st.multiselect("Delete resources: ", list(data['resources']))
         if st.button("Delete resources", key=1) and len(delete_resources) > 0:
             for resource in delete_resources:
                 del data['resources'][resource]

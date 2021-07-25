@@ -148,7 +148,7 @@ def render_processes(data, save_file):
             if re.match("SG-(.+?)-RO",subgraph) is not None:
                 delete_options = list(set(delete_options) - set(data['subgraphs'][subgraph]['processes']))
         delete_options = delete_options + list(data['subgraphs'])
-        _delete_processes = st.multiselect("Delete processes: ", delete_options, key=0)
+        _delete_processes = st.multiselect("Delete processes: ", delete_options)
         if st.button("Delete processes", key=1) and len(_delete_processes) > 0:
             delete_processes(data, _delete_processes, save_file)
 
