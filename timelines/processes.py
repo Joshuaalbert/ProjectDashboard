@@ -114,7 +114,7 @@ def render_processes(data, save_file):
         if new_process in data['processes']:
             _default_earliest_start = datetime.datetime.fromisoformat(data['processes'][new_process]['earliest_start'])
         else:
-            _default_earliest_start = strip_time(datetime.datetime.now())
+            _default_earliest_start = strip_time(datetime.datetime.fromisoformat(data['start_date']))
         new_process_earliest_start = st.date_input("Earliest start:", _default_earliest_start,
                                                            help="What date is the earliest this process can start?")
 

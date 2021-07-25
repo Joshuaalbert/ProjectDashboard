@@ -269,7 +269,7 @@ def plot_role_usage(G, data, hours_per_role, ax):
     for resource in data['resources']:
         for role in data['resources'][resource]['roles']:
             num_per_role[role] += 1
-    start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.now())
+    start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.fromisoformat(data['start_date']))
     for bar_idx, role in enumerate(roles):
         xranges = []
         facecolors = []
@@ -364,8 +364,8 @@ def display_graph(G, critical_path, data):
         st.graphviz_chart(H)
 
 def plot_costs_per_resource(G, data, cost_per_resource, rewards):
-    start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.now())
-    end_date = max([G.nodes[node]['LF'] for node in G.nodes], default=datetime.datetime.now())
+    start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.fromisoformat(data['start_date']))
+    end_date = max([G.nodes[node]['LF'] for node in G.nodes], default=datetime.datetime.fromisoformat(data['start_date']))
     num_days = (end_date - start_date).days
     time = [start_date + datetime.timedelta(days=i) for i in range(num_days)]
     fig, ax = plt.subplots(1,1, figsize=(8,6))

@@ -68,11 +68,10 @@ class CPM(nx.DiGraph):
         super().remove_edges_from(*args, **kwargs)
 
     def _forward(self):
-        start_time = min([self.nodes[j]['earliest_start'] for j in self.nodes], default=next_business_day(strip_time(datetime.datetime.now())))
+        start_time = next_business_day(strip_time(self.graph['start_date']))# min([self.nodes[j]['earliest_start'] for j in self.nodes], default=next_business_day(strip_time(datetime.datetime.now())))
         for n in nx.topological_sort(self):
             es = max([self.nodes[j]['EF'] for j in self.predecessors(n)], default=start_time)
             es = max([es, self.nodes[n]['earliest_start'], add_business_days(es, self.nodes[n]['delay_start'])])
-            print(es)
             self.add_node(n,
                           ES=es,
                           EF=add_business_days(es, self.nodes[n]['duration']))

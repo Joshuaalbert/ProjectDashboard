@@ -1,3 +1,5 @@
+import datetime
+
 import streamlit as st
 from streamlit import caching
 import json
@@ -30,7 +32,7 @@ def render_components():
     save_file = st.sidebar.text_input("State file: ", 'project.json', help="JSON file to store information in.")
 
     file = st.sidebar.file_uploader("Upload data file", type=['json'], accept_multiple_files=False)
-    if file is not None:
+    if st.sidebar.button("Load file") and (file is not None):
         data = json.load(file)
         flush_state(save_file, data)
 
@@ -38,8 +40,11 @@ def render_components():
     if os.path.isfile(save_file):
         with open(save_file, 'r') as f:
             data = json.load(f)
+            data['start_date'] = data['start_date'] if 'start_date' in data else datetime.datetime.now().isoformat()
+
     else:
         data = dict(cache_hash=0,
+                    start_date=datetime.datetime.now().isoformat(),
                     roles=[],
                     resources=dict(),
                     processes=dict(),
@@ -50,6 +55,11 @@ def render_components():
 
     if st.sidebar.button("Refresh"):
         caching.clear_cache()
+
+    start_date = st.sidebar.date_input("Start date: ", datetime.datetime.fromisoformat(data['start_date']), help='Date where process graph starts.')
+    if start_date is not None:
+        data['start_date'] = start_date.isoformat()
+
 
     render_roles(data, save_file)
 

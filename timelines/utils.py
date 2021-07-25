@@ -34,8 +34,7 @@ def merge_nodes(G, nodes, new_node, attr_dict=None, **attr):
 
 def fill_graph(G, data, collapse_rollouts=False):
     G.graph['cache_hash'] = data['cache_hash']
-
-
+    G.graph['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
 
     for process in data['processes']:
         G.add_node(f"{process}",
