@@ -44,7 +44,7 @@ def render_resources(data, save_file):
             flush_state(save_file, data)
 
         delete_resources = st.multiselect("Delete resources: ", list(data['resources']))
-        if st.button("Delete resources", key=1) and len(delete_resources) > 0:
+        if st.button("Delete resources") and len(delete_resources) > 0:
             for resource in delete_resources:
                 del data['resources'][resource]
             flush_state(save_file, data)
