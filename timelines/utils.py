@@ -32,19 +32,29 @@ def merge_nodes(G, nodes, new_node, attr_dict=None, **attr):
     for n in nodes:  # remove the merged nodes
         G.remove_node(n)
 
-def fill_graph(G, data, collapse_rollouts=False):
+def fill_graph(G, data, scenario='Normal'):
     G.graph['cache_hash'] = data['cache_hash']
     G.graph['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
 
     for process in data['processes']:
+        if scenario == 'Pessimistic':
+            _mod = data['processes'][process]['pessimistic_modifier']
+        elif scenario == 'Optimistic':
+            _mod = data['processes'][process]['optimistic_modifier']
+        elif scenario == 'Normal':
+            _mod = 1.
+        else:
+            raise ValueError(f"Invalid scenario, {scenario}")
+        _duration = int(_mod * data['processes'][process]['duration']) # days
+        _commitment = {key: com * _duration / 5. for key, com in data['processes'][process]['commitment'].items()}
         G.add_node(f"{process}",
-                   duration=datetime.timedelta(days=data['processes'][process]['duration']),
+                   duration=datetime.timedelta(days=_duration),
                    roles=data['processes'][process]['roles'],
                    resources=[resource for resource in data['resources'] if any([role in data['resources'][resource]['roles']
                                                                                  for role in data['processes'][process]['roles']])],
                    reward=data['processes'][process]['reward'],
                    success_prob=data['processes'][process]['success_prob'],
-                   commitment=data['processes'][process]['commitment'],
+                   commitment=_commitment,
                    earliest_start=next_business_day(datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])),
                    delay_start=datetime.timedelta(data['processes'][process]['delay_start'])
                    )

@@ -117,10 +117,11 @@ class CPM(nx.DiGraph):
         self._dirty = False
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_critical_path(c):
+def get_critical_path(c, scenario):
     data = c['data']
     G = CPM()
-    fill_graph(G, data)
+
+    fill_graph(G, data, scenario)
 
     compute_event_probabilities(G, 1000)
 
@@ -130,19 +131,20 @@ def get_critical_path(c):
 
 def render_critical_path(data):
     st.header("Critical Path")
+    scenario = st.radio("Scenario: ", ['Pessimistic', 'Normal', 'Optimistic'], index=1,help="Which scenario to show")
 
-    G, critical_path = get_critical_path(Cache(data=data))
-    G_collapsed, critical_path_collapsed = collapse_rollouts(G, critical_path, data)
+    G, critical_path = get_critical_path(Cache(data=data), scenario)
+    G_collapsed, critical_path_collapsed = collapse_rollouts(G, critical_path, data, scenario)
 
     st.subheader("Graph")
-    display_graph(G_collapsed, critical_path_collapsed, data)
+    display_graph(G_collapsed, critical_path_collapsed, data, scenario)
 
     st.subheader("Timeline")
 
-    display_usage(G, critical_path, data, G_collapsed, critical_path_collapsed)
+    display_usage(G, critical_path, data, G_collapsed, critical_path_collapsed, scenario)
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_collapsed_rollout(c):
+def get_collapsed_rollout(c, scenario):
     data = c['data']
     G = c['G']
     critical_path = c['critical_path']
@@ -194,8 +196,8 @@ def get_collapsed_rollout(c):
     return G, critical_path
 
 
-def collapse_rollouts(G, critical_path, data):
+def collapse_rollouts(G, critical_path, data, scenario):
     if st.checkbox("Collapse Roll-outs", True, help="Whether to collapse rolled-out subgraphs into single processes."):
-        G, critical_path = get_collapsed_rollout(Cache(data=data, G=G, critical_path=critical_path))
+        G, critical_path = get_collapsed_rollout(Cache(data=data, G=G, critical_path=critical_path), scenario)
 
     return G, critical_path

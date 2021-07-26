@@ -53,21 +53,44 @@ def render_processes(data, save_file):
         new_process_dependencies = st.multiselect("Dependencies:", dep_options, _default_dependencies,
                                                   help="What are the dependencies of this process.")
 
-        # Duration
-        duration_in_weeks = st.checkbox("Duration in weeks", True,
-                                        help="Whether duration of process is in business weeks.")
+
 
         if new_process in data['processes']:
             _default_duration = data['processes'][new_process]['duration']
+            _default_pessimistic_modifer = data['processes'][new_process]['pessimistic_modifier']
+            _default_optimistic_modifer = data['processes'][new_process]['optimistic_modifier']
+            if _default_duration % 5 == 0:
+                _default_duration = _default_duration // 5
+                _default_duration_in_weeks = True
+            else:
+                _default_duration_in_weeks = False
+
         else:
             _default_duration = 0
+            _default_duration_in_weeks = True
+            _default_pessimistic_modifer = 1.
+            _default_optimistic_modifer = 1.
+
+
+        # Duration
+        duration_in_weeks = st.checkbox("Duration in weeks", _default_duration_in_weeks,
+                                        help="Whether duration of process is in business weeks.")
+
         if duration_in_weeks:
             _default_duration = _default_duration // 5
             new_process_duration = st.slider("Duration: ", 0, 52, _default_duration, step=1,
                                                      help="Duration of the process in weeks.")
         else:
-            new_process_duration = st.slider("Duration: ", 0, 20, _default_duration, step=1,
+            new_process_duration = st.slider("Duration: ", 0, 30, _default_duration, step=1,
                                              help="Duration of the process in business days.")
+
+
+        pessimistic_modifier = st.slider("Pessimistic modifier", min_value=1., max_value=5., value=_default_pessimistic_modifer, step=0.1,
+                  help="Pessimistic estimate of duration is duration times this.")
+
+        optimistic_modifier = st.slider("Optimistic modifier", min_value=0., max_value=1.,
+                                        value=_default_optimistic_modifer, step=0.1,
+                                        help="Optimistic estimate of duration is duration times this.")
 
         if duration_in_weeks:
             new_process_duration *= 5
@@ -80,8 +103,6 @@ def render_processes(data, save_file):
         new_process_roles = st.multiselect("Required roles:", data['roles'], _default_roles,
                                            help="Which roles are needed for process success.")
 
-        if len(new_process_roles)>0:
-            commitment_per_week = st.checkbox("Commitment per week",True, help="Whether commitment in hours per business week, or else total involvement.")
         # Commitment
         commitment = dict()
         for role in new_process_roles:
@@ -89,15 +110,8 @@ def render_processes(data, save_file):
                 _default_commitment = data['processes'][new_process]['commitment'][role]
             else:
                 _default_commitment = 0
-            if commitment_per_week:
-                if new_process_duration == 0:
-                    _default_commitment = 0
-                else:
-                    _default_commitment = (_default_commitment * 5) // new_process_duration
-            _commitment = st.slider(f"Hours {role}:", 0, 90, _default_commitment, step=1,
-                                    help="Hours of the resource performing this role, either total or per week.")
-            if commitment_per_week:
-                _commitment = _commitment * new_process_duration // 5
+            _commitment = st.slider(f"Hours per week {role}:", 0, 120, _default_commitment, step=1,
+                                    help="Hours of this role required per week of duration.")
             commitment[role] = _commitment
 
 
@@ -138,9 +152,18 @@ def render_processes(data, save_file):
 
         # Add it
         if st.button("Add/Mod process") and (new_process != ""):
-            set_process(save_file, data, new_process_name, new_process, commitment, new_process_dependencies,
-                        new_process_duration, new_process_earliest_start, new_process_reward, new_process_roles,
-                        new_process_success_prob)
+            set_process(save_file, data,
+                        new_process_name=new_process_name,
+                        new_process=new_process,
+                        commitment=commitment,
+                        new_process_dependencies=new_process_dependencies,
+                        new_process_duration=new_process_duration,
+                        new_process_earliest_start=new_process_earliest_start,
+                        new_process_reward=new_process_reward,
+                        new_process_roles=new_process_roles,
+                        new_process_success_prob=new_process_success_prob,
+                        new_process_delay_start=0,
+                        pessimistic_modifier=pessimistic_modifier, optimistic_modifier=optimistic_modifier)
 
         # Delete
         delete_options = list(data['processes'])
@@ -195,7 +218,9 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
                 new_process_duration=None, new_process_earliest_start=None, new_process_reward=None,
                 new_process_roles=None,
                 new_process_success_prob=None,
-                new_process_delay_start=None):
+                new_process_delay_start=None,
+                pessimistic_modifier=None,
+                optimistic_modifier=None):
     if new_process is None:
         new_process = symbolify_process_name(data, new_process_name)
 
@@ -206,6 +231,15 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
     if new_process_duration is None:
         new_process_duration = 0
     new_process_duration = int(new_process_duration)
+
+
+    if pessimistic_modifier is None:
+        pessimistic_modifier = 1.
+    pessimistic_modifier = float(pessimistic_modifier)
+
+    if optimistic_modifier is None:
+        optimistic_modifier = 1.
+    optimistic_modifier = float(optimistic_modifier)
 
     if new_process_earliest_start is None:
         new_process_earliest_start = datetime.datetime.now()
@@ -236,6 +270,8 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
                                           success_prob=new_process_success_prob,
                                           commitment=commitment,
                                           duration=new_process_duration,
+                                          pessimistic_modifier=pessimistic_modifier,
+                                          optimistic_modifier=optimistic_modifier,
                                           earliest_start=new_process_earliest_start.isoformat(),
                                           delay_start=new_process_delay_start,
                                           name=new_process_name)
@@ -248,4 +284,6 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
             data['processes'][other_process]['success_prob'] = new_process_success_prob
             data['processes'][other_process]['commitment'] = commitment
             data['processes'][other_process]['duration'] = new_process_duration
+            data['processes'][other_process]['pessimistic_modifier'] = pessimistic_modifier
+            data['processes'][other_process]['optimistic_modifier'] = optimistic_modifier
     flush_state(save_file, data)
