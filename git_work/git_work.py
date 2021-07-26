@@ -31,7 +31,7 @@ hash_map = {Repository.Repository: lambda x: hash(x.name),
 def get_issues(repo, label, assignee="*"):
     if not isinstance(label, (list, tuple)):
         label = [label]
-    return repo.get_issues(state='all', labels=label, assignee=assignee)
+    return repo.get_issues(state='all', labels=label)#, assignee=assignee)
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def search_issues(repo, labels, assignees):
@@ -714,6 +714,7 @@ def render_report(repo, epic_regex, storypoint_regex):
                 plt.tight_layout()
                 st.write(fig)
         st.header("Velocity estimation")
+        _normal_velocity = dict()
         if len(sum_labels) > 0:
             for issues, name in zip([all_user_stories, all_bugs, all_dev_tickets], ['user stories', 'bugs', 'dev tickets']):
                 _close_times = []
@@ -728,10 +729,14 @@ def render_report(repo, epic_regex, storypoint_regex):
                     _close_times.append(issue.closed_at)
                 fig, ax = plt.subplots(1,1,figsize=(6,6))
                 y = np.asarray(list(map(lambda x, y: x/y, _time_with_label, _story_points)))
+                if len(y) == 0:
+                    _normal_velocity[name] = 1.
+                    continue
                 ax.scatter(_close_times, y)
                 fastest = np.mean(y[y<np.percentile(y, 33)])
                 slowest = np.mean(y[y>np.percentile(y, 66)])
                 normal = np.mean(y[(y>np.percentile(y, 33)) & (y<np.percentile(y, 66))])
+                _normal_velocity[name] = normal
 
                 ax.axhline(normal, c='black', ls='dashed', label=f'Normal Vel.={round(float(np.median(y)),2)} days/SP')
                 ax.axhline(fastest, c='green', ls='dotted', label=f'Optimistic Vel.={round(float(fastest),2)} days/SP (x {round(float(fastest/normal),2)})')
@@ -741,3 +746,24 @@ def render_report(repo, epic_regex, storypoint_regex):
                 ax.set_ylabel("Velocity [days/story point]")
                 ax.set_xlabel("Close date")
                 st.write(fig)
+        st.header("Remaining work per Epic")
+        for epic in epics_to_report:
+            with st.beta_expander(f"{epic.name}"):
+                # over all health
+                user_story_issues = list(get_issues(repo, [epic, user_story_label]))
+                open_user_story_issues = list(filter(lambda issue: issue.state=='open', user_story_issues))
+                bug_issues = list(get_issues(repo, [epic, bug_label]))
+                open_bug_issues = list(filter(lambda issue: issue.state=='open', bug_issues))
+                dev_issues = sum([list(get_issues(repo, [epic, dev_ticket_label])) for dev_ticket_label in dev_ticket_labels], [])
+                open_dev_issues = list(filter(lambda issue: issue.state=='open', dev_issues))
+
+                for all_issues, issues, open_issues, name in zip([all_user_stories, all_bugs, all_dev_tickets],
+                                        [user_story_issues, bug_issues, dev_issues],
+                                                                 [open_user_story_issues, open_bug_issues,
+                                                                  open_dev_issues],
+                                        ['user stories', 'bugs', 'dev tickets']):
+                    _story_points = [get_story_points(issue, storypoint_regex) for issue in open_issues]
+                    _story_points_remaining = sum(filter(lambda x: x is not None, _story_points), 0.)
+                    _num_missing = len( list(filter(lambda x: x is None, _story_points)))
+                    _story_points_missing = _num_missing * np.mean(list(filter(lambda x: x is not None, [get_story_points(issue, storypoint_regex) for issue in all_issues])))
+                    st.markdown(f"{name} story points remaining: {_story_points_remaining}, missing: {_story_points_missing}, which is about {(_story_points_remaining + _story_points_missing) * _normal_velocity[name]} days (normal).")
