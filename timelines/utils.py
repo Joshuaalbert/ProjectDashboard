@@ -56,7 +56,9 @@ def fill_graph(G, data, scenario='Normal'):
                    success_prob=data['processes'][process]['success_prob'],
                    commitment=_commitment,
                    earliest_start=next_business_day(datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])),
-                   delay_start=datetime.timedelta(data['processes'][process]['delay_start'])
+                   delay_start=datetime.timedelta(data['processes'][process]['delay_start']),
+                   done=data['processes'][process]['done'],
+                   done_date=next_business_day(datetime.datetime.fromisoformat(data['processes'][process]['done_date']))
                    )
         for dep in data['processes'][process]['dependencies']:
             G.add_edge(f"{dep}", f"{process}")

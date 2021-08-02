@@ -72,16 +72,26 @@ class CPM(nx.DiGraph):
         for n in nx.topological_sort(self):
             es = max([self.nodes[j]['EF'] for j in self.predecessors(n)], default=start_time)
             es = max([es, self.nodes[n]['earliest_start'], add_business_days(es, self.nodes[n]['delay_start'])])
+            ef = add_business_days(es, self.nodes[n]['duration'])
+            duration = self.nodes[n]['duration']
+            if self.nodes[n]['done']:
+                if ef > self.nodes[n]['done_date']:
+                    duration = count_business_days(es, self.nodes[n]['done_date'])
+                    ef = self.nodes[n]['done_date']
             self.add_node(n,
                           ES=es,
-                          EF=add_business_days(es, self.nodes[n]['duration']))
+                          EF=ef,
+                          duration=duration)
 
     def _backward(self):
         # import streamlit as st
         for n in reversed(list(nx.topological_sort(self))):
             lf = min([self.nodes[j]['LS'] for j in self.successors(n)], default=self._critical_path_length)
+            if self.nodes[n]['done']:
+                lf = self.nodes[n]['done_date']
+            ls = subtract_business_days(lf, self.nodes[n]['duration'])
             self.add_node(n,
-                          LS=subtract_business_days(lf, self.nodes[n]['duration']),
+                          LS=ls,
                           LF=lf,
                           total_float=datetime.timedelta(days=count_business_days(self.nodes[n]['ES'], lf)) - self.nodes[n]['duration'])
 

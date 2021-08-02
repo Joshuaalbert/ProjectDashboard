@@ -37,7 +37,7 @@ def render_processes(data, save_file):
             new_process_name = data['processes'][new_process]['name']
             st.info(f"Found ({new_process}) {new_process_name}")
             _default_done = data['processes'][new_process]['done']
-            _default_done_date = data['processes'][new_process]['done_date']
+            _default_done_date = datetime.datetime.fromisoformat(data['processes'][new_process]['done_date'])
         else:
             new_process = symbolify_process_name(data, new_process_name)
             _default_done = False
@@ -288,7 +288,8 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
     if process_done is None:
         process_done = False
     if done_date is None:
-        done_date = None
+        done_date = datetime.datetime.now()
+    done_date = next_business_day(strip_time(new_process_earliest_start))
 
     data['processes'][new_process] = dict(roles=new_process_roles,
                                           dependencies=new_process_dependencies,
@@ -302,7 +303,7 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
                                           delay_start=new_process_delay_start,
                                           name=new_process_name,
                                           done=process_done,
-                                          done_date=done_date)
+                                          done_date=done_date.isoformat())
     # update broadcasted variables
     new_process = new_process.split("-")[0]
     for other_process in data['processes']:
