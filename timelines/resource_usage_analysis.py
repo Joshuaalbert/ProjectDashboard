@@ -337,6 +337,7 @@ def plot_gantt_chart(G, critical_path, display_resources, ax):
                            edgecolor='black',
                            alpha=0.5)
     ax.grid()
+    ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
     ax.legend(loc='lower right')
     ax.set_yticks(np.arange(len(order)) + 0.5)
     ax.set_yticklabels(order, rotation=0)
