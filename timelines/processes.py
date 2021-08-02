@@ -35,6 +35,7 @@ def render_processes(data, save_file):
             # Name was symbol, so swap
             new_process = new_process_name
             new_process_name = data['processes'][new_process]['name']
+            st.info(f"Found ({new_process}) {new_process_name}")
         else:
             new_process = symbolify_process_name(data, new_process_name)
 
