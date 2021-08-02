@@ -76,7 +76,7 @@ class CPM(nx.DiGraph):
             duration = self.nodes[n]['duration']
             if self.nodes[n]['done']:
                 if ef > self.nodes[n]['done_date']:
-                    duration = count_business_days(es, self.nodes[n]['done_date'])
+                    duration = datetime.timedelta(days=count_business_days(es, self.nodes[n]['done_date']))
                     ef = self.nodes[n]['done_date']
             self.add_node(n,
                           ES=es,
@@ -89,7 +89,7 @@ class CPM(nx.DiGraph):
             lf = min([self.nodes[j]['LS'] for j in self.successors(n)], default=self._critical_path_length)
             if self.nodes[n]['done']:
                 lf = self.nodes[n]['done_date']
-            ls = subtract_business_days(lf, self.nodes[n]['duration'])
+            ls = subtract_business_days(lf,self.nodes[n]['duration'])
             self.add_node(n,
                           LS=ls,
                           LF=lf,
