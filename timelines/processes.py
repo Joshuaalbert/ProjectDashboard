@@ -48,6 +48,8 @@ def render_processes(data, save_file):
             done_date = st.date_input("Done date",value=_default_done_date,
                                       min_value=None, max_value=datetime.datetime.now(),
                                       help="When was the process done?")
+        else:
+            done_date = None
 
 
         # Dependencies
