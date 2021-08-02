@@ -110,8 +110,8 @@ def render_processes(data, save_file):
                 _default_commitment = data['processes'][new_process]['commitment'][role]
             else:
                 _default_commitment = 0
-            _commitment = st.slider(f"Hours per week {role}:", 0, 120, _default_commitment, step=1,
-                                    help="Hours of this role required per week of duration.")
+            _commitment = st.slider(f"Attention {role}:", 0, 5, _default_commitment, step=1./3.,
+                                    help="Attention of this role required for execution. > 1 means more than one resources with this role required.")
             commitment[role] = _commitment
 
 
