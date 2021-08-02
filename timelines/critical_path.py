@@ -32,6 +32,7 @@ class CPM(nx.DiGraph):
     def __init__(self):
         super().__init__()
         self._dirty = True
+        self._attention_contraint = False
         self._critical_path_length = -1
         self._criticalPath = None
 
@@ -82,6 +83,8 @@ class CPM(nx.DiGraph):
                           ES=es,
                           EF=ef,
                           duration=duration)
+            for role in self.nodes[n]['roles']:
+                self.nodes[f"role_{role}"] += self.nodes[n]['attention'][role]
 
     def _backward(self):
         # import streamlit as st
@@ -127,11 +130,11 @@ class CPM(nx.DiGraph):
         self._dirty = False
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_critical_path(c, scenario):
+def get_critical_path(c, scenario, max_attention_per_role):
     data = c['data']
     G = CPM()
 
-    fill_graph(G, data, scenario)
+    fill_graph(G, data, scenario, max_attention_per_role)
 
     compute_event_probabilities(G, 1000)
 
@@ -143,15 +146,18 @@ def render_critical_path(data):
     st.header("Critical Path")
     scenario = st.radio("Scenario: ", ['Pessimistic', 'Normal', 'Optimistic'], index=1,help="Which scenario to show")
 
-    G, critical_path = get_critical_path(Cache(data=data), scenario)
-    G_collapsed, critical_path_collapsed = collapse_rollouts(G, critical_path, data, scenario)
+    max_attention_per_role = st.slider("Maximum attention per role",0., 5., 1., step=1/3.,
+                                       help="What is the maximum attention allocated to each role? Affects how non-critical tasks are scheduled.")
+
+    G, critical_path = get_critical_path(Cache(data=data), scenario, max_attention_per_role)
+    G_collapsed, critical_path_collapsed = collapse_rollouts(G, critical_path, data, scenario, max_attention_per_role)
 
     st.subheader("Graph")
-    display_graph(G_collapsed, critical_path_collapsed, data, scenario)
+    display_graph(G_collapsed, critical_path_collapsed, data, scenario, max_attention_per_role)
 
     st.subheader("Timeline")
 
-    display_usage(G, critical_path, data, G_collapsed, critical_path_collapsed, scenario)
+    display_usage(G, critical_path, data, G_collapsed, critical_path_collapsed, scenario, max_attention_per_role)
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def get_collapsed_rollout(c, scenario):
@@ -206,7 +212,7 @@ def get_collapsed_rollout(c, scenario):
     return G, critical_path
 
 
-def collapse_rollouts(G, critical_path, data, scenario):
+def collapse_rollouts(G, critical_path, data, scenario, max_attention_per_role):
     if st.checkbox("Collapse Roll-outs", True, help="Whether to collapse rolled-out subgraphs into single processes."):
         G, critical_path = get_collapsed_rollout(Cache(data=data, G=G, critical_path=critical_path), scenario)
 
