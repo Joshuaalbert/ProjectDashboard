@@ -36,8 +36,18 @@ def render_processes(data, save_file):
             new_process = new_process_name
             new_process_name = data['processes'][new_process]['name']
             st.info(f"Found ({new_process}) {new_process_name}")
+            _default_done = data['processes'][new_process]['done']
+            _default_done_date = data['processes'][new_process]['done_date']
         else:
             new_process = symbolify_process_name(data, new_process_name)
+            _default_done = False
+            _default_done_date = None
+
+        process_done = st.checkbox("Done", _default_done, help="Is this process done?")
+        if process_done:
+            done_date = st.date_input("Done date",value=_default_done_date,
+                                      min_value=None, max_value=datetime.datetime.now(),
+                                      help="When was the process done?")
 
 
         # Dependencies
@@ -164,7 +174,9 @@ def render_processes(data, save_file):
                         new_process_roles=new_process_roles,
                         new_process_success_prob=new_process_success_prob,
                         new_process_delay_start=0,
-                        pessimistic_modifier=pessimistic_modifier, optimistic_modifier=optimistic_modifier)
+                        pessimistic_modifier=pessimistic_modifier, optimistic_modifier=optimistic_modifier,
+                        process_done=process_done,
+                        done_date=done_date)
 
         # Delete
         delete_options = list(data['processes'])
@@ -181,7 +193,12 @@ def render_processes(data, save_file):
         for process in data['processes']:
             if not any([process in data['subgraphs'][subgraph]['processes']
                     for subgraph in rollouts]):
-                st.markdown(f" - ({process}) {data['processes'][process]['name']}")
+                _done = data['processes'][process]['done']
+                _done_date = data['processes'][process]['done_date']
+                if _done:
+                    st.markdown(f" -[x] ({process}) {data['processes'][process]['name']} done on {_done_date}")
+                else:
+                    st.markdown(f" -[ ] ({process}) {data['processes'][process]['name']}")
 
 
 def delete_processes(data, processes, save_file):
@@ -221,7 +238,10 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
                 new_process_success_prob=None,
                 new_process_delay_start=None,
                 pessimistic_modifier=None,
-                optimistic_modifier=None):
+                optimistic_modifier=None,
+                process_done=None,
+                done_date=None
+                ):
     if new_process is None:
         new_process = symbolify_process_name(data, new_process_name)
 
@@ -265,6 +285,11 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
         new_process_success_prob = 100
     new_process_success_prob = int(new_process_success_prob)
 
+    if process_done is None:
+        process_done = False
+    if done_date is None:
+        done_date = None
+
     data['processes'][new_process] = dict(roles=new_process_roles,
                                           dependencies=new_process_dependencies,
                                           reward=new_process_reward,
@@ -275,7 +300,9 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
                                           optimistic_modifier=optimistic_modifier,
                                           earliest_start=new_process_earliest_start.isoformat(),
                                           delay_start=new_process_delay_start,
-                                          name=new_process_name)
+                                          name=new_process_name,
+                                          done=process_done,
+                                          done_date=done_date)
     # update broadcasted variables
     new_process = new_process.split("-")[0]
     for other_process in data['processes']:
