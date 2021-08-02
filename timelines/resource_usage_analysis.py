@@ -93,7 +93,7 @@ def compute_hours_per_role(G, data, use_weighted_hours):
                                     G.nodes[process]['ES'], G.nodes[process]['LS'], G.nodes[process]['duration'])
 
         for role in G.nodes[process]['roles']:
-            commitment = G.nodes[process]['commitment'][role]*hours_per_attention
+            commitment = G.nodes[process]['commitment'][role]*hours_per_attention * G.nodes[process]['duration'].days/5.
             total_commitment += commitment
             reward = G.nodes[process]['reward']
             idx = roles.index(role)
