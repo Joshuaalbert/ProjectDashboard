@@ -37,7 +37,6 @@ def render_processes(data, save_file):
             new_process_name = data['processes'][new_process]['name']
             st.info(f"Found ({new_process}) {new_process_name}")
             _default_done = data['processes'][new_process]['done']
-            st.write(data['processes'][new_process]['done_date'])
             _default_done_date = datetime.datetime.fromisoformat(data['processes'][new_process]['done_date'])
         else:
             new_process = symbolify_process_name(data, new_process_name)
