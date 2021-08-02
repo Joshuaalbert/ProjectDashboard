@@ -244,6 +244,7 @@ def plot_resource_usage(G, data, hours_per_resource, ax):
         #             color='black',
         #             )
     ax.grid()
+    ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
     ax.legend(loc='lower right')
     ax.set_yticks(np.arange(len(resources)) + 0.5)
     ax.set_yticklabels(resources, rotation=0)
@@ -298,6 +299,7 @@ def plot_role_usage(G, data, hours_per_role, ax):
         #             color='black',
         #             )
     ax.grid()
+    ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
     ax.legend(loc='lower right')
     ax.set_yticks(np.arange(len(roles)) + 0.5)
     ax.set_yticklabels(roles, rotation=0)
