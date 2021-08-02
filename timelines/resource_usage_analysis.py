@@ -145,8 +145,8 @@ def display_usage(G, critical_path, data, G_collapsed=None, critical_path_collap
         display_resources = st.multiselect("Gantt chart only some resources? ", list(data['resources']), [],
                                        help="Whether to GANTT chart certain resources.")
 
-        if len(display_resources)==0:
-            display_resources = list(data['resources'])
+        # if len(display_resources)==0:
+        #     display_resources = list(data['resources'])
 
 
         hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache( data=data, G=G),use_weighted_hours, scenario)
