@@ -11,7 +11,7 @@ from .utils import count_business_days, add_business_days
 
 # make a color map of fixed colors
 cmap = plt.cm.colors.ListedColormap(['tab:cyan','tab:blue','tab:green','tab:olive','orange','red','pink','lime'])
-bounds = [0., 1./3., 2./3., 1., 4./3., 5./3., 2., 2.5, 3.]
+bounds = [0, 2., 4., 6., 8., 10., 15., 20., 100.]
 norm = plt.cm.colors.BoundaryNorm(bounds, cmap.N)
 hours_per_attention = 40.
 
