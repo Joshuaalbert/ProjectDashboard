@@ -291,7 +291,7 @@ def set_process(save_file, data, new_process_name, new_process=None, commitment=
         process_done = False
     if done_date is None:
         done_date = datetime.datetime.now()
-    done_date = next_business_day(strip_time(new_process_earliest_start))
+    done_date = next_business_day(strip_time(done_date))
 
     data['processes'][new_process] = dict(roles=new_process_roles,
                                           dependencies=new_process_dependencies,
