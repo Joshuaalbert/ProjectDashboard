@@ -37,10 +37,10 @@ def fill_graph(G, data, scenario='Normal', max_attention_per_role=1.):
     G.graph['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
     G.graph['max_attention_per_role'] = float(max_attention_per_role)
 
-    for role in data['roles']:
-        G.add_node(f"role_{role}",
-                   attention_per_role=0.,
-                   max_attention_per_role=max_attention_per_role)
+    # for role in data['roles']:
+    #     G.add_node(f"role_{role}",
+    #                attention_per_role=0.,
+    #                max_attention_per_role=max_attention_per_role)
 
     for process in data['processes']:
         if scenario == 'Pessimistic':

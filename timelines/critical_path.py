@@ -83,8 +83,6 @@ class CPM(nx.DiGraph):
                           ES=es,
                           EF=ef,
                           duration=duration)
-            for role in self.nodes[n]['roles']:
-                self.nodes[f"role_{role}"] += self.nodes[n]['attention'][role]
 
     def _backward(self):
         # import streamlit as st
