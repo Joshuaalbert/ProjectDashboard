@@ -310,7 +310,8 @@ def plot_role_usage(G, data, hours_per_role, ax):
 
 def plot_gantt_chart(G, critical_path, display_resources, ax):
     if len(display_resources) > 0:
-        resource_nodes = [node for node in G.nodes if (any([resource in G.nodes[node]['resources'] for resource in display_resources]) or (len(G.nodes[node]['roles']) == 0))]
+        # resource_nodes = [node for node in G.nodes if (any([resource in G.nodes[node]['resources'] for resource in display_resources]) or (len(G.nodes[node]['roles']) == 0))]
+        resource_nodes = list(filter(lambda node: any([resource in G.nodes[node]['resources'] for resource in display_resources]), G.nodes))
     else:
         resource_nodes = list(G.nodes)
     order = []
