@@ -75,9 +75,9 @@ class CPM(nx.DiGraph):
             ef = add_business_days(es, self.nodes[n]['duration'])
             duration = self.nodes[n]['duration']
             if self.nodes[n]['done']:
+                st.write(ef, self.nodes[n]['done_date'], self.nodes[n]['duration'])
                 if ef > self.nodes[n]['done_date']:
                     duration = datetime.timedelta(days=count_business_days(es, self.nodes[n]['done_date']))
-                    st.write(duration)
                     ef = self.nodes[n]['done_date']
             self.add_node(n,
                           ES=es,
