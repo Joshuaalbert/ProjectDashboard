@@ -93,7 +93,7 @@ def compute_hours_per_role(G, data, use_weighted_hours):
                                     G.nodes[process]['ES'], G.nodes[process]['LS'], G.nodes[process]['duration'])
 
         for role in G.nodes[process]['roles']:
-            commitment = G.nodes[process]['commitment'][role]*hours_per_attention * G.nodes[process]['duration'].days/5.
+            commitment = G.nodes[process]['commitment'][role]
             total_commitment += commitment
             reward = G.nodes[process]['reward']
             idx = roles.index(role)
@@ -138,7 +138,7 @@ def get_usage_figs(c, hours_per_role, hours_per_resource, display_resources, sce
     return fig
 
 
-def display_usage(G, critical_path, data, G_collapsed=None, critical_path_collapsed=None, scenario=None):
+def display_usage(G, critical_path, data, G_collapsed=None, critical_path_collapsed=None, scenario=None, max_attention_per_role=None):
     if st.checkbox("Compute resource requirements"):
         use_weighted_hours = st.checkbox("Display probability weighted resource usage.", False,
                                          help="Whether to compute the expected resource usage based on probability of being able to perform process.")
@@ -348,7 +348,7 @@ def plot_gantt_chart(G, critical_path, display_resources, ax):
     plt.tight_layout()
 
 
-def display_graph(G, critical_path, data, scenario):
+def display_graph(G, critical_path, data, scenario, max_attention_per_role):
     if st.checkbox("Display graph", False):
 
         H = graphviz_graph(engine='dot')

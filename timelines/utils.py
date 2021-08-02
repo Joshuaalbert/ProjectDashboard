@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import numpy as np
 import streamlit
-
+hours_per_attention = 40.
 
 def flush_state(save_file, data):
     with open(save_file, 'w') as f:
@@ -32,9 +32,15 @@ def merge_nodes(G, nodes, new_node, attr_dict=None, **attr):
     for n in nodes:  # remove the merged nodes
         G.remove_node(n)
 
-def fill_graph(G, data, scenario='Normal'):
+def fill_graph(G, data, scenario='Normal', max_attention_per_role=1.):
     G.graph['cache_hash'] = data['cache_hash']
     G.graph['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
+    G.graph['max_attention_per_role'] = float(max_attention_per_role)
+
+    for role in data['roles']:
+        G.add_node(f"role_{role}",
+                   attention_per_role=0.,
+                   max_attention_per_role=max_attention_per_role)
 
     for process in data['processes']:
         if scenario == 'Pessimistic':
@@ -46,7 +52,7 @@ def fill_graph(G, data, scenario='Normal'):
         else:
             raise ValueError(f"Invalid scenario, {scenario}")
         _duration = int(_mod * data['processes'][process]['duration']) # days
-        _commitment = {key: com * _duration / 5. for key, com in data['processes'][process]['commitment'].items()}
+        _commitment = {key: com * hours_per_attention * _duration / 5. for key, com in data['processes'][process]['commitment'].items()}
         G.add_node(f"{process}",
                    duration=datetime.timedelta(days=_duration),
                    roles=data['processes'][process]['roles'],
@@ -55,6 +61,7 @@ def fill_graph(G, data, scenario='Normal'):
                    reward=data['processes'][process]['reward'],
                    success_prob=data['processes'][process]['success_prob'],
                    commitment=_commitment,
+                   attention=data['processes'][process]['commitment'],
                    earliest_start=next_business_day(datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])),
                    delay_start=datetime.timedelta(data['processes'][process]['delay_start']),
                    done=data['processes'][process]['done'],
