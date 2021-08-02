@@ -192,7 +192,9 @@ def render_processes(data, save_file):
 
     # Display them
     with st.beta_expander("Processes"):
-        for process in data['processes']:
+        G = nx.DiGraph()
+        fill_graph(G, data)
+        for process in nx.topological_sort(G):
             if not any([process in data['subgraphs'][subgraph]['processes']
                     for subgraph in rollouts]):
                 _done = data['processes'][process]['done']
