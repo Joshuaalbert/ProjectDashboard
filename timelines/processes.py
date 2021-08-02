@@ -107,7 +107,7 @@ def render_processes(data, save_file):
         commitment = dict()
         for role in new_process_roles:
             if (new_process in data['processes']) and (role in data['processes'][new_process]['commitment']):
-                _default_commitment = data['processes'][new_process]['commitment'][role]
+                _default_commitment = float(data['processes'][new_process]['commitment'][role])
             else:
                 _default_commitment = 0.
             _commitment = st.slider(f"Attention {role}:", 0., 5., _default_commitment, step=1./3.,
