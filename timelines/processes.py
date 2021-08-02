@@ -198,9 +198,9 @@ def render_processes(data, save_file):
                 _done = data['processes'][process]['done']
                 _done_date = data['processes'][process]['done_date']
                 if _done:
-                    st.markdown(f" -[x] ({process}) {data['processes'][process]['name']} done on {_done_date}")
+                    st.markdown(f" - [x] ({process}) {data['processes'][process]['name']} done on {_done_date}")
                 else:
-                    st.markdown(f" -[ ] ({process}) {data['processes'][process]['name']}")
+                    st.markdown(f" - [ ] ({process}) {data['processes'][process]['name']}")
 
 
 def delete_processes(data, processes, save_file):
