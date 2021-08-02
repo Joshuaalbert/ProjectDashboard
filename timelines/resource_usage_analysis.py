@@ -11,8 +11,9 @@ from .utils import count_business_days, add_business_days
 
 # make a color map of fixed colors
 cmap = plt.cm.colors.ListedColormap(['tab:cyan','tab:blue','tab:green','tab:olive','orange','red','pink','lime'])
-bounds = [0, 2., 4., 6., 8., 10., 15., 20., 100.]
+bounds = [0., 1./3., 2./3., 1., 4./3., 5./3., 2., 2.5, 3.]
 norm = plt.cm.colors.BoundaryNorm(bounds, cmap.N)
+hours_per_attention = 40.
 
 def add_colorbar_to_axes(ax, label):
     """
@@ -92,7 +93,7 @@ def compute_hours_per_role(G, data, use_weighted_hours):
                                     G.nodes[process]['ES'], G.nodes[process]['LS'], G.nodes[process]['duration'])
 
         for role in G.nodes[process]['roles']:
-            commitment = G.nodes[process]['commitment'][role]
+            commitment = G.nodes[process]['commitment'][role]*hours_per_attention
             total_commitment += commitment
             reward = G.nodes[process]['reward']
             idx = roles.index(role)
