@@ -337,7 +337,7 @@ def plot_gantt_chart(G, critical_path, display_resources, ax):
 
             ax.broken_barh(xranges,
                            yrange,
-                           facecolors=('green', 'blue', 'green'),
+                           facecolors=('green', 'blue', 'yellow'),
                            edgecolor='black',
                            alpha=0.5)
     ax.grid()
