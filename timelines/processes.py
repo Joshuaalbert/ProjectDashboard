@@ -81,8 +81,8 @@ def render_processes(data, save_file):
         else:
             _default_duration = 0
             _default_duration_in_weeks = True
-            _default_pessimistic_modifer = 1.
-            _default_optimistic_modifer = 1.
+            _default_pessimistic_modifer = 3.
+            _default_optimistic_modifer = 0.3
 
 
         # Duration
@@ -90,9 +90,9 @@ def render_processes(data, save_file):
                                         help="Whether duration of process is in business weeks.")
 
         if duration_in_weeks:
-            _default_duration = _default_duration // 5
             new_process_duration = st.slider("Duration: ", 0, 52, _default_duration, step=1,
                                                      help="Duration of the process in weeks.")
+            new_process_duration *= 5
         else:
             new_process_duration = st.slider("Duration: ", 0, 30, _default_duration, step=1,
                                              help="Duration of the process in business days.")
@@ -104,9 +104,6 @@ def render_processes(data, save_file):
         optimistic_modifier = st.slider("Optimistic modifier", min_value=0., max_value=1.,
                                         value=_default_optimistic_modifer, step=0.1,
                                         help="Optimistic estimate of duration is duration times this.")
-
-        if duration_in_weeks:
-            new_process_duration *= 5
 
         # Roles
         if new_process in data['processes']:
