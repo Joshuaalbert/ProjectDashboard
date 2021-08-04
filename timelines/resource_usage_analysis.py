@@ -332,8 +332,8 @@ def plot_gantt_chart(G, critical_path, display_resources, ax):
         else:
             yrange = (bar_idx, 1)
             xranges = [(G.nodes[process]['ES'], G.nodes[process]['LS'] - G.nodes[process]['ES']),
-                       (G.nodes[process]['LS'], G.nodes[process]['EF'] - G.nodes[process]['LS']),
-                       (G.nodes[process]['EF'], G.nodes[process]['LF'] - G.nodes[process]['EF'])]
+                       (G.nodes[process]['EF'], G.nodes[process]['LF'] - G.nodes[process]['EF']),
+                       (G.nodes[process]['LS'], G.nodes[process]['EF'] - G.nodes[process]['LS'])]
 
             ax.broken_barh(xranges,
                            yrange,
