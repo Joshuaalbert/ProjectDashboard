@@ -8,7 +8,7 @@ from .utils import flush_state
 def render_resources(data, save_file):
     ###
     # resources
-    with st.sidebar.beta_expander("Resources"):
+    with st.sidebar.expander("Resources"):
         new_resource = st.text_input("Resource name: ", help="Add a new resource.")
 
         if new_resource in data['resources']:
@@ -49,6 +49,6 @@ def render_resources(data, save_file):
                 del data['resources'][resource]
             flush_state(save_file, data)
 
-    with st.beta_expander("Resources"):
+    with st.expander("Resources"):
         for resource in data['resources']:
             st.markdown(f" - {resource} -> {', '.join(data['resources'][resource]['roles'])}")

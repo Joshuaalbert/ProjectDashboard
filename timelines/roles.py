@@ -6,7 +6,7 @@ from .utils import flush_state
 def render_roles(data, save_file):
     ###
     # roles
-    with st.sidebar.beta_expander("Roles"):
+    with st.sidebar.expander("Roles"):
         new_role = st.text_input("New role: ", help="Add a new role type.")
         if st.button("Add role") and (new_role != ""):
             if new_role not in data['roles']:
@@ -28,6 +28,6 @@ def render_roles(data, save_file):
                         del data['processes'][process]['commitment'][role]
 
             flush_state(save_file, data)
-    with st.beta_expander("Roles"):
+    with st.expander("Roles"):
         for role in data['roles']:
             st.markdown(f" - {role}")

@@ -8,7 +8,7 @@ from .utils import flush_state, symbolify, fill_graph, add_business_days
 
 
 def render_process_subgraph(data, save_file):
-    with st.sidebar.beta_expander("Subgraphs"):
+    with st.sidebar.expander("Subgraphs"):
         new_subgraph_name = st.text_input("Subgraph Name: ")
 
         if new_subgraph_name in data['subgraphs']:
@@ -87,7 +87,7 @@ def render_process_subgraph(data, save_file):
     for subgraph in data['subgraphs']:
         if re.match("SG-(.+?)-RO", subgraph) is not None:
             rollouts.append(subgraph)
-    with st.beta_expander("Subgraphs"):
+    with st.expander("Subgraphs"):
         for subgraph in data['subgraphs']:
             if subgraph in rollouts:
                 counts = set()

@@ -22,7 +22,7 @@ def symbolify_process_name(data, new_process_name):
 def render_processes(data, save_file):
     ###
     # processes
-    with st.sidebar.beta_expander("Processes"):
+    with st.sidebar.expander("Processes"):
         rollouts = []
         for subgraph in data['subgraphs']:
             if re.match("SG-(.+?)-RO", subgraph) is not None:
@@ -188,7 +188,7 @@ def render_processes(data, save_file):
             delete_processes(data, _delete_processes, save_file)
 
     # Display them
-    with st.beta_expander("Processes"):
+    with st.expander("Processes"):
         G = nx.DiGraph()
         fill_graph(G, data)
         for process in nx.topological_sort(G):
