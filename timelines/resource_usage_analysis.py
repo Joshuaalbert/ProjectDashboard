@@ -133,8 +133,7 @@ def render_resource_usage(data, scenario, date_of_change):
 
         hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache(data=data, G=G), use_weighted_hours, scenario)
 
-        plot_usage_figs(Cache(data=data, G=G), display_resources, scenario)
-
+        plot_usage_figs(Cache(data=data, G=G), hours_per_role, hours_per_resource)
 
         if st.checkbox("Display resource costs"):
             plot_costs_per_resource(G, data, cost_per_resource)
@@ -239,6 +238,7 @@ def plot_role_usage(G, data, hours_per_role, ax):
         xranges = []
         facecolors = []
         annotations = []
+        print(bar_idx, hours_per_role)
         for _start_range, _end_range in get_breaks(hours_per_role[bar_idx, :]):
             xranges.append(
                 (start_date + datetime.timedelta(days=_start_range), datetime.timedelta(days=_end_range - _start_range)))
