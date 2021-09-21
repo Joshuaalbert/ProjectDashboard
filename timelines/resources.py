@@ -5,7 +5,7 @@ import streamlit as st
 from .utils import flush_state
 
 
-def render_resources(data, save_file):
+def render_resources(data, save_file, advanced):
     ###
     # resources
     with st.sidebar.expander("Resources"):

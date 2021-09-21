@@ -9,9 +9,9 @@ from .critical_path import render_critical_path
 from .processes import render_processes
 from .resources import render_resources
 from .roles import render_roles
-from .subgraphs import render_process_subgraph
-from .utils import flush_state
-
+from .resource_usage_analysis import render_resource_usage
+from .utils import flush_state, Cache, get_dates_of_prediction_change
+from .graph import display_graph
 import base64
 
 
@@ -52,7 +52,7 @@ def render_components():
         flush_state(save_file, data)
 
     st.sidebar.markdown(get_table_download_link(save_file), unsafe_allow_html=True)
-
+    advanced = st.sidebar.checkbox("Advanced options", False, help="Whether to enable probabilistic options.")
     if st.sidebar.button("Refresh"):
         caching.clear_cache()
 
@@ -60,16 +60,35 @@ def render_components():
     if start_date is not None:
         data['start_date'] = start_date.isoformat()
 
+    container = st.container()
 
-    render_roles(data, save_file)
 
-    render_resources(data, save_file)
+    ### display sections
 
-    render_processes(data, save_file)
+    st.header("Visualise")
 
-    render_process_subgraph(data, save_file)
+    scenario = st.radio("Scenario: ", ['Pessimistic', 'Normal', 'Optimistic'], index=1, help="Which scenario to show")
 
-    render_critical_path(data)
+    dates_of_change = get_dates_of_prediction_change(Cache(data))
+    if len(dates_of_change) > 1:
+        date_of_change = st.select_slider("Date of prediction: ", dates_of_change,
+                                          value=dates_of_change[0],
+                                          format_func=lambda date: date.isoformat(),
+                                          help="Choose the historical date to explore past predictions, from past updates.")
+    else:
+        date_of_change = datetime.datetime.fromisoformat(data['start_date'])
+
+    display_graph(data, scenario, date_of_change)
+
+    render_critical_path(data, scenario, date_of_change)
+
+    render_resource_usage(data, scenario, date_of_change)
+
+    ## data
+    with container:
+        render_roles(data, save_file, advanced)
+        render_resources(data, save_file, advanced)
+        render_processes(data, save_file, advanced, scenario, date_of_change)
 
 
 

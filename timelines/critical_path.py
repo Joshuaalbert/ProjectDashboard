@@ -1,31 +1,15 @@
 import datetime
-import re
 
 import networkx as nx
+import numpy as np
+import pylab as plt
 import streamlit as st
-from copy import deepcopy
 
 from .probabilities import compute_event_probabilities
-from .resource_usage_analysis import display_graph, display_usage
+from .utils import Cache, hash_map, set_prediction_data
 
 from .utils import add_business_days, subtract_business_days, count_business_days, next_business_day, strip_time, \
-    fill_graph, prod, merge_nodes
-
-
-class Cache(object):
-    def __init__(self, **kwargs):
-        self._kwargs = dict()
-        for key in kwargs:
-            self._kwargs[key] = kwargs[key]
-
-    @property
-    def cache_hash(self):
-        return self._kwargs['data']['cache_hash']
-
-    def __getitem__(self, item):
-        return self._kwargs[item]
-
-hash_map = {Cache:lambda c: c.cache_hash}
+    fill_graph
 
 class CPM(nx.DiGraph):
 
@@ -128,90 +112,66 @@ class CPM(nx.DiGraph):
         self._dirty = False
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_critical_path(c, scenario, max_attention_per_role):
-    data = c['data']
+def get_critical_path(cache: Cache, scenario, date_of_change):
+    data = cache['data']
     G = CPM()
-
-    fill_graph(G, data, scenario, max_attention_per_role)
-
-    compute_event_probabilities(G, 1000)
-
+    fill_graph(G, data, scenario)
+    set_prediction_data(scenario, date_of_change, G, data)
+    compute_event_probabilities(G)
     critical_path = G.critical_path
     return G, critical_path
 
 
-def render_critical_path(data):
-    st.header("Critical Path")
-    scenario = st.radio("Scenario: ", ['Pessimistic', 'Normal', 'Optimistic'], index=1,help="Which scenario to show")
+def render_critical_path(data, scenario, date_of_change):
 
-    max_attention_per_role = st.slider("Maximum attention per role",0., 5., 1., step=1/3.,
-                                       help="What is the maximum attention allocated to each role? Affects how non-critical tasks are scheduled.")
+    if st.checkbox("Display critical path", False):
+        display_resources = st.multiselect("Gantt chart only some resources? ", list(data['resources']), [],
+                                           help="Whether to GANTT chart certain resources.")
 
-    G, critical_path = get_critical_path(Cache(data=data), scenario, max_attention_per_role)
-    G_collapsed, critical_path_collapsed = collapse_rollouts(G, critical_path, data, scenario, max_attention_per_role)
+        G, critical_path = get_critical_path(Cache(data=data), scenario, date_of_change)
 
-    st.subheader("Graph")
-    display_graph(G_collapsed, critical_path_collapsed, data, scenario, max_attention_per_role)
-
-    st.subheader("Timeline")
-
-    display_usage(G, critical_path, data, G_collapsed, critical_path_collapsed, scenario, max_attention_per_role)
-
-@st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_collapsed_rollout(c, scenario):
-    data = c['data']
-    G = c['G']
-    critical_path = c['critical_path']
-    rollout_subgraphs = dict()
-    G = deepcopy(G)
-    for subgraph in data['subgraphs']:
-        if re.match("SG-(.+?)-RO", subgraph) is not None:
-            rollout_subgraphs[subgraph] = data['subgraphs'][subgraph]['processes']
-
-    _new_critical_path_additions = set()
-    attrs = dict()
-    for subgraph in rollout_subgraphs:
-        for process in rollout_subgraphs[subgraph]:
-            if process in critical_path:
-                _new_critical_path_additions.add(subgraph)
-                idx = critical_path.index(process)
-                # st.warning(f"Removing {critical_path[idx]}")
-                del critical_path[idx]
-
-        G_rollout = nx.subgraph(G, rollout_subgraphs[subgraph])
-
-        es = min([G_rollout.nodes[n]['ES'] for n in G_rollout.nodes],
-                 default=next_business_day(strip_time(datetime.datetime.now())))
-        ls = min([G_rollout.nodes[n]['LS'] for n in G_rollout.nodes],
-                 default=next_business_day(strip_time(datetime.datetime.now())))
-        ef = max([G_rollout.nodes[n]['EF'] for n in G_rollout.nodes],
-                 default=next_business_day(strip_time(datetime.datetime.now())))
-        lf = max([G_rollout.nodes[n]['LF'] for n in G_rollout.nodes],
-                 default=next_business_day(strip_time(datetime.datetime.now())))
-        reward = sum([G_rollout.nodes[n]['reward'] for n in G_rollout.nodes])
-        in_nodes = filter(lambda n: G_rollout.in_degree(n) == 0, G_rollout.nodes)
-        out_nodes = filter(lambda n: G_rollout.out_degree(n) == 0, G_rollout.nodes)
-        start_prob = prod([G_rollout.nodes[n]['start_prob'] for n in in_nodes])
-        success_prob = prod([G_rollout.nodes[n]['success'] for n in out_nodes])
-        attrs[subgraph] = dict(ES=es, EF=ef, LF=lf, LS=ls,
-                               reward=reward, start_prob=start_prob,
-                               success=success_prob,
-                               duration=lf - es)
-        # st.write(es, lf, lf-es)
-
-    for subgraph in rollout_subgraphs:
-        merge_nodes(G, rollout_subgraphs[subgraph], subgraph)
-        for key in attrs[subgraph]:
-            G.nodes[subgraph][key] = attrs[subgraph][key]
-
-    for process in list(_new_critical_path_additions):
-        critical_path.append(process)
-        # st.warning(f"Adding {process}")
-    return G, critical_path
+        plot_gantt_chart(G, critical_path, display_resources)
 
 
-def collapse_rollouts(G, critical_path, data, scenario, max_attention_per_role):
-    if st.checkbox("Collapse Roll-outs", True, help="Whether to collapse rolled-out subgraphs into single processes."):
-        G, critical_path = get_collapsed_rollout(Cache(data=data, G=G, critical_path=critical_path), scenario)
+def plot_gantt_chart(G, critical_path, display_resources):
+    fig, ax = plt.subplots(1, 1, figsize=(12, 28//3))
 
-    return G, critical_path
+    if len(display_resources) > 0:
+        # resource_nodes = [node for node in G.nodes if (any([resource in G.nodes[node]['resources'] for resource in display_resources]) or (len(G.nodes[node]['roles']) == 0))]
+        resource_nodes = list(filter(lambda node: any([resource in G.nodes[node]['resources'] for resource in display_resources]), G.nodes))
+    else:
+        resource_nodes = list(G.nodes)
+    order = []
+    for bar_idx, process in enumerate(filter(lambda node: node in resource_nodes, nx.topological_sort(G))):
+        order.append(process)
+
+        if process in critical_path:
+            start_day = G.nodes[process]['ES']
+            end_day = G.nodes[process]['LF']
+            xranges = [(start_day, end_day - start_day)]
+            yrange = (bar_idx, 1)
+
+            ax.broken_barh(xranges,
+                           yrange,
+                           facecolors='red',
+                           edgecolor='black',
+                           alpha=0.75)
+        else:
+            yrange = (bar_idx, 1)
+            xranges = [(G.nodes[process]['ES'], G.nodes[process]['LS'] - G.nodes[process]['ES']),
+                       (G.nodes[process]['EF'], G.nodes[process]['LF'] - G.nodes[process]['EF']),
+                       (G.nodes[process]['LS'], G.nodes[process]['EF'] - G.nodes[process]['LS'])]
+
+            ax.broken_barh(xranges,
+                           yrange,
+                           facecolors=('green', 'blue', 'yellow'),
+                           edgecolor='black',
+                           alpha=0.5)
+    ax.grid()
+    ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
+    ax.legend(loc='lower right')
+    ax.set_yticks(np.arange(len(order)) + 0.5)
+    ax.set_yticklabels(order, rotation=0)
+    plt.tight_layout()
+
+    st.write(fig)

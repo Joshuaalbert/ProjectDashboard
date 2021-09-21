@@ -1,11 +1,25 @@
 import datetime
 import json
-import re
-from copy import deepcopy
 
 import numpy as np
-import streamlit
+import streamlit as st
 hours_per_attention = 40.
+
+class Cache(object):
+    def __init__(self, data, **kwargs):
+        self._kwargs = dict()
+        self._kwargs['data'] = data
+        for key in kwargs:
+            self._kwargs[key] = kwargs[key]
+
+    @property
+    def cache_hash(self):
+        return self._kwargs['data']['cache_hash']
+
+    def __getitem__(self, item):
+        return self._kwargs[item]
+
+hash_map = {Cache:lambda c: c.cache_hash}
 
 def flush_state(save_file, data):
     with open(save_file, 'w') as f:
@@ -32,15 +46,9 @@ def merge_nodes(G, nodes, new_node, attr_dict=None, **attr):
     for n in nodes:  # remove the merged nodes
         G.remove_node(n)
 
-def fill_graph(G, data, scenario='Normal', max_attention_per_role=1.):
+def fill_graph(G, data, scenario="Normal"):
     G.graph['cache_hash'] = data['cache_hash']
     G.graph['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
-    G.graph['max_attention_per_role'] = float(max_attention_per_role)
-
-    # for role in data['roles']:
-    #     G.add_node(f"role_{role}",
-    #                attention_per_role=0.,
-    #                max_attention_per_role=max_attention_per_role)
 
     for process in data['processes']:
         if scenario == 'Pessimistic':
@@ -162,5 +170,58 @@ def count_business_days(start, end):
         date += datetime.timedelta(days=1)
     return count
 
-if __name__ == '__main__':
-    test_add_subtract_business_days()
+
+
+
+
+def set_prediction_data(scenario, date, G, data):
+    date = strip_time(date)
+    for process in G.nodes:
+        __date = datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])
+        __duration = data['processes'][process]['duration']
+        for _date_key in data['processes'][process]['duration_dict']:
+            _date = datetime.datetime.fromisoformat(_date_key)
+            if (_date >= __date) and (_date <= date):
+                __date = _date
+                __duration = data['processes'][process]['duration_dict'][_date_key]
+
+        __date = datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])
+        __pessimistic_modifier = data['processes'][process]['pessimistic_modifier']
+        for _date_key in data['processes'][process]['pessimistic_modifier_dict']:
+            _date = datetime.datetime.fromisoformat(_date_key)
+            if (_date >= __date) and (_date <= date):
+                __date = _date
+                __pessimistic_modifier = data['processes'][process]['pessimistic_modifier_dict'][_date_key]
+
+        __date = datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])
+        __optimistic_modifier = data['processes'][process]['optimistic_modifier']
+        for _date_key in data['processes'][process]['optimistic_modifier_dict']:
+            _date = datetime.datetime.fromisoformat(_date_key)
+            if (_date >= __date) and (_date <= date):
+                __date = _date
+                __optimistic_modifier = data['processes'][process]['optimistic_modifier_dict'][_date_key]
+
+        if scenario == 'Normal':
+            G.nodes[process]['duration'] = datetime.timedelta(days=__duration)
+        if scenario == 'Pessimistic':
+            G.nodes[process]['duration'] = datetime.timedelta(days=int(__duration*__pessimistic_modifier))
+        if scenario == 'Optimistic':
+            G.nodes[process]['duration'] = datetime.timedelta(days=int(__duration*__optimistic_modifier))
+
+
+
+
+@st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
+def get_dates_of_prediction_change(cache: Cache):
+    data = cache['data']
+    if 'processes' not in data:
+        return []
+    dates = set()
+    for process in data['processes']:
+        for date in data['processes'][process]['duration_dict']:
+            dates.add(datetime.datetime.fromisoformat(date))
+        for date in data['processes'][process]['pessimistic_modifier_dict']:
+            dates.add(datetime.datetime.fromisoformat(date))
+        for date in data['processes'][process]['optimistic_modifier_dict']:
+            dates.add(datetime.datetime.fromisoformat(date))
+    return sorted(list(dates))

@@ -3,7 +3,7 @@ import streamlit as st
 from .utils import flush_state
 
 
-def render_roles(data, save_file):
+def render_roles(data, save_file, advanced):
     ###
     # roles
     with st.sidebar.expander("Roles"):

@@ -27,7 +27,7 @@ def prod(l):
         return 1.
     return np.prod(l)
 
-def compute_event_probabilities(G, unused_num_samples):
+def compute_event_probabilities(G):
     for n in nx.topological_sort(G):
         G.nodes[n]['start_prob'] = prod([G.nodes[j]['success'] for j in G.predecessors(n)])
         G.nodes[n]['success'] = G.nodes[n]['success_prob']/100. * G.nodes[n]['start_prob']

@@ -5,9 +5,9 @@ import numpy as np
 import pylab as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import streamlit as st
-from graphviz import Digraph as graphviz_graph
 
-from .utils import count_business_days, add_business_days
+from .critical_path import get_critical_path
+from .utils import add_business_days, Cache
 
 # make a color map of fixed colors
 cmap = plt.cm.colors.ListedColormap(['tab:cyan','tab:blue','tab:green','tab:olive','orange','red','pink','lime'])
@@ -31,18 +31,6 @@ def add_colorbar_to_axes(ax, label):
     sm = plt.cm.ScalarMappable(norm, cmap=cmap)
     ax.figure.colorbar(sm,label=label ,cax=cax, orientation='vertical')
 
-class Cache(object):
-    def __init__(self, **kwargs):
-        self._kwargs = dict()
-        for key in kwargs:
-            self._kwargs[key] = kwargs[key]
-
-    @property
-    def cache_hash(self):
-        return self._kwargs['data']['cache_hash']
-
-    def __getitem__(self, item):
-        return self._kwargs[item]
 
 hash_map = {Cache:lambda c: c.cache_hash, np.ndarray: lambda x: np.sum(x)}
 
@@ -109,73 +97,47 @@ def compute_hours_per_role(G, data, use_weighted_hours):
     return hours, reward
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_hour_stats(c, use_weighted_hours, scenario):
-    data = c['data']
-    G = c['G']
+def get_hour_stats(cache: Cache, use_weighted_hours, scenario):
+    data = cache['data']
+    G = cache['G']
     hours_per_role, reward = compute_hours_per_role(G, data, use_weighted_hours)
     hours_per_resource = compute_hours_per_resource(hours_per_role, data)
     cost_per_resource = compute_cost_per_resource(G, data, hours_per_resource)
     return hours_per_role, hours_per_resource, cost_per_resource, reward
 
-@st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_usage_figs(c, hours_per_role, hours_per_resource, display_resources, scenario):
-    G = c['G']
-    G_collapsed = c['G_collapsed']
-    data = c['data']
-    critical_path_collapsed = c['critical_path_collapsed']
+# @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
+def plot_usage_figs(cache:Cache, hours_per_role, hours_per_resource):
+    G = cache['G']
+    data = cache['data']
 
-    fig, axs = plt.subplots(3, 1, figsize=(12, 28), sharex=True)
+    fig, axs = plt.subplots(2, 1, figsize=(12, 28//2), sharex=True)
 
-    plot_gantt_chart(G_collapsed, critical_path_collapsed, display_resources, axs[0])
+    plot_role_usage(G, data, hours_per_role, axs[0])
 
-    plot_role_usage(G, data, hours_per_role, axs[1])
+    plot_resource_usage(G, data, hours_per_resource, axs[1])
 
-    plot_resource_usage(G, data, hours_per_resource, axs[2])
+    add_colorbar_to_axes(axs[0], "hours / b.day / res.")
+    add_colorbar_to_axes(axs[1], "hours / b.day")
 
-    add_colorbar_to_axes(axs[1], "hours / b.day / res.")
-    add_colorbar_to_axes(axs[2], "hours / b.day")
-
-    return fig
+    st.write(fig)
 
 
-def display_usage(G, critical_path, data, G_collapsed=None, critical_path_collapsed=None, scenario=None, max_attention_per_role=None):
-    if st.checkbox("Compute resource requirements"):
+def render_resource_usage(data, scenario, date_of_change):
+    if st.checkbox("Display resource requirements"):
         use_weighted_hours = st.checkbox("Display probability weighted resource usage.", False,
                                          help="Whether to compute the expected resource usage based on probability of being able to perform process.")
-        display_resources = st.multiselect("Gantt chart only some resources? ", list(data['resources']), [],
-                                       help="Whether to GANTT chart certain resources.")
+        display_resources = st.multiselect("Display resource usage of only some resources? ", list(data['resources']), [],
+                                       help="Whether to display resource usage of certain resources.")
 
-        # if len(display_resources)==0:
-        #     display_resources = list(data['resources'])
+        G, critical_path = get_critical_path(Cache(data), scenario, date_of_change)
+
+        hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache(data=data, G=G), use_weighted_hours, scenario)
+
+        plot_usage_figs(Cache(data=data, G=G), display_resources, scenario)
 
 
-        hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache( data=data, G=G),use_weighted_hours, scenario)
-
-        if G_collapsed is None:
-            G_collapsed = G
-
-        if critical_path_collapsed is None:
-            critical_path_collapsed = critical_path
-
-        fig = get_usage_figs(Cache(G_collapsed=G_collapsed, G=G, data=data,
-                                   critical_path_collapsed=critical_path_collapsed),
-                             hours_per_role,
-                             hours_per_resource,
-                             display_resources,
-                             scenario
-                             )
-
-        # fig, axs = plt.subplots(3, 1, figsize=(12, 28), sharex=True)
-        #
-        # plot_gantt_chart(G_collapsed, critical_path_collapsed, axs[0])
-        #
-        # plot_role_usage(G, data, hours_per_role, axs[1])
-        #
-        # plot_resource_usage(G, data, hours_per_resource, axs[2])
-
-        st.write(fig)
-
-        plot_costs_per_resource(G, data, cost_per_resource, reward, scenario)
+        if st.checkbox("Display resource costs"):
+            plot_costs_per_resource(G, data, cost_per_resource)
 
 def compute_cost_per_resource(G, data, hours_per_resource):
     start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.now())
@@ -308,74 +270,13 @@ def plot_role_usage(G, data, hours_per_role, ax):
     plt.tight_layout()
 
 
-def plot_gantt_chart(G, critical_path, display_resources, ax):
-    if len(display_resources) > 0:
-        # resource_nodes = [node for node in G.nodes if (any([resource in G.nodes[node]['resources'] for resource in display_resources]) or (len(G.nodes[node]['roles']) == 0))]
-        resource_nodes = list(filter(lambda node: any([resource in G.nodes[node]['resources'] for resource in display_resources]), G.nodes))
-    else:
-        resource_nodes = list(G.nodes)
-    order = []
-    for bar_idx, process in enumerate(filter(lambda node: node in resource_nodes, nx.topological_sort(G))):
-        order.append(process)
-
-        if process in critical_path:
-            start_day = G.nodes[process]['ES']
-            end_day = G.nodes[process]['LF']
-            xranges = [(start_day, end_day - start_day)]
-            yrange = (bar_idx, 1)
-
-            ax.broken_barh(xranges,
-                           yrange,
-                           facecolors='red',
-                           edgecolor='black',
-                           alpha=0.75)
-        else:
-            yrange = (bar_idx, 1)
-            xranges = [(G.nodes[process]['ES'], G.nodes[process]['LS'] - G.nodes[process]['ES']),
-                       (G.nodes[process]['EF'], G.nodes[process]['LF'] - G.nodes[process]['EF']),
-                       (G.nodes[process]['LS'], G.nodes[process]['EF'] - G.nodes[process]['LS'])]
-
-            ax.broken_barh(xranges,
-                           yrange,
-                           facecolors=('green', 'blue', 'yellow'),
-                           edgecolor='black',
-                           alpha=0.5)
-    ax.grid()
-    ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
-    ax.legend(loc='lower right')
-    ax.set_yticks(np.arange(len(order)) + 0.5)
-    ax.set_yticklabels(order, rotation=0)
-    plt.tight_layout()
-
-
-def display_graph(G, critical_path, data, scenario, max_attention_per_role):
-    if st.checkbox("Display graph", False):
-
-        H = graphviz_graph(engine='dot')
-
-        for process in G.nodes:
-            if process in critical_path:
-                label = "{}\nDur={} days\nPs={:.3f}, Pf={:.3f}".format(process, G.nodes[process]['duration'].days,
-                                                                       round(G.nodes[process]['start_prob'], 3),
-                                                                       round(G.nodes[process]['success'], 3))
-            else:
-                label = "{}\nSlack={} days\nPs={:.3f}, Pf={:.3f}".format(process, G.nodes[process]['total_float'].days,
-                                                                         round(G.nodes[process]['start_prob'], 3),
-                                                                         round(G.nodes[process]['success'], 3))
-            H.node(process, penwidth="3" if process in critical_path else "1",
-                   label=label)
-            for dep in G.pred[process]:
-                H.edge(dep, process, penwidth="3" if (dep in critical_path) and (process in critical_path) else "1")
-
-        st.graphviz_chart(H)
-
-def plot_costs_per_resource(G, data, cost_per_resource, rewards, scenario):
+def plot_costs_per_resource(G, data, cost_per_resource):
     start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.fromisoformat(data['start_date']))
     end_date = max([G.nodes[node]['LF'] for node in G.nodes], default=datetime.datetime.fromisoformat(data['start_date']))
     num_days = (end_date - start_date).days
     time = [start_date + datetime.timedelta(days=i) for i in range(num_days)]
     fig, ax = plt.subplots(1,1, figsize=(8,6))
-    total_cost = np.zeros(num_days)-rewards
+    total_cost = np.zeros(num_days)
     cum_cost_per_resource = {resource:np.cumsum(cost_per_resource[resource]) for resource in data['resources']}
     vmin = min([cum_cost_per_resource[resource][-1] for resource in data['resources']], default=0)
     vmax = max([cum_cost_per_resource[resource][-1] for resource in data['resources']], default=0)
