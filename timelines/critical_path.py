@@ -137,18 +137,18 @@ def get_critical_path(cache: Cache, scenario, date_of_change, termination_nodes=
 def render_critical_path(data, scenario, date_of_change):
 
     if st.checkbox("Display critical path", False):
-        display_resources = st.multiselect("Gantt chart only some resources? ", list(data['resources']), [],
-                                           help="Whether to GANTT chart certain resources.")
+        # display_resources = st.multiselect("Gantt chart only some resources? ", list(data['resources']), [],
+        #                                    help="Whether to GANTT chart certain resources.")
 
         termination_nodes = st.multiselect("Termination points: ", data['processes'], [],
                                            help='What nodes to compute up until, else all.')
+
         if len(termination_nodes) == 0:
             termination_nodes = None
 
-        G, critical_path = get_critical_path(Cache(data=data), scenario, date_of_change,
-                                             termination_nodes)
+        G, critical_path = get_critical_path(Cache(data=data), scenario, date_of_change, termination_nodes)
 
-        plot_gantt_chart(G, critical_path, display_resources)
+        plot_gantt_chart(G, critical_path, [])
 
 
 def plot_gantt_chart(G, critical_path, display_resources):
