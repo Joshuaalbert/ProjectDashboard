@@ -89,8 +89,9 @@ def render_components():
 
     ## data
     with container:
-        render_roles(data, save_file, advanced)
-        render_resources(data, save_file, advanced)
+        if advanced:
+            render_roles(data, save_file, advanced)
+            render_resources(data, save_file, advanced)
         render_processes(data, save_file, advanced, scenario, date_of_change)
 
 
