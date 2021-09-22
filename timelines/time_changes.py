@@ -6,7 +6,7 @@ import datetime
 import pylab as plt
 
 def render_timeline_changes(cache: Cache, scenario, dates_of_change):
-    if st.checkbox("Display timeline evolution", False) and len(dates_of_change) > 0:
+    if st.checkbox("Display timeline evolution", False):
         termination_nodes = st.multiselect("Termination point: ", cache['data']['processes'],[], help='What nodes to compute up until, else all.')
         if len(termination_nodes) == 0:
             termination_nodes = None
