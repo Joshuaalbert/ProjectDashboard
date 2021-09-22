@@ -13,6 +13,11 @@ def render_timeline_changes(cache: Cache, scenario, dates_of_change):
         fig, ax = plt.subplots(1,1,figsize=(12,28//3))
         _dates = []
         _total_lengths = []
+
+        G, critical_path = get_critical_path(cache, scenario, datetime.datetime.now(), termination_nodes=termination_nodes)
+        _dates.append(datetime.datetime.now())
+        _total_lengths.append(G.critical_path_end)
+
         for date in dates_of_change:
             G, critical_path = get_critical_path(cache, scenario, date, termination_nodes=termination_nodes)
             _dates.append(date)
