@@ -124,13 +124,14 @@ def get_critical_path(cache: Cache, scenario, date_of_change, termination_nodes=
     if termination_nodes is not None:
         if not isinstance(termination_nodes, (tuple, list)):
             termination_nodes = [termination_nodes]
-        descendants = set()
+        ancestors = set()
         for source in termination_nodes:
-            _descendants = nx.algorithms.descendants(G, source)
-            descendants = descendants.union(_descendants)
-        for node in descendants:
-            G.remove_node(node)
-            st.write(node)
+            _ancestors = nx.algorithms.ancestors(G, source)
+            ancestors = ancestors.union(_ancestors)
+        for node in list(G.nodes):
+            if node not in ancestors:
+                G.remove_node(node)
+                st.write(node)
     critical_path = G.critical_path
     return G, critical_path
 
