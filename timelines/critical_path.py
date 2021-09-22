@@ -131,7 +131,6 @@ def get_critical_path(cache: Cache, scenario, date_of_change, termination_nodes=
         for node in list(G.nodes):
             if node not in ancestors:
                 G.remove_node(node)
-                st.write(node)
     critical_path = G.critical_path
     return G, critical_path
 
@@ -149,7 +148,6 @@ def render_critical_path(data, scenario, date_of_change):
             termination_nodes = None
 
         G, critical_path = get_critical_path(Cache(data=data), scenario, date_of_change, termination_nodes)
-        st.write(G.nodes)
         plot_gantt_chart(G, critical_path, [])
 
 
