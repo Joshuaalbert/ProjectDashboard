@@ -147,7 +147,7 @@ def render_critical_path(data, scenario, date_of_change):
             termination_nodes = None
 
         G, critical_path = get_critical_path(Cache(data=data), scenario, date_of_change, termination_nodes)
-        print(G.nodes)
+        st.write(G.nodes)
         plot_gantt_chart(G, critical_path, [])
 
 
