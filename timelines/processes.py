@@ -39,19 +39,6 @@ def render_processes(data, save_file, advanced, scenario, date_of_change):
             _default_done = False
             _default_done_date = None
 
-
-        if new_process_name in data['processes']:
-            # Name was symbol, so swap
-            new_process = new_process_name
-            new_process_name = data['processes'][new_process]['name']
-            st.info(f"Found ({new_process}) {new_process_name}")
-            _default_done = data['processes'][new_process]['done']
-            _default_done_date = datetime.datetime.fromisoformat(data['processes'][new_process]['done_date'])
-        else:
-            new_process = symbolify_process_name(data, new_process_name)
-            _default_done = False
-            _default_done_date = None
-
         process_done = st.checkbox("Done", _default_done, help="Is this process done?")
         if process_done:
             done_date = st.date_input("Done date",value=_default_done_date,
