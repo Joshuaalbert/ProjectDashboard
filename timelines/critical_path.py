@@ -130,6 +130,7 @@ def get_critical_path(cache: Cache, scenario, date_of_change, termination_nodes=
             descendants = descendants.union(_descendants)
         for node in descendants:
             G.remove_node(node)
+            st.write(node)
     critical_path = G.critical_path
     return G, critical_path
 
