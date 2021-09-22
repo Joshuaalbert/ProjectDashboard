@@ -140,7 +140,7 @@ def render_critical_path(data, scenario, date_of_change):
         display_resources = st.multiselect("Gantt chart only some resources? ", list(data['resources']), [],
                                            help="Whether to GANTT chart certain resources.")
 
-        termination_nodes = st.multiselect("Termination point: ", data['processes'], [],
+        termination_nodes = st.multiselect("Termination points: ", data['processes'], [],
                                            help='What nodes to compute up until, else all.')
         if len(termination_nodes) == 0:
             termination_nodes = None
