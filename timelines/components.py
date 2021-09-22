@@ -12,6 +12,7 @@ from .roles import render_roles
 from .resource_usage_analysis import render_resource_usage
 from .utils import flush_state, Cache, get_dates_of_prediction_change
 from .graph import display_graph
+from .time_changes import render_timeline_changes
 import base64
 
 
@@ -81,6 +82,8 @@ def render_components():
     display_graph(data, scenario, date_of_change)
 
     render_critical_path(data, scenario, date_of_change)
+
+    render_timeline_changes(Cache(data), scenario, dates_of_change)
 
     render_resource_usage(data, scenario, date_of_change)
 

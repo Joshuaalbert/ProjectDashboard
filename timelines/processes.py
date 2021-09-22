@@ -188,7 +188,7 @@ def render_processes(data, save_file, advanced, scenario, date_of_change):
     # Display them
     with st.expander("Processes"):
         G, critical_path = get_critical_path(Cache(data), scenario, date_of_change)
-        for process in critical_path:
+        for process in nx.algorithms.topological_sort(G):
             _done = data['processes'][process]['done']
             _done_date = datetime.datetime.fromisoformat(data['processes'][process]['done_date'])
             if _done:

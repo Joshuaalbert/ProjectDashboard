@@ -238,7 +238,6 @@ def plot_role_usage(G, data, hours_per_role, ax):
         xranges = []
         facecolors = []
         annotations = []
-        print(bar_idx, hours_per_role)
         for _start_range, _end_range in get_breaks(hours_per_role[bar_idx, :]):
             xranges.append(
                 (start_date + datetime.timedelta(days=_start_range), datetime.timedelta(days=_end_range - _start_range)))

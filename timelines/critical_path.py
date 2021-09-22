@@ -71,7 +71,7 @@ class CPM(nx.DiGraph):
     def _backward(self):
         # import streamlit as st
         for n in reversed(list(nx.topological_sort(self))):
-            lf = min([self.nodes[j]['LS'] for j in self.successors(n)], default=self._critical_path_length)
+            lf = min([self.nodes[j]['LS'] for j in self.successors(n)], default=self._critical_path_end)
             if self.nodes[n]['done']:
                 lf = self.nodes[n]['done_date']
             ls = subtract_business_days(lf,self.nodes[n]['duration'])
@@ -79,10 +79,6 @@ class CPM(nx.DiGraph):
                           LS=ls,
                           LF=lf,
                           total_float=datetime.timedelta(days=count_business_days(self.nodes[n]['ES'], lf)) - self.nodes[n]['duration'])
-
-
-
-            # st.write(datetime.timedelta(days=count_business_days(self.nodes[n]['ES'], lf)) - self.nodes[n]['duration'])
 
     def _compute_critical_path(self):
         graph = set()
@@ -99,6 +95,12 @@ class CPM(nx.DiGraph):
         return self._critical_path_length
 
     @property
+    def critical_path_end(self):
+        if self._dirty:
+            self._update()
+        return self._critical_path_end
+
+    @property
     def critical_path(self):
         if self._dirty:
             self._update()
@@ -106,18 +108,28 @@ class CPM(nx.DiGraph):
 
     def _update(self):
         self._forward()
-        self._critical_path_length = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0))
+        self._critical_path_end = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0))
+        self._critical_path_length = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0)) - min(nx.get_node_attributes(self, 'ES').values(), default=datetime.timedelta(0))
         self._backward()
         self._compute_critical_path()
         self._dirty = False
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_critical_path(cache: Cache, scenario, date_of_change):
+def get_critical_path(cache: Cache, scenario, date_of_change, termination_nodes=None):
     data = cache['data']
     G = CPM()
     fill_graph(G, data, scenario)
     set_prediction_data(scenario, date_of_change, G, data)
     compute_event_probabilities(G)
+    if termination_nodes is not None:
+        if not isinstance(termination_nodes, (tuple, list)):
+            termination_nodes = [termination_nodes]
+        descendants = set()
+        for source in termination_nodes:
+            _descendants = nx.algorithms.descendants(G, source)
+            descendants = descendants.union(_descendants)
+        for node in descendants:
+            G.remove_node(node)
     critical_path = G.critical_path
     return G, critical_path
 
