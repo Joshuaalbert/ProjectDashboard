@@ -22,8 +22,23 @@ def render_processes(data, save_file, advanced, scenario, date_of_change):
     ###
     # processes
     with st.sidebar.expander("Processes"):
-        new_process_name = st.text_input("Process name: ",
-                                                 help="Add a new process, can be symbol or name. If symbol then modifies that process. If name then makes a new symbol for that name.")
+        new_process_lookup = st.multiselect("Process Lookup: ", data['processes'],[], help='Look-up a process via symbol and modify.')
+
+        if len(new_process_lookup) == 1:
+            new_process = new_process_lookup[0]
+            new_process_name = data['processes'][new_process]['name']
+            st.info(f"Found ({new_process}) {new_process_name}")
+            _default_done = data['processes'][new_process]['done']
+            _default_done_date = datetime.datetime.fromisoformat(data['processes'][new_process]['done_date'])
+        else:
+            if len(new_process_lookup) > 1:
+                st.info("Lookup max one process")
+            new_process_name = st.text_input("Process name: ",
+                                             help="Add a new process. Makes a new symbol for that name.")
+            new_process = symbolify_process_name(data, new_process_name)
+            _default_done = False
+            _default_done_date = None
+
 
         if new_process_name in data['processes']:
             # Name was symbol, so swap
