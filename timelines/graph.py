@@ -4,22 +4,18 @@ from .utils import Cache
 from .critical_path import get_critical_path
 
 
-def display_graph(data, scenario, date_of_change):
+def display_graph(data, date_of_change):
     if st.checkbox("Display graph", False):
 
-        G, critical_path = get_critical_path(Cache(data=data), scenario, date_of_change)
+        G, critical_path = get_critical_path(Cache(data=data), date_of_change)
 
         H = graphviz_graph(engine='dot')
 
         for process in G.nodes:
             if process in critical_path:
-                label = "{}\nDur={} days\nPs={:.3f}, Pf={:.3f}".format(process, G.nodes[process]['duration'].days,
-                                                                       round(G.nodes[process]['start_prob'], 3),
-                                                                       round(G.nodes[process]['success'], 3))
+                label = "{}\nDur={} days".format(process, G.nodes[process]['duration'].days)
             else:
-                label = "{}\nSlack={} days\nPs={:.3f}, Pf={:.3f}".format(process, G.nodes[process]['total_float'].days,
-                                                                         round(G.nodes[process]['start_prob'], 3),
-                                                                         round(G.nodes[process]['success'], 3))
+                label = "{}\nSlack={} days".format(process, G.nodes[process]['total_float'].days)
             H.node(process, penwidth="3" if process in critical_path else "1",
                    label=label)
             for dep in G.pred[process]:

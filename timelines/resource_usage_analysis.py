@@ -97,7 +97,7 @@ def compute_hours_per_role(G, data, use_weighted_hours):
     return hours, reward
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def get_hour_stats(cache: Cache, use_weighted_hours, scenario):
+def get_hour_stats(cache: Cache, use_weighted_hours):
     data = cache['data']
     G = cache['G']
     hours_per_role, reward = compute_hours_per_role(G, data, use_weighted_hours)
@@ -122,17 +122,16 @@ def plot_usage_figs(cache:Cache, hours_per_role, hours_per_resource):
     st.write(fig)
 
 
-def render_resource_usage(data, scenario, date_of_change):
+def render_resource_usage(data, date_of_change):
     if st.checkbox("Display resource requirements"):
         use_weighted_hours = st.checkbox("Display probability weighted resource usage.", False,
                                          help="Whether to compute the expected resource usage based on probability of being able to perform process.")
         display_resources = st.multiselect("Display resource usage of only some resources? ", list(data['resources']), [],
                                        help="Whether to display resource usage of certain resources.")
 
-        G, critical_path = get_critical_path(Cache(data), scenario, date_of_change)
+        G, critical_path = get_critical_path(Cache(data), date_of_change)
 
-        hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache(data=data, G=G), use_weighted_hours, scenario)
-
+        hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache(data=data, G=G), use_weighted_hours)
         plot_usage_figs(Cache(data=data, G=G), hours_per_role, hours_per_resource)
 
         if st.checkbox("Display resource costs"):

@@ -5,7 +5,7 @@ import networkx as nx
 import datetime
 import pylab as plt
 
-def render_timeline_changes(cache: Cache, scenario, dates_of_change):
+def render_timeline_changes(cache: Cache, dates_of_change):
     if st.checkbox("Display timeline evolution", False):
         termination_nodes = st.multiselect("Termination point: ", cache['data']['processes'],[], help='What nodes to compute up until, else all.')
         if len(termination_nodes) == 0:
@@ -14,12 +14,12 @@ def render_timeline_changes(cache: Cache, scenario, dates_of_change):
         _dates = []
         _total_lengths = []
 
-        G, critical_path = get_critical_path(cache, scenario, datetime.datetime.now(), termination_nodes=termination_nodes)
+        G, critical_path = get_critical_path(cache, datetime.datetime.now(), termination_nodes=termination_nodes)
         _dates.append(datetime.datetime.now())
         _total_lengths.append(G.critical_path_end)
 
         for date in dates_of_change:
-            G, critical_path = get_critical_path(cache, scenario, date, termination_nodes=termination_nodes)
+            G, critical_path = get_critical_path(cache, date, termination_nodes=termination_nodes)
             _dates.append(date)
             _total_lengths.append(G.critical_path_end)
             #

@@ -32,32 +32,42 @@ def get_table_download_link(save_file):
 def render_components():
     save_file = st.sidebar.text_input("State file: ", 'project.json', help="JSON file to store information in.")
 
+    if not save_file.endswith('.json'):
+        raise ValueError("Save file must end with '.json'")
+
     file = st.sidebar.file_uploader("Upload data file", type=['json'], accept_multiple_files=False)
+
     if st.sidebar.button("Load file") and (file is not None):
         data = json.load(file)
         flush_state(save_file, data)
+        st.sidebar.info(f"Loaded {file} into {save_file}. Previous contents of {save_file} are deleted.")
 
 
     if os.path.isfile(save_file):
         with open(save_file, 'r') as f:
             data = json.load(f)
             data['start_date'] = data['start_date'] if 'start_date' in data else datetime.datetime.now().isoformat()
-
     else:
         data = dict(cache_hash=0,
                     start_date=datetime.datetime.now().isoformat(),
                     roles=[],
                     resources=dict(),
-                    processes=dict(),
-                    subgraphs=dict())
+                    processes=dict())
         flush_state(save_file, data)
 
     st.sidebar.markdown(get_table_download_link(save_file), unsafe_allow_html=True)
-    advanced = st.sidebar.checkbox("Advanced options", False, help="Whether to enable probabilistic options.")
+
+    advanced = st.sidebar.checkbox("Advanced options", False, help="Whether to enable advanced options.")
+
     if st.sidebar.button("Refresh"):
         caching.clear_cache()
 
-    start_date = st.sidebar.date_input("Start date: ", datetime.datetime.fromisoformat(data['start_date']), help='Date where process graph starts.')
+
+    st.session_state['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
+    start_date = st.sidebar.date_input("Start date: ",
+                                       help='Date where process graph starts.',
+                                       key='start_date')
+
     if start_date is not None:
         data['start_date'] = start_date.isoformat()
 
@@ -68,31 +78,28 @@ def render_components():
 
     st.header("Visualise")
 
-    scenario = st.radio("Scenario: ", ['Pessimistic', 'Normal', 'Optimistic'], index=1, help="Which scenario to show")
-
     dates_of_change = get_dates_of_prediction_change(Cache(data))
     if len(dates_of_change) > 1:
         date_of_change = st.select_slider("Date of prediction: ", dates_of_change,
-                                          value=dates_of_change[0],
                                           format_func=lambda date: date.isoformat(),
                                           help="Choose the historical date to explore past predictions, from past updates.")
     else:
         date_of_change = datetime.datetime.fromisoformat(data['start_date'])
 
-    display_graph(data, scenario, date_of_change)
+    display_graph(data, date_of_change)
 
-    render_critical_path(data, scenario, date_of_change)
+    render_critical_path(data, date_of_change)
 
-    render_timeline_changes(Cache(data), scenario, dates_of_change)
+    render_timeline_changes(Cache(data), dates_of_change)
 
-    render_resource_usage(data, scenario, date_of_change)
+    render_resource_usage(data, date_of_change)
 
     ## data
     with container:
         if advanced:
             render_roles(data, save_file, advanced)
             render_resources(data, save_file, advanced)
-        render_processes(data, save_file, advanced, scenario, date_of_change)
+        render_processes(data, save_file, advanced, date_of_change)
 
 
 

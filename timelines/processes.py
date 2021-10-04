@@ -2,8 +2,10 @@ import datetime
 import networkx as nx
 import streamlit as st
 
-from .utils import flush_state, fill_graph, symbolify, next_business_day, strip_time, Cache
+from .utils import flush_state, fill_graph, symbolify, next_business_day, strip_time, Cache, count_business_days, \
+    add_business_days
 from .critical_path import get_critical_path
+
 
 def symbolify_process_name(data, new_process_name):
     new_process = symbolify(new_process_name)
@@ -18,167 +20,249 @@ def symbolify_process_name(data, new_process_name):
     return new_process
 
 
-def render_processes(data, save_file, advanced, scenario, date_of_change):
+def build_remaining_to_duration(remaining_key):
+    def _f():
+        if 'process_date_started' not in st.session_state:
+            start_date = next_business_day(strip_time(datetime.datetime.now()))
+        else:
+            start_date = strip_time(st.session_state['process_date_started'])
+        process_duration = count_business_days(start_date,
+                                               add_business_days(datetime.datetime.now(),
+                                                                 datetime.timedelta(
+                                                                     days=st.session_state[remaining_key])))
+        st.session_state[remaining_key.replace('remaining', 'duration')] = process_duration
+
+    return _f
+
+def build_duration_to_remaining(duration_key):
+    def _f():
+        if 'process_date_started' not in st.session_state:
+            start_date = next_business_day(strip_time(datetime.datetime.now()))
+        else:
+            start_date = strip_time(st.session_state['process_date_started'])
+        process_remaining = count_business_days(datetime.datetime.now(),
+                                                add_business_days(start_date,
+                                                                  datetime.timedelta(
+                                                                      days=st.session_state[duration_key])))
+        st.session_state[duration_key.replace('duration', 'remaining')] = process_remaining
+
+    return _f
+
+def render_processes(data, save_file, advanced, date_of_change):
     ###
     # processes
     with st.sidebar.expander("Processes"):
-        new_process_lookup = st.multiselect("Process Lookup: ", data['processes'],[], help='Look-up a process via symbol and modify.')
+        def _lookup_process_cb():
+            process_lookup = st.session_state['process_lookup']
+            if len(process_lookup) == 1:  # found
+                date = data['processes'][process]['last_date']
+                process_data = data['processes'][process]['history'][date]
+                session_state = dict(
+                    process=process_lookup[0],  # symbol
+                    process_name=process_data['name'],  # Name
+                    process_done=process_data['done'],
+                    process_done_date=datetime.datetime.fromisoformat(process_data['done_date']),
+                    process_dependencies=process_data['dependencies'],
+                    process_date_started=datetime.datetime.fromisoformat(
+                        process_data['started_date']),
+                    process_started=process_data['started'],
+                    process_duration=process_data['duration'],
+                    pessimistic_duration=process_data['pessimistic_duration'],
+                    optimistic_duration=process_data['optimistic_duration'],
+                    process_roles=process_data['roles'],
+                    process_commitment=process_data['commitment'],
+                    process_earliest_start=datetime.datetime.fromisoformat(
+                        process_data['earliest_start']),
+                    process_delay_start=process_data['delay_start']
+                )
+            else:  # none looked up, defaults are set
+                if len(process_lookup) > 1:
+                    st.info("Lookup max one process!")
+                session_state = dict(
+                    process_name="",
+                    process_done=False,
+                    process_done_date=strip_time(datetime.datetime.now()),
+                    process_dependencies=[],
+                    process_date_started=strip_time(datetime.datetime.now()),
+                    process_started=False,
+                    process_duration=0,
+                    pessimistic_duration=0,
+                    optimistic_duration=0,
+                    process_roles=[],
+                    process_commitment=dict(),
+                    process_earliest_start=strip_time(datetime.datetime.fromisoformat(data['start_date'])),
+                    process_delay_start=0
+                )
 
-        if len(new_process_lookup) == 1:
-            new_process = new_process_lookup[0]
-            new_process_name = data['processes'][new_process]['name']
-            st.info(f"Found ({new_process}) {new_process_name}")
-            _default_done = data['processes'][new_process]['done']
-            _default_done_date = datetime.datetime.fromisoformat(data['processes'][new_process]['done_date'])
+            for key in session_state:
+                st.session_state[key] = session_state[key]
+            build_duration_to_remaining('process_duration')
+            build_duration_to_remaining('pessimistic_duration')
+            build_duration_to_remaining('optimistic_duration')
+
+        process_lookup = st.multiselect("Process Lookup: ",
+                                        data['processes'],
+                                        [],
+                                        help='Look-up a process via symbol and modify.',
+                                        on_change=_lookup_process_cb,
+                                        key='process_lookup')
+
+        process_name = st.text_input("Process name: ",
+                                     help="Add a new process. Makes a new symbol for that name.",
+                                     key='process_name')
+
+        if len(process_lookup) == 0:
+            process = symbolify_process_name(data, process_name)
+        elif len(process_lookup) == 1:
+            process = process_lookup[0]
         else:
-            if len(new_process_lookup) > 1:
-                st.info("Lookup max one process")
-            new_process_name = st.text_input("Process name: ",
-                                             help="Add a new process. Makes a new symbol for that name.")
-            new_process = symbolify_process_name(data, new_process_name)
-            _default_done = False
-            _default_done_date = None
-
-        process_done = st.checkbox("Done", _default_done, help="Is this process done?")
-        if process_done:
-            done_date = st.date_input("Done date",value=_default_done_date,
-                                      min_value=None, max_value=datetime.datetime.now(),
-                                      help="When was the process done?")
-        else:
-            done_date = None
-
+            raise ValueError("Too many symbols selected.")
+        # store process name
+        st.session_state['process'] = process
 
         # Dependencies
         dep_options = list(data['processes'])
-        if new_process in data['processes']:
-            _default_dependencies = data['processes'][new_process]['dependencies']
+        if process in data['processes']:
             G = nx.DiGraph()
-            fill_graph(G, data, scenario)
-            descendants = nx.algorithms.dag.descendants(G, new_process)
-            dep_options = sorted(list(set(dep_options) - descendants - {new_process}))
-        else:
-            _default_dependencies = []
+            fill_graph(G, data, datetime.datetime.fromisoformat(data['processes'][process]['last_date']))
+            descendants = nx.algorithms.dag.descendants(G, process)
+            dep_options = sorted(list(set(dep_options) - descendants - {process}))
 
-        new_process_dependencies = st.multiselect("Dependencies:", dep_options, _default_dependencies,
-                                                  help="What are the dependencies of this process.")
+        st.multiselect("Dependencies:",
+                       dep_options,
+                       help="What are the dependencies of this process.",
+                       key='process_dependencies')
+
+        process_done = st.checkbox("Process Done",
+                                   help="Is this process done?",
+                                   key='process_done')
+
+        if process_done:
+            def _clean_date():
+                st.session_state['process_done_date'] = next_business_day(
+                    strip_time(st.session_state['process_done_date']))
+
+            st.date_input("Date finished",
+                          min_value=None,
+                          max_value=datetime.datetime.now(),
+                          help="When was the process done?",
+                          key='process_done_date',
+                          on_change=_clean_date)
+
+        if process_done:
+            st.session_state['process_started'] = True
+
+        process_started = st.checkbox("Process Started",
+                                      help="Is this process underway?",
+                                      key='process_started')
+
+        if process_started:
+            def _clean_date():
+                st.session_state['process_date_started'] = next_business_day(strip_time(st.session_state['process_date_started']))
+
+            st.date_input("Date started",
+                          min_value=None,
+                          max_value=st.session_state['process_done_date'] if process_done else datetime.datetime.now(),
+                          help="When was the process done?",
+                          key='process_date_started',
+                          on_change=_clean_date)
 
 
+        if process_started and not process_done:
 
-        if new_process in data['processes']:
-            _default_duration = data['processes'][new_process]['duration']
-            _default_pessimistic_modifer = data['processes'][new_process]['pessimistic_modifier']
-            _default_optimistic_modifer = data['processes'][new_process]['optimistic_modifier']
-            if _default_duration % 5 == 0:
-                _default_duration = _default_duration // 5
-                _default_duration_in_weeks = True
-            else:
-                _default_duration_in_weeks = False
+            st.slider("Conservative remaining (days)",
+                      min_value=0,
+                      max_value=30,
+                      step=1,
+                      help='Days remaining until done.',
+                      key='process_remaining',
+                      on_change=build_remaining_to_duration('process_remaining'))
 
-        else:
-            _default_duration = 0
-            _default_duration_in_weeks = True
-            _default_pessimistic_modifer = 2.
-            _default_optimistic_modifer = 0.5
+            st.slider("Pessimistic remaining (days)",
+                      min_value=st.session_state['process_remaining'],
+                      max_value=st.session_state['process_remaining'] + 30,
+                      step=1,
+                      help='Pessimistic estimate of days remaining until done.',
+                      key='pessimistic_remaining',
+                      on_change=build_remaining_to_duration('pessimistic_remaining'))
 
-
-        # Duration
-        duration_in_weeks = st.checkbox("Duration in weeks", _default_duration_in_weeks,
-                                        help="Whether duration of process is in business weeks.")
-
-        if duration_in_weeks:
-            new_process_duration = st.slider("Duration: ", 0, 52, _default_duration, step=1,
-                                                     help="Duration of the process in weeks.")
-            new_process_duration *= 5
-        else:
-            new_process_duration = st.slider("Duration: ", 0, 30, _default_duration, step=1,
-                                             help="Duration of the process in business days.")
+            st.slider("Optimistic remaining (days)",
+                      min_value=0,
+                      max_value=max(st.session_state['process_remaining'], 1),
+                      step=1,
+                      help='Optimistic estimate of days remaining until done.',
+                      key='optimistic_remaining',
+                      on_change=build_remaining_to_duration('optimistic_remaining'))
 
 
-        pessimistic_modifier = st.slider("Pessimistic modifier", min_value=1., max_value=5., value=_default_pessimistic_modifer, step=0.1,
-                  help="Pessimistic estimate of duration is duration times this.")
+        elif not process_started and not process_done:
+            st.slider("Conservative duration (days)",
+                      min_value=0,
+                      max_value=30,
+                      step=1,
+                      help='Days duration total.',
+                      key='process_duration',
+                      on_change=build_duration_to_remaining('process_duration'))
 
-        optimistic_modifier = st.slider("Optimistic modifier", min_value=0., max_value=1.,
-                                        value=_default_optimistic_modifer, step=0.1,
-                                        help="Optimistic estimate of duration is duration times this.")
+            st.slider("Pessimistic duration (days)",
+                      min_value=st.session_state['process_duration'],
+                      max_value=st.session_state['process_duration'] + 30,
+                      step=1,
+                      help='Conservative estimate of days to do.',
+                      key='pessimistic_duration',
+                      on_change=build_duration_to_remaining('pessimistic_duration'))
+
+            st.slider("Optimistic duration (days)",
+                      min_value=0,
+                      max_value=max(st.session_state['process_duration'], 1),
+                      step=1,
+                      help='Optimistic estimate of days to do.',
+                      key='optimistic_duration',
+                      on_change=build_duration_to_remaining('optimistic_duration'))
+        elif process_started and process_done:
+            st.session_state['process_duration'] = count_business_days(strip_time(st.session_state['process_date_started']),
+                                                                       strip_time(st.session_state['process_done_date']))
+            st.session_state['pessimistic_duration'] = st.session_state['optimistic_duration'] = st.session_state['process_duration']
+            st.info(f"Duration {st.session_state['process_duration']} days.")
+        elif process_done and not process_started:
+            st.info("If process done then a start date must be chosen too.")
+
+        st.subheader("Starting constraints")
 
         # Earliest start
-        if new_process in data['processes']:
-            _default_earliest_start = datetime.datetime.fromisoformat(data['processes'][new_process]['earliest_start'])
-        else:
-            _default_earliest_start = strip_time(datetime.datetime.fromisoformat(data['start_date']))
-        new_process_earliest_start = st.date_input("Earliest start:", _default_earliest_start,
-                                                   help="What date is the earliest this process can start?")
+        st.date_input("Earliest start:",
+                      help="What date is the earliest this process can start?",
+                      key='process_earliest_start')
 
-
-        # Roles
-        if new_process in data['processes']:
-            _default_roles = data['processes'][new_process]['roles']
-        else:
-            _default_roles = []
+        # Delay start
+        st.slider("Delay start:", min_value=0, max_value=30,
+                  help="Delay stary by this many days after all dependencies end.",
+                  key='process_delay_start')
 
         if advanced:
-            new_process_roles = st.multiselect("Required roles:", data['roles'], _default_roles,
-                                           help="Which roles are needed for process success.")
-        else:
-            new_process_roles = _default_roles
+            # Roles
+            process_roles = st.multiselect("Required roles:", data['roles'],
+                                           help="Which roles are needed for process success.",
+                                           key='process_roles')
 
-        # Commitment
-        commitment = dict()
-        for role in new_process_roles:
-            if (new_process in data['processes']) and (role in data['processes'][new_process]['commitment']):
-                _default_commitment = float(data['processes'][new_process]['commitment'][role])
-            else:
-                _default_commitment = 1.
-            if advanced:
-                _commitment = st.slider(f"Attention {role}:", 0., 5., _default_commitment, step=1./3.,
-                                    help="Attention of this role required for execution. > 1 means more than one resources with this role required.")
-            else:
-                _commitment = _default_commitment
-            commitment[role] = _commitment
-
-
-
-        # Success Probability give correct resources
-        if new_process in data['processes']:
-            _default_success_prob = data['processes'][new_process]['success_prob']
-        else:
-            _default_success_prob = 100
-        if advanced:
-            new_process_success_prob = st.slider("Success prob (%):", 0, 100, _default_success_prob, step=10,
-                                             help="Probability of success with fully resourced process.")
-        else:
-            new_process_success_prob = _default_success_prob
-
-
-        # Reward
-        if new_process in data['processes']:
-            _default_reward = data['processes'][new_process]['reward']
-        else:
-            _default_reward = 0
-        if advanced:
-            new_process_reward = st.text_input("Reward ($):", _default_reward,
-                                                   help="How much is earned by this process.")
-            new_process_reward = float(new_process_reward)
-        else:
-            new_process_reward = _default_reward
+            # Commitment
+            commitment = dict()
+            for role in process_roles:
+                last_date = data['processes'][process]['last_date']
+                if (process in data['processes']) and (role in data['processes'][process]['history'][last_date]['commitment']):
+                    _default_commitment = float(data['processes'][process]['history'][last_date]['commitment'][role])
+                else:
+                    _default_commitment = 1.
+                if advanced:
+                    _commitment = st.slider(f"Attention {role}:", 0., 5., _default_commitment, step=1. / 3.,
+                                            help="Attention of this role required for execution. > 1 means more than one resources with this role required.")
+                else:
+                    _commitment = _default_commitment
+                commitment[role] = _commitment
 
         # Add it
-        if st.button("Add/Mod process") and (new_process != ""):
-            set_process(save_file, data,
-                        new_process_name=new_process_name,
-                        new_process=new_process,
-                        commitment=commitment,
-                        new_process_dependencies=new_process_dependencies,
-                        new_process_duration=new_process_duration,
-                        new_process_earliest_start=new_process_earliest_start,
-                        new_process_reward=new_process_reward,
-                        new_process_roles=new_process_roles,
-                        new_process_success_prob=new_process_success_prob,
-                        new_process_delay_start=0,
-                        pessimistic_modifier=pessimistic_modifier,
-                        optimistic_modifier=optimistic_modifier,
-                        process_done=process_done,
-                        done_date=done_date)
+        if st.button("Add/Mod process") and (process != ""):
+            set_process(save_file, data)
 
         # Delete
         delete_options = list(data['processes'])
@@ -189,22 +273,23 @@ def render_processes(data, save_file, advanced, scenario, date_of_change):
 
     # Display them
     with st.expander("Processes"):
-        G, critical_path = get_critical_path(Cache(data), scenario, date_of_change)
+        G, critical_path = get_critical_path(Cache(data), date_of_change)
         for process in nx.algorithms.topological_sort(G):
-            _done = data['processes'][process]['done']
-            _done_date = datetime.datetime.fromisoformat(data['processes'][process]['done_date'])
+            last_date = data['processes'][process]['last_date']
+            _done = data['processes'][process]['history'][last_date]['done']
+            _done_date = datetime.datetime.fromisoformat(data['processes'][process]['history'][last_date]['done_date'])
             if _done:
-                st.markdown(f" - [x] ({process}) {data['processes'][process]['name']} done on {date_label(_done_date)}")
+                st.markdown(f" - [x] ({process}) {data['processes'][process]['history'][last_date]['name']} done on {date_label(_done_date)}")
             else:
-                st.markdown(f" - [ ] ({process}) {data['processes'][process]['name']}")
-                st.markdown(f"**{scenario} Scenario: {G.nodes[process]['duration'].days} days**")
+                st.markdown(f" - [ ] ({process}) {data['processes'][process]['history'][last_date]['name']}")
                 st.markdown(f"Earliest Start: {date_label(G.nodes[process]['ES'])}")
                 st.markdown(f"Latest Start: {date_label(G.nodes[process]['LS'])}")
                 st.markdown(f"Earliest Finish: {date_label(G.nodes[process]['EF'])}")
                 st.markdown(f"Latest Finish: {date_label(G.nodes[process]['LF'])}")
 
-def date_label(date:datetime.datetime):
+def date_label(date: datetime.datetime):
     return date.strftime("%a, %d %b, %Y")
+
 
 def delete_processes(data, processes, save_file):
     # unload subgraphs
@@ -215,113 +300,53 @@ def delete_processes(data, processes, save_file):
     for process in processes:
         # delete process
         del data['processes'][process]
-        # st.warning(f"Deleting process: {process}")
         # delete from dependencies
         for other_process in data['processes']:
-            if process in data['processes'][other_process]['dependencies']:
-                idx = data['processes'][other_process]['dependencies'].index(process)
-                del data['processes'][other_process]['dependencies'][idx]
+            for date in data['processes'][other_process]['history']:
+                if process in data['processes'][other_process]['history'][date]['dependencies']:
+                    idx = data['processes'][other_process]['history'][date]['dependencies'].index(process)
+                    del data['processes'][other_process]['history'][date]['dependencies'][idx]
     flush_state(save_file, data)
 
 
-def set_process(save_file, data, new_process_name, new_process=None, commitment=None, new_process_dependencies=None,
-                new_process_duration=None, new_process_earliest_start=None, new_process_reward=None,
-                new_process_roles=None,
-                new_process_success_prob=None,
-                new_process_delay_start=None,
-                pessimistic_modifier=None,
-                optimistic_modifier=None,
-                process_done=None,
-                done_date=None
-                ):
-
-    if new_process is None:
-        new_process = symbolify_process_name(data, new_process_name)
-
-    if new_process_dependencies is None:
-        new_process_dependencies = []
-    new_process_dependencies = list(new_process_dependencies)
-
-    if new_process_duration is None:
-        new_process_duration = 0
-    new_process_duration = int(new_process_duration)
-
-    if pessimistic_modifier is None:
-        pessimistic_modifier = 1.
-    pessimistic_modifier = float(pessimistic_modifier)
-
-    if optimistic_modifier is None:
-        optimistic_modifier = 1.
-    optimistic_modifier = float(optimistic_modifier)
-
-    if new_process_earliest_start is None:
-        new_process_earliest_start = datetime.datetime.now()
-    new_process_earliest_start = next_business_day(strip_time(new_process_earliest_start))
-
-    if new_process_reward is None:
-        new_process_reward = 0.
-    new_process_reward = float(new_process_reward)
-
-    if new_process_delay_start is None:
-        new_process_delay_start = 0
-    new_process_delay_start = int(new_process_delay_start)
-
-    if new_process_roles is None:
-        new_process_roles = []
-    new_process_roles = list(new_process_roles)
-
-    if commitment is None:
-        commitment = {role: 0. for role in new_process_roles}
-
-    if new_process_success_prob is None:
-        new_process_success_prob = 100
-    new_process_success_prob = int(new_process_success_prob)
-
-    if process_done is None:
-        process_done = False
-    if done_date is None:
-        done_date = datetime.datetime.now()
-    done_date = next_business_day(strip_time(done_date))
+def set_process(save_file, data):
+    today = next_business_day(strip_time(datetime.datetime.today()))
+    process = st.session_state['process']
+    process_name = st.session_state['process_name']
+    process_dependencies = list(st.session_state['process_dependencies'])
+    process_done = bool(st.session_state['process_done'])
+    process_done_date = next_business_day(strip_time(st.session_state['process_done_date'])) if 'process_done_date' in st.session_state else today
+    process_started = bool(st.session_state['process_started'])
+    process_start_date = next_business_day(strip_time(st.session_state['process_start_date'])) if 'process_start_date' in st.session_state else today
+    process_duration = int(st.session_state['process_duration'])
+    pessimistic_duration = int(st.session_state['pessimistic_duration'])
+    optimistic_duration = int(st.session_state['optimistic_duration'])
+    process_earliest_start = next_business_day(strip_time(st.session_state['process_earliest_start']))
+    process_delay_start = int(st.session_state['process_delay_start'])
+    process_roles = list(st.session_state['process_roles'])
+    process_commitment = st.session_state['process_commitment']
+    for role in process_roles:
+        assert role in data['roles']
 
     # Use this to make note of duration, and modifiers
-    today = strip_time(datetime.datetime.today())
-    if new_process not in data['processes']:
-        duration_dict = dict()
-        pessimistic_modifier_dict = dict()
-        optimistic_modifier_dict = dict()
-    else:
-        if 'duration_dict' not in data['processes'][new_process]:
-            duration_dict = {data['processes'][new_process]['earliest_start']: data['processes'][new_process]['duration']}
-        else:
-            duration_dict = data['processes'][new_process]['duration_dict']
-        if 'pessimistic_modifier_dict' not in data['processes'][new_process]:
-            pessimistic_modifier_dict = {data['processes'][new_process]['earliest_start']: data['processes'][new_process]['pessimistic_modifier']}
-        else:
-            pessimistic_modifier_dict = data['processes'][new_process]['pessimistic_modifier_dict']
-        if 'optimistic_modifier_dict' not in data['processes'][new_process]:
-            optimistic_modifier_dict = {data['processes'][new_process]['earliest_start']: data['processes'][new_process]['optimistic_modifier']}
-        else:
-            optimistic_modifier_dict = data['processes'][new_process]['optimistic_modifier_dict']
-
-    duration_dict[today.isoformat()] = new_process_duration
-    pessimistic_modifier_dict[today.isoformat()] = pessimistic_modifier
-    optimistic_modifier_dict[today.isoformat()] = optimistic_modifier
 
 
-    data['processes'][new_process] = dict(roles=new_process_roles,
-                                          dependencies=new_process_dependencies,
-                                          reward=new_process_reward,
-                                          success_prob=new_process_success_prob,
-                                          commitment=commitment,
-                                          duration_dict=duration_dict,
-                                          duration=new_process_duration,
-                                          pessimistic_modifier_dict=pessimistic_modifier_dict,
-                                          pessimistic_modifier=pessimistic_modifier,
-                                          optimistic_modifier_dict=optimistic_modifier_dict,
-                                          optimistic_modifier=optimistic_modifier,
-                                          earliest_start=new_process_earliest_start.isoformat(),
-                                          delay_start=new_process_delay_start,
-                                          name=new_process_name,
-                                          done=process_done,
-                                          done_date=done_date.isoformat())
+    if process not in data['processes']:
+        data['processes'][process] = dict(history=dict(),
+                                          last_save=today.isoformat())
+    data['processes'][process]['history'][today.isoformat()] = dict(name=process_name,
+                                                        roles=process_roles,
+                                                        dependencies=process_dependencies,
+                                                        commitment=process_commitment,
+                                                        done=process_done,
+                                                        done_date=process_done_date.isoformat(),
+                                                        started=process_started,
+                                                        started_date=process_start_date.isoformat(),
+                                                        duration=process_duration,
+                                                        pessimistic_duration=pessimistic_duration,
+                                                        optimistic_duration=optimistic_duration,
+                                                        earliest_start=process_earliest_start.isoformat(),
+                                                        delay_start=process_delay_start
+                                                        )
+    data['processes'][process]['last_date'] = today.isoformat()
     flush_state(save_file, data)

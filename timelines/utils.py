@@ -46,36 +46,39 @@ def merge_nodes(G, nodes, new_node, attr_dict=None, **attr):
     for n in nodes:  # remove the merged nodes
         G.remove_node(n)
 
-def fill_graph(G, data, scenario="Normal"):
+def fill_graph(G, data, date):
     G.graph['cache_hash'] = data['cache_hash']
     G.graph['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
 
     for process in data['processes']:
-        if scenario == 'Pessimistic':
-            _mod = data['processes'][process]['pessimistic_modifier']
-        elif scenario == 'Optimistic':
-            _mod = data['processes'][process]['optimistic_modifier']
-        elif scenario == 'Normal':
-            _mod = 1.
-        else:
-            raise ValueError(f"Invalid scenario, {scenario}")
-        _duration = int(_mod * data['processes'][process]['duration']) # days
-        _commitment = {key: com * hours_per_attention * _duration / 5. for key, com in data['processes'][process]['commitment'].items()}
+        dates = sorted(map(lambda date: datetime.datetime.fromisoformat(date), data['processes'][process]['history']))
+        if date < dates[0]:
+            continue # don't add this process
+        key_date = dates[-1]
+        for _date in dates[::-1]:
+            if date <= _date:
+                key_date = _date
+                break
+        process_data = data['processes'][process]['history'][key_date.isoformat()]
+
+        _commitment = {key: com * hours_per_attention * process_data['duration'] / 5. for key, com in process_data['commitment'].items()}
         G.add_node(f"{process}",
-                   duration=datetime.timedelta(days=_duration),
-                   roles=data['processes'][process]['roles'],
-                   resources=[resource for resource in data['resources'] if any([role in data['resources'][resource]['roles']
-                                                                                 for role in data['processes'][process]['roles']])],
-                   reward=data['processes'][process]['reward'],
-                   success_prob=data['processes'][process]['success_prob'],
+                   duration=datetime.timedelta(days=process_data['duration']),
+                   pessimistic_duration=datetime.timedelta(days=process_data['pessimistic_duration']),
+                   optimistic_duration=datetime.timedelta(days=process_data['optimistic_duration']),
+                   started = process_data['started'],
+                   started_date = next_business_day(datetime.datetime.fromisoformat(process_data['started_date'])),
+                   done=process_data['done'],
+                   done_date=next_business_day(datetime.datetime.fromisoformat(process_data['done_date'])),
+                   roles=process_data['roles'],
+                   resources=[resource for resource in data['resources'] if any([role in process_data['roles']
+                                                                                 for role in process_data['roles']])],
                    commitment=_commitment,
-                   attention=data['processes'][process]['commitment'],
-                   earliest_start=next_business_day(datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])),
-                   delay_start=datetime.timedelta(data['processes'][process]['delay_start']),
-                   done=data['processes'][process]['done'],
-                   done_date=next_business_day(datetime.datetime.fromisoformat(data['processes'][process]['done_date']))
+                   attention=process_data['commitment'],
+                   earliest_start=next_business_day(datetime.datetime.fromisoformat(process_data['earliest_start'])),
+                   delay_start=datetime.timedelta(days=process_data['delay_start'])
                    )
-        for dep in data['processes'][process]['dependencies']:
+        for dep in process_data['dependencies']:
             G.add_edge(f"{dep}", f"{process}")
 
 def prod(x):
@@ -117,7 +120,7 @@ def strip_time(date:datetime.datetime):
     return datetime.datetime(year=date.year,month=date.month, day=date.day)
 
 
-def add_business_days(date, days):
+def add_business_days(date: datetime.datetime, days: datetime.timedelta) -> datetime.datetime:
     output = prev_business_day(date)
     count = datetime.timedelta(days=0)
     lim = days
@@ -135,7 +138,7 @@ def add_business_days(date, days):
     return output
 
 
-def subtract_business_days(date, days):
+def subtract_business_days(date: datetime.datetime, days:datetime.timedelta)->datetime.datetime:
     output = next_business_day(date)
     count = datetime.timedelta(days=0)
     lim = days
@@ -161,7 +164,7 @@ def test_add_subtract_business_days():
             assert subtract_business_days(add_business_days(date, delta), delta) == date
 
 
-def count_business_days(start, end):
+def count_business_days(start:datetime.datetime, end:datetime.datetime) -> int:
     date = start
     count = 0
     while date < end:
@@ -171,46 +174,6 @@ def count_business_days(start, end):
     return count
 
 
-
-
-
-def set_prediction_data(scenario, date, G, data):
-    date = strip_time(date)
-    for process in G.nodes:
-        __date = datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])
-        __duration = data['processes'][process]['duration']
-        for _date_key in data['processes'][process]['duration_dict']:
-            _date = datetime.datetime.fromisoformat(_date_key)
-            if (_date >= __date) and (_date <= date):
-                __date = _date
-                __duration = data['processes'][process]['duration_dict'][_date_key]
-
-        __date = datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])
-        __pessimistic_modifier = data['processes'][process]['pessimistic_modifier']
-        for _date_key in data['processes'][process]['pessimistic_modifier_dict']:
-            _date = datetime.datetime.fromisoformat(_date_key)
-            if (_date >= __date) and (_date <= date):
-                __date = _date
-                __pessimistic_modifier = data['processes'][process]['pessimistic_modifier_dict'][_date_key]
-
-        __date = datetime.datetime.fromisoformat(data['processes'][process]['earliest_start'])
-        __optimistic_modifier = data['processes'][process]['optimistic_modifier']
-        for _date_key in data['processes'][process]['optimistic_modifier_dict']:
-            _date = datetime.datetime.fromisoformat(_date_key)
-            if (_date >= __date) and (_date <= date):
-                __date = _date
-                __optimistic_modifier = data['processes'][process]['optimistic_modifier_dict'][_date_key]
-
-        if scenario == 'Normal':
-            G.nodes[process]['duration'] = datetime.timedelta(days=__duration)
-        if scenario == 'Pessimistic':
-            G.nodes[process]['duration'] = datetime.timedelta(days=int(__duration*__pessimistic_modifier))
-        if scenario == 'Optimistic':
-            G.nodes[process]['duration'] = datetime.timedelta(days=int(__duration*__optimistic_modifier))
-
-
-
-
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def get_dates_of_prediction_change(cache: Cache):
     data = cache['data']
@@ -218,10 +181,6 @@ def get_dates_of_prediction_change(cache: Cache):
         return []
     dates = set()
     for process in data['processes']:
-        for date in data['processes'][process]['duration_dict']:
-            dates.add(datetime.datetime.fromisoformat(date))
-        for date in data['processes'][process]['pessimistic_modifier_dict']:
-            dates.add(datetime.datetime.fromisoformat(date))
-        for date in data['processes'][process]['optimistic_modifier_dict']:
+        for date in data['processes'][process]['history']:
             dates.add(datetime.datetime.fromisoformat(date))
     return sorted(list(dates))
