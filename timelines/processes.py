@@ -115,7 +115,10 @@ def render_processes(data, save_file, advanced, date_of_change):
             process = symbolify_process_name(data, process_name)
         elif len(process_lookup) == 1:
             process = process_lookup[0]
-            _lookup_process_cb()
+            date = data['processes'][process]['last_date']
+            process_data = data['processes'][process]['history'][date]
+            process_name = process_data['name']
+            st.session_state['process_name'] = process_name
         else:
             raise ValueError("Too many symbols selected.")
 
