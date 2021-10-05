@@ -44,7 +44,7 @@ def build_duration_to_remaining(duration_key):
         process_remaining = count_business_days(datetime.datetime.now(),
                                                 add_business_days(start_date,
                                                                   datetime.timedelta(
-                                                                      days=st.session_state[duration_key])))
+                                                                      days=st.session_state[duration_key])))-1
         st.session_state[duration_key.replace('duration', 'remaining')] = process_remaining
 
     return _f
