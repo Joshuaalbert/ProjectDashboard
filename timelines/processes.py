@@ -59,6 +59,7 @@ def render_processes(data, save_file, advanced, date_of_change):
             if len(process_lookup) == 1:  # found
                 date = data['processes'][process]['last_date']
                 process_data = data['processes'][process]['history'][date]
+                st.write(process_data)
                 session_state = dict(
                     process=process_lookup[0],  # symbol
                     process_name=process_data['name'],  # Name
