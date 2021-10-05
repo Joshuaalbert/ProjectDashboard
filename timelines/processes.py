@@ -334,8 +334,8 @@ def set_process(save_file, data):
     optimistic_duration = int(st.session_state['optimistic_duration'])
     process_earliest_start = next_business_day(strip_time(st.session_state['process_earliest_start']))
     process_delay_start = int(st.session_state['process_delay_start'])
-    # process_roles = list(st.session_state['process_roles'])
-    # process_commitment = st.session_state['process_commitment']
+    process_roles = []# list(st.session_state['process_roles'])
+    process_commitment = dict()#st.session_state['process_commitment']
     # for role in process_roles:
     #     assert role in data['roles']
 
