@@ -34,6 +34,7 @@ def build_remaining_to_duration(remaining_key):
 
     return _f
 
+
 def build_duration_to_remaining(duration_key):
     def _f():
         if 'process_date_started' not in st.session_state:
@@ -47,6 +48,7 @@ def build_duration_to_remaining(duration_key):
         st.session_state[duration_key.replace('duration', 'remaining')] = process_remaining
 
     return _f
+
 
 def render_processes(data, save_file, advanced, date_of_change):
     ###
@@ -158,7 +160,8 @@ def render_processes(data, save_file, advanced, date_of_change):
 
         if process_started:
             def _clean_date():
-                st.session_state['process_date_started'] = next_business_day(strip_time(st.session_state['process_date_started']))
+                st.session_state['process_date_started'] = next_business_day(
+                    strip_time(st.session_state['process_date_started']))
 
             st.date_input("Date started",
                           min_value=None,
@@ -166,7 +169,6 @@ def render_processes(data, save_file, advanced, date_of_change):
                           help="When was the process done?",
                           key='process_date_started',
                           on_change=_clean_date)
-
 
         if process_started and not process_done:
 
@@ -220,9 +222,11 @@ def render_processes(data, save_file, advanced, date_of_change):
                       key='optimistic_duration',
                       on_change=build_duration_to_remaining('optimistic_duration'))
         elif process_started and process_done:
-            st.session_state['process_duration'] = count_business_days(strip_time(st.session_state['process_date_started']),
-                                                                       strip_time(st.session_state['process_done_date']))
-            st.session_state['pessimistic_duration'] = st.session_state['optimistic_duration'] = st.session_state['process_duration']
+            st.session_state['process_duration'] = count_business_days(
+                strip_time(st.session_state['process_date_started']),
+                strip_time(st.session_state['process_done_date']))
+            st.session_state['pessimistic_duration'] = st.session_state['optimistic_duration'] = st.session_state[
+                'process_duration']
             st.info(f"Duration {st.session_state['process_duration']} days.")
         elif process_done and not process_started:
             st.info("If process done then a start date must be chosen too.")
@@ -249,7 +253,8 @@ def render_processes(data, save_file, advanced, date_of_change):
             commitment = dict()
             for role in process_roles:
                 last_date = data['processes'][process]['last_date']
-                if (process in data['processes']) and (role in data['processes'][process]['history'][last_date]['commitment']):
+                if (process in data['processes']) and (
+                        role in data['processes'][process]['history'][last_date]['commitment']):
                     _default_commitment = float(data['processes'][process]['history'][last_date]['commitment'][role])
                 else:
                     _default_commitment = 1.
@@ -259,6 +264,8 @@ def render_processes(data, save_file, advanced, date_of_change):
                 else:
                     _commitment = _default_commitment
                 commitment[role] = _commitment
+        else:
+            st.session_state['process_roles'] = []
 
         # Add it
         if st.button("Add/Mod process") and (process != ""):
@@ -279,13 +286,15 @@ def render_processes(data, save_file, advanced, date_of_change):
             _done = data['processes'][process]['history'][last_date]['done']
             _done_date = datetime.datetime.fromisoformat(data['processes'][process]['history'][last_date]['done_date'])
             if _done:
-                st.markdown(f" - [x] ({process}) {data['processes'][process]['history'][last_date]['name']} done on {date_label(_done_date)}")
+                st.markdown(
+                    f" - [x] ({process}) {data['processes'][process]['history'][last_date]['name']} done on {date_label(_done_date)}")
             else:
                 st.markdown(f" - [ ] ({process}) {data['processes'][process]['history'][last_date]['name']}")
                 st.markdown(f"Earliest Start: {date_label(G.nodes[process]['ES'])}")
                 st.markdown(f"Latest Start: {date_label(G.nodes[process]['LS'])}")
                 st.markdown(f"Earliest Finish: {date_label(G.nodes[process]['EF'])}")
                 st.markdown(f"Latest Finish: {date_label(G.nodes[process]['LF'])}")
+
 
 def date_label(date: datetime.datetime):
     return date.strftime("%a, %d %b, %Y")
@@ -315,38 +324,40 @@ def set_process(save_file, data):
     process_name = st.session_state['process_name']
     process_dependencies = list(st.session_state['process_dependencies'])
     process_done = bool(st.session_state['process_done'])
-    process_done_date = next_business_day(strip_time(st.session_state['process_done_date'])) if 'process_done_date' in st.session_state else today
+    process_done_date = next_business_day(
+        strip_time(st.session_state['process_done_date'])) if 'process_done_date' in st.session_state else today
     process_started = bool(st.session_state['process_started'])
-    process_start_date = next_business_day(strip_time(st.session_state['process_start_date'])) if 'process_start_date' in st.session_state else today
+    process_start_date = next_business_day(
+        strip_time(st.session_state['process_start_date'])) if 'process_start_date' in st.session_state else today
     process_duration = int(st.session_state['process_duration'])
     pessimistic_duration = int(st.session_state['pessimistic_duration'])
     optimistic_duration = int(st.session_state['optimistic_duration'])
     process_earliest_start = next_business_day(strip_time(st.session_state['process_earliest_start']))
     process_delay_start = int(st.session_state['process_delay_start'])
-    process_roles = list(st.session_state['process_roles'])
-    process_commitment = st.session_state['process_commitment']
-    for role in process_roles:
-        assert role in data['roles']
+    # process_roles = list(st.session_state['process_roles'])
+    # process_commitment = st.session_state['process_commitment']
+    # for role in process_roles:
+    #     assert role in data['roles']
 
     # Use this to make note of duration, and modifiers
-
 
     if process not in data['processes']:
         data['processes'][process] = dict(history=dict(),
                                           last_save=today.isoformat())
-    data['processes'][process]['history'][today.isoformat()] = dict(name=process_name,
-                                                        roles=process_roles,
-                                                        dependencies=process_dependencies,
-                                                        commitment=process_commitment,
-                                                        done=process_done,
-                                                        done_date=process_done_date.isoformat(),
-                                                        started=process_started,
-                                                        started_date=process_start_date.isoformat(),
-                                                        duration=process_duration,
-                                                        pessimistic_duration=pessimistic_duration,
-                                                        optimistic_duration=optimistic_duration,
-                                                        earliest_start=process_earliest_start.isoformat(),
-                                                        delay_start=process_delay_start
-                                                        )
+    data['processes'][process]['history'][today.isoformat()] = dict(
+        name=process_name,
+        # roles=process_roles,
+        dependencies=process_dependencies,
+        # commitment=process_commitment,
+        done=process_done,
+        done_date=process_done_date.isoformat(),
+        started=process_started,
+        started_date=process_start_date.isoformat(),
+        duration=process_duration,
+        pessimistic_duration=pessimistic_duration,
+        optimistic_duration=optimistic_duration,
+        earliest_start=process_earliest_start.isoformat(),
+        delay_start=process_delay_start
+    )
     data['processes'][process]['last_date'] = today.isoformat()
     flush_state(save_file, data)
