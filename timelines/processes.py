@@ -322,6 +322,7 @@ def delete_processes(data, processes, save_file):
 
 
 def set_process(save_file, data):
+    st.write(st.session_state)
     today = next_business_day(strip_time(datetime.datetime.today()))
     process = st.session_state['process']
     process_name = st.session_state['process_name']
