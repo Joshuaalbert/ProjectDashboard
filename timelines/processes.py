@@ -57,9 +57,9 @@ def render_processes(data, save_file, advanced, date_of_change):
         def _lookup_process_cb():
             process_lookup = st.session_state['process_lookup']
             if len(process_lookup) == 1:  # found
+                process = process_lookup[0]
                 date = data['processes'][process]['last_date']
                 process_data = data['processes'][process]['history'][date]
-                st.write(process, process_data)
                 session_state = dict(
                     process=process_lookup[0],  # symbol
                     process_name=process_data['name'],  # Name
@@ -79,9 +79,8 @@ def render_processes(data, save_file, advanced, date_of_change):
                     process_delay_start=process_data['delay_start']
                 )
             else:  # none looked up, defaults are set
-                if len(process_lookup) > 1:
-                    st.info("Lookup max one process!")
                 session_state = dict(
+                    process="",
                     process_name="",
                     process_done=False,
                     process_done_date=strip_time(datetime.datetime.now()),
@@ -105,21 +104,20 @@ def render_processes(data, save_file, advanced, date_of_change):
 
         process_lookup = st.multiselect("Process Lookup: ",
                                         data['processes'],
-                                        [],
                                         help='Look-up a process via symbol and modify.',
                                         on_change=_lookup_process_cb,
                                         key='process_lookup')
 
-        process_name = st.text_input("Process name: ",
-                                     help="Add a new process. Makes a new symbol for that name.",
-                                     key='process_name')
-
         if len(process_lookup) == 0:
+            process_name = st.text_input("Process name: ",
+                                         help="Add a new process. Makes a new symbol for that name.",
+                                         key='process_name')
             process = symbolify_process_name(data, process_name)
         elif len(process_lookup) == 1:
             process = process_lookup[0]
         else:
             raise ValueError("Too many symbols selected.")
+
         # store process name
         st.session_state['process'] = process
 
