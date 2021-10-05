@@ -98,9 +98,9 @@ def render_processes(data, save_file, advanced, date_of_change):
 
             for key in session_state:
                 st.session_state[key] = session_state[key]
-            build_duration_to_remaining('process_duration')
-            build_duration_to_remaining('pessimistic_duration')
-            build_duration_to_remaining('optimistic_duration')
+            build_duration_to_remaining('process_duration')()
+            build_duration_to_remaining('pessimistic_duration')()
+            build_duration_to_remaining('optimistic_duration')()
             st.write(st.session_state)
 
         process_lookup = st.multiselect("Process Lookup: ",
