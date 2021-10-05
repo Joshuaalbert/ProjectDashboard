@@ -160,8 +160,10 @@ def render_processes(data, save_file, advanced, date_of_change):
 
         if process_started:
             def _clean_date():
+                st.write(st.session_state['process_date_started'])
                 st.session_state['process_date_started'] = next_business_day(
                     strip_time(st.session_state['process_date_started']))
+                st.write(st.session_state['process_date_started'])
 
             st.date_input("Date started",
                           min_value=None,
