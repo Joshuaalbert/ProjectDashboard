@@ -208,6 +208,11 @@ def render_processes(data, save_file, advanced, date_of_change):
                       key='process_duration',
                       on_change=build_duration_to_remaining('process_duration'))
 
+            if 'pessimistic_duration' in st.session_state:
+                st.session_state['pessimistic_duration'] = min(max(st.session_state['pessimistic_duration'],
+                              st.session_state['process_duration']),
+                              st.session_state['process_duration'] + 30)
+
             st.slider("Pessimistic duration (days)",
                       min_value=st.session_state['process_duration'],
                       max_value=st.session_state['process_duration'] + 30,
@@ -215,6 +220,11 @@ def render_processes(data, save_file, advanced, date_of_change):
                       help='Conservative estimate of days to do.',
                       key='pessimistic_duration',
                       on_change=build_duration_to_remaining('pessimistic_duration'))
+
+            if 'optimistic_duration' in st.session_state:
+                st.session_state['optimistic_duration'] = min(
+                              st.session_state['process_duration'],
+                              st.session_state['optimistic_duration'])
 
             st.slider("Optimistic duration (days)",
                       min_value=0,
