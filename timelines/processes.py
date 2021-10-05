@@ -26,10 +26,8 @@ def build_remaining_to_duration(remaining_key):
             start_date = next_business_day(strip_time(datetime.datetime.now()))
         else:
             start_date = strip_time(st.session_state['process_date_started'])
-        process_duration = count_business_days(start_date,
-                                               add_business_days(datetime.datetime.now(),
-                                                                 datetime.timedelta(
-                                                                     days=st.session_state[remaining_key])))
+        process_duration = st.session_state[remaining_key] \
+                           - count_business_days(start_date, next_business_day(strip_time(datetime.datetime.now())))
         st.session_state[remaining_key.replace('remaining', 'duration')] = process_duration
 
     return _f
@@ -43,10 +41,6 @@ def build_duration_to_remaining(duration_key):
             start_date = strip_time(st.session_state['process_date_started'])
         process_remaining = count_business_days(start_date, next_business_day(strip_time(datetime.datetime.now()))) \
                             + st.session_state[duration_key]
-        # process_remaining = count_business_days(datetime.datetime.now(),
-        #                                         add_business_days(start_date,
-        #                                                           datetime.timedelta(
-        #                                                               days=st.session_state[duration_key])))-1
         st.session_state[duration_key.replace('duration', 'remaining')] = process_remaining
 
     return _f
