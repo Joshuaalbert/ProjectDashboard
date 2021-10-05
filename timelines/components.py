@@ -10,7 +10,7 @@ from .processes import render_processes
 from .resources import render_resources
 from .roles import render_roles
 from .resource_usage_analysis import render_resource_usage
-from .utils import flush_state, Cache, get_dates_of_prediction_change
+from .utils import flush_state, Cache, get_dates_of_prediction_change, strip_time
 from .graph import display_graph
 from .time_changes import render_timeline_changes
 import base64
@@ -64,9 +64,14 @@ def render_components():
 
 
     st.session_state['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
+    def _on_change():
+        data['start_date'] = strip_time(st.session_state['start_date']).isoformat()
+        flush_state(save_file, data)
+
     start_date = st.sidebar.date_input("Start date: ",
                                        help='Date where process graph starts.',
-                                       key='start_date')
+                                       key='start_date',
+                                       on_change=_on_change)
 
     if start_date is not None:
         data['start_date'] = start_date.isoformat()
