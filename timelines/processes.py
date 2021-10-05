@@ -343,7 +343,7 @@ def set_process(save_file, data):
 
     if process not in data['processes']:
         data['processes'][process] = dict(history=dict(),
-                                          last_save=today.isoformat())
+                                          last_date=today.isoformat())
     data['processes'][process]['history'][today.isoformat()] = dict(
         name=process_name,
         roles=process_roles,
