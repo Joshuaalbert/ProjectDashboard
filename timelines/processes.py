@@ -346,9 +346,9 @@ def set_process(save_file, data):
                                           last_save=today.isoformat())
     data['processes'][process]['history'][today.isoformat()] = dict(
         name=process_name,
-        # roles=process_roles,
+        roles=process_roles,
         dependencies=process_dependencies,
-        # commitment=process_commitment,
+        commitment=process_commitment,
         done=process_done,
         done_date=process_done_date.isoformat(),
         started=process_started,
