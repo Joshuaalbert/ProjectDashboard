@@ -286,6 +286,7 @@ def render_processes(data, save_file, advanced, date_of_change):
         st.write(display_process)
         G, critical_path = get_critical_path(Cache(data), date_of_change)
         for process in nx.algorithms.topological_sort(G):
+            st.write(process)
             if (process not in display_process) and (len(display_process) > 0):
                 continue
             last_date = data['processes'][process]['last_date']
