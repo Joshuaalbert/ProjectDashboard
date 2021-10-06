@@ -294,6 +294,7 @@ def render_processes(data, save_file, advanced, date_of_change):
     with st.expander("Processes"):
         # display_process = st.multiselect("Filter process", data['processes'])
         G, critical_path = get_critical_path(Cache(data), date_of_change)
+        print(G.nodes)
         for process in nx.algorithms.topological_sort(G):
             # if (process not in display_process) and (len(display_process) > 0):
             #     continue
