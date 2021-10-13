@@ -2,8 +2,7 @@ import datetime
 import networkx as nx
 import streamlit as st
 
-from .utils import flush_state, fill_graph, symbolify, next_business_day, strip_time, Cache, count_business_days, \
-    add_business_days
+from .utils import flush_state, fill_graph, symbolify, next_business_day, strip_time, Cache, count_business_days, add_business_days
 from .critical_path import get_critical_path
 
 
@@ -21,26 +20,22 @@ def symbolify_process_name(data, new_process_name):
 
 
 def build_remaining_to_duration(remaining_key):
+    # s+d = t+r => d = count(s, t+r)
     def _f():
-        if 'process_date_started' not in st.session_state:
-            start_date = next_business_day(strip_time(datetime.datetime.now()))
-        else:
-            start_date = strip_time(st.session_state['process_date_started'])
-        process_duration = st.session_state[remaining_key] \
-                           - count_business_days(start_date, next_business_day(strip_time(datetime.datetime.now())))
+        process_duration = count_business_days(strip_time(st.session_state['process_date_started']),
+                                               add_business_days(next_business_day(strip_time(datetime.datetime.now())),
+                                                                 datetime.timedelta(days=st.session_state[remaining_key])))
         st.session_state[remaining_key.replace('remaining', 'duration')] = process_duration
 
     return _f
 
 
 def build_duration_to_remaining(duration_key):
+    #s+d = t+r => r = count(t, s + d)
     def _f():
-        if 'process_date_started' not in st.session_state:
-            start_date = next_business_day(strip_time(datetime.datetime.now()))
-        else:
-            start_date = strip_time(st.session_state['process_date_started'])
-        process_remaining = count_business_days(start_date, next_business_day(strip_time(datetime.datetime.now()))) \
-                            + st.session_state[duration_key]
+        process_remaining = count_business_days(next_business_day(strip_time(datetime.datetime.now())),
+                                                add_business_days(strip_time(st.session_state['process_date_started']),
+                                                                  datetime.timedelta(days=st.session_state[duration_key])))
         st.session_state[duration_key.replace('duration', 'remaining')] = process_remaining
 
     return _f
@@ -94,10 +89,6 @@ def render_processes(data, save_file, advanced, date_of_change):
 
             for key in session_state:
                 st.session_state[key] = session_state[key]
-            build_duration_to_remaining('process_duration')()
-            build_duration_to_remaining('pessimistic_duration')()
-            build_duration_to_remaining('optimistic_duration')()
-            st.write(st.session_state)
 
         process_lookup = st.multiselect("Process Lookup: ",
                                         data['processes'],
@@ -130,6 +121,7 @@ def render_processes(data, save_file, advanced, date_of_change):
             descendants = nx.algorithms.dag.descendants(G, process)
             dep_options = sorted(list(set(dep_options) - descendants - {process}))
 
+        
         st.multiselect("Dependencies:",
                        dep_options,
                        help="What are the dependencies of this process.",
@@ -160,10 +152,8 @@ def render_processes(data, save_file, advanced, date_of_change):
 
         if process_started:
             def _clean_date():
-                st.write(st.session_state['process_date_started'])
                 st.session_state['process_date_started'] = next_business_day(
                     strip_time(st.session_state['process_date_started']))
-                st.write(st.session_state['process_date_started'])
 
             st.date_input("Date started",
                           min_value=None,
@@ -172,7 +162,12 @@ def render_processes(data, save_file, advanced, date_of_change):
                           key='process_date_started',
                           on_change=_clean_date)
 
+
         if process_started and not process_done:
+            # Turn duration into remaining using: s+d = t+r => r = count(t, s + d)
+            build_duration_to_remaining('process_duration')()
+            build_duration_to_remaining('pessimistic_duration')()
+            build_duration_to_remaining('optimistic_duration')()
 
             st.slider("Conservative remaining (days)",
                       min_value=0,
@@ -204,9 +199,8 @@ def render_processes(data, save_file, advanced, date_of_change):
                       min_value=0,
                       max_value=30,
                       step=1,
-                      help='Days duration total.',
-                      key='process_duration',
-                      on_change=build_duration_to_remaining('process_duration'))
+                      help='Conservative estimate days duration total.',
+                      key='process_duration')
 
             if 'pessimistic_duration' in st.session_state:
                 st.session_state['pessimistic_duration'] = min(max(st.session_state['pessimistic_duration'],
@@ -217,22 +211,20 @@ def render_processes(data, save_file, advanced, date_of_change):
                       min_value=st.session_state['process_duration'],
                       max_value=st.session_state['process_duration'] + 30,
                       step=1,
-                      help='Conservative estimate of days to do.',
-                      key='pessimistic_duration',
-                      on_change=build_duration_to_remaining('pessimistic_duration'))
+                      help='Pessimisic estimate of days to do.',
+                      key='pessimistic_duration')
 
             if 'optimistic_duration' in st.session_state:
                 st.session_state['optimistic_duration'] = min(
-                              st.session_state['process_duration'],
-                              st.session_state['optimistic_duration'])
+                              st.session_state['process_duration'])
 
             st.slider("Optimistic duration (days)",
                       min_value=0,
                       max_value=max(st.session_state['process_duration'], 1),
                       step=1,
                       help='Optimistic estimate of days to do.',
-                      key='optimistic_duration',
-                      on_change=build_duration_to_remaining('optimistic_duration'))
+                      key='optimistic_duration')
+
         elif process_started and process_done:
             st.session_state['process_duration'] = count_business_days(
                 strip_time(st.session_state['process_date_started']),
@@ -294,7 +286,6 @@ def render_processes(data, save_file, advanced, date_of_change):
     with st.expander("Processes"):
         # display_process = st.multiselect("Filter process", data['processes'])
         G, critical_path = get_critical_path(Cache(data), date_of_change)
-        st.write(data, G.nodes)
         for process in nx.algorithms.topological_sort(G):
             # if (process not in display_process) and (len(display_process) > 0):
             #     continue

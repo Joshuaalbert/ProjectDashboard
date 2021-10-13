@@ -121,6 +121,13 @@ def strip_time(date:datetime.datetime):
 
 
 def add_business_days(date: datetime.datetime, days: datetime.timedelta) -> datetime.datetime:
+    """
+    Adds one business day to the date.
+
+    :param date:
+    :param days:
+    :return:
+    """
     output = prev_business_day(date)
     count = datetime.timedelta(days=0)
     lim = days
@@ -139,6 +146,13 @@ def add_business_days(date: datetime.datetime, days: datetime.timedelta) -> date
 
 
 def subtract_business_days(date: datetime.datetime, days:datetime.timedelta)->datetime.datetime:
+    """
+    Subtracts one business day from the date.
+
+    :param date:
+    :param days:
+    :return:
+    """
     output = next_business_day(date)
     count = datetime.timedelta(days=0)
     lim = days
@@ -165,8 +179,17 @@ def test_add_subtract_business_days():
 
 
 def count_business_days(start:datetime.datetime, end:datetime.datetime) -> int:
+    """
+    Count business days (inclusive) of start date.
+    That is from the SOB on `start` to EOB on `end`.
+    E.g. Monday to Wednesday -> 3
+
+    :param start: inclusive start-date
+    :param end: inclusive end-date
+    :return:
+    """
     date = start
-    count = 0
+    count = 1
     while date < end:
         if date.weekday()<5:
             count += 1
