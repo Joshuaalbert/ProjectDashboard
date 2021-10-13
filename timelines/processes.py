@@ -215,8 +215,8 @@ def render_processes(data, save_file, advanced, date_of_change):
                       key='pessimistic_duration')
 
             if 'optimistic_duration' in st.session_state:
-                st.session_state['optimistic_duration'] = min(
-                              st.session_state['process_duration'])
+                st.session_state['optimistic_duration'] = max(0,min(st.session_state['optimistic_duration'],
+                              st.session_state['process_duration']))
 
             st.slider("Optimistic duration (days)",
                       min_value=0,
