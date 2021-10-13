@@ -197,13 +197,13 @@ def count_business_days(start:datetime.datetime, end:datetime.datetime) -> int:
     return count
 
 
-@st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def get_dates_of_prediction_change(cache: Cache):
     data = cache['data']
     if 'processes' not in data:
         return []
     dates = set()
     for process in data['processes']:
+        st.write(data['processes'][process])
         for date in data['processes'][process]['history']:
             dates.add(datetime.datetime.fromisoformat(date))
     return sorted(list(dates))
