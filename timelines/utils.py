@@ -180,16 +180,16 @@ def test_add_subtract_business_days():
 
 def count_business_days(start:datetime.datetime, end:datetime.datetime) -> int:
     """
-    Count business days (inclusive) of start date.
-    That is from the SOB on `start` to EOB on `end`.
-    E.g. Monday to Wednesday -> 3
+    Count business days (exclusive) of start date.
+    That is from the SOB on `start` to SOB on `end`.
+    E.g. Monday to Wednesday -> 2
 
     :param start: inclusive start-date
     :param end: inclusive end-date
     :return:
     """
     date = start
-    count = 1
+    count = 0
     while date < end:
         if date.weekday()<5:
             count += 1

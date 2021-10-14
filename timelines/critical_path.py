@@ -171,7 +171,7 @@ class CPM(nx.DiGraph):
             self._stochastic_critical_path_length = stochastic_critical_path_length
             self._dirty = False
 
-@st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
+# @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def get_critical_path(cache: Cache, date_of_change, termination_nodes=None):
     data = cache['data']
     G = CPM()
