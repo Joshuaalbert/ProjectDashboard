@@ -64,11 +64,15 @@ class CPM(nx.DiGraph):
                 self.add_node(n,
                               expected_start_date=self.nodes[n]['started_date'],
                               expected_done_date=add_business_days(self.nodes[n]['started_date'], self.nodes[n]['_duration']))
+                if self.nodes[n]['done']:
+                    self.add_node(n, expected_done_date=self.nodes[n]['done_date'])
             elif self.nodes[n]['start_earliest_start']:
                 self.add_node(n,
                               expected_start_date=self.nodes[n]['ES'],
                               expected_done_date=add_business_days(self.nodes[n]['ES'],
                                                                    self.nodes[n]['_duration']))
+                if self.nodes[n]['done']:
+                    self.add_node(n, expected_done_date=self.nodes[n]['done_date'])
             else:
                 self.add_node(n,
                               expected_start_date=None,
