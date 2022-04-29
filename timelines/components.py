@@ -59,10 +59,6 @@ def render_components():
 
     advanced = st.sidebar.checkbox("Advanced options", False, help="Whether to enable advanced options.")
 
-    if st.sidebar.button("Refresh"):
-        caching.clear_cache()
-
-
     st.session_state['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
     def _on_change():
         data['start_date'] = strip_time(st.session_state['start_date']).isoformat()
@@ -88,6 +84,8 @@ def render_components():
         date_of_change = st.select_slider("Date of prediction: ", dates_of_change,
                                           format_func=lambda date: date.isoformat(),
                                           help="Choose the historical date to explore past predictions, from past updates.")
+    elif len(dates_of_change) == 1:
+        date_of_change = dates_of_change[0]
     else:
         date_of_change = datetime.datetime.fromisoformat(data['start_date'])
 

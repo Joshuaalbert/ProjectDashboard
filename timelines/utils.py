@@ -76,10 +76,15 @@ def fill_graph(G, data, date):
                    commitment=_commitment,
                    attention=process_data['commitment'],
                    earliest_start=next_business_day(datetime.datetime.fromisoformat(process_data['earliest_start'])),
+                   start_earliest_start=process_data['start_earliest_start'],
                    delay_start=datetime.timedelta(days=process_data['delay_start'])
                    )
         for dep in process_data['dependencies']:
             G.add_edge(f"{dep}", f"{process}")
+    # filter undefined nodes (because of history)
+    for node in list(G.nodes):
+        if G.nodes[node].get('duration', None) is None:
+            G.remove_node(node)
 
 def prod(x):
     if len(x) == 0:
@@ -203,7 +208,7 @@ def get_dates_of_prediction_change(cache: Cache):
         return []
     dates = set()
     for process in data['processes']:
-        st.write(data['processes'][process])
+        # st.write(data['processes'][process])
         for date in data['processes'][process]['history']:
             dates.add(datetime.datetime.fromisoformat(date))
     return sorted(list(dates))

@@ -13,13 +13,19 @@ def render_timeline_changes(cache: Cache, dates_of_change):
         fig, ax = plt.subplots(1,1,figsize=(12,28//3))
         _dates = []
         _total_lengths = []
-
         G, critical_path = get_critical_path(cache, datetime.datetime.now(), termination_nodes=termination_nodes)
         _dates.append(datetime.datetime.now())
         _total_lengths.append(G.critical_path_end)
 
         for date in dates_of_change:
             G, critical_path = get_critical_path(cache, date, termination_nodes=termination_nodes)
+            _available_in_data = True
+            if termination_nodes is not None:
+                for _node in termination_nodes:
+                    if _node not in G.nodes:
+                        _available_in_data = False
+                if not _available_in_data:
+                    continue
             _dates.append(date)
             _total_lengths.append(G.critical_path_end)
             #

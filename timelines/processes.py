@@ -40,6 +40,55 @@ def build_duration_to_remaining(duration_key):
 
     return _f
 
+def load_from_data(data, process):
+    date = data['processes'][process]['last_date']
+    process_data = data['processes'][process]['history'][date]
+    session_state = dict(
+        process=process,  # symbol
+        process_name=process_data['name'],  # Name
+        process_done=process_data['done'],
+        process_done_date=datetime.datetime.fromisoformat(process_data['done_date']),
+        process_dependencies=process_data['dependencies'],
+        process_date_started=datetime.datetime.fromisoformat(
+            process_data['started_date']),
+        process_started=process_data['started'],
+        duration=process_data['duration'],
+        pessimistic_duration=process_data['pessimistic_duration'],
+        optimistic_duration=process_data['optimistic_duration'],
+        process_roles=process_data['roles'],
+        process_commitment=process_data['commitment'],
+        process_earliest_start=datetime.datetime.fromisoformat(
+            process_data['earliest_start']),
+        process_start_earliest_start=process_data['start_earliest_start'],
+        process_delay_start=process_data['delay_start'])
+    for key in session_state:
+        st.session_state[key] = session_state[key]
+
+def set_default_values(data, weak=False):
+        session_state = dict(
+            process="",
+            process_name="",
+            process_done=False,
+            process_done_date=strip_time(datetime.datetime.now()),
+            process_dependencies=[],
+            process_date_started=strip_time(datetime.datetime.now()),
+            process_started=False,
+            duration=0,
+            pessimistic_duration=0,
+            optimistic_duration=0,
+            process_roles=[],
+            process_commitment=dict(),
+            process_earliest_start=strip_time(datetime.datetime.fromisoformat(data['start_date'])),
+            process_start_earliest_start=False,
+            process_delay_start=0
+        )
+
+        for key in session_state:
+            if weak:
+                if key in st.session_state:
+                    continue
+            st.session_state[key] = session_state[key]
+
 
 def render_processes(data, save_file, advanced, date_of_change):
     ###
@@ -49,66 +98,38 @@ def render_processes(data, save_file, advanced, date_of_change):
             process_lookup = st.session_state['process_lookup']
             if len(process_lookup) == 1:  # found
                 process = process_lookup[0]
-                date = data['processes'][process]['last_date']
-                process_data = data['processes'][process]['history'][date]
-                session_state = dict(
-                    process=process_lookup[0],  # symbol
-                    process_name=process_data['name'],  # Name
-                    process_done=process_data['done'],
-                    process_done_date=datetime.datetime.fromisoformat(process_data['done_date']),
-                    process_dependencies=process_data['dependencies'],
-                    process_date_started=datetime.datetime.fromisoformat(
-                        process_data['started_date']),
-                    process_started=process_data['started'],
-                    process_duration=process_data['duration'],
-                    pessimistic_duration=process_data['pessimistic_duration'],
-                    optimistic_duration=process_data['optimistic_duration'],
-                    process_roles=process_data['roles'],
-                    process_commitment=process_data['commitment'],
-                    process_earliest_start=datetime.datetime.fromisoformat(
-                        process_data['earliest_start']),
-                    process_delay_start=process_data['delay_start']
-                )
+                load_from_data(data, process) # data closure
             else:  # none looked up, defaults are set
-                session_state = dict(
-                    process="",
-                    process_name="",
-                    process_done=False,
-                    process_done_date=strip_time(datetime.datetime.now()),
-                    process_dependencies=[],
-                    process_date_started=strip_time(datetime.datetime.now()),
-                    process_started=False,
-                    process_duration=0,
-                    pessimistic_duration=0,
-                    optimistic_duration=0,
-                    process_roles=[],
-                    process_commitment=dict(),
-                    process_earliest_start=strip_time(datetime.datetime.fromisoformat(data['start_date'])),
-                    process_delay_start=0
-                )
-
-            for key in session_state:
-                st.session_state[key] = session_state[key]
+                set_default_values(data)
 
         process_lookup = st.multiselect("Process Lookup: ",
                                         data['processes'],
                                         help='Look-up a process via symbol and modify.',
-                                        on_change=_lookup_process_cb,
+                                        # on_change=_lookup_process_cb,
                                         key='process_lookup')
 
+
+        found_process = False
         if len(process_lookup) == 0:
+            if st.button("Reset process data"):
+                set_default_values(data)
             process_name = st.text_input("Process name: ",
                                          help="Add a new process. Makes a new symbol for that name.",
                                          key='process_name')
             process = symbolify_process_name(data, process_name)
+            st.session_state['process'] = process
         elif len(process_lookup) == 1:
             process = process_lookup[0]
+            if st.button("Load process data"):
+                load_from_data(data, process)  # data closure
             date = data['processes'][process]['last_date']
             process_data = data['processes'][process]['history'][date]
-            process_name = process_data['name']
-            st.session_state['process_name'] = process_name
+            st.session_state['process_name'] = process_data['name'] # Name
+            found_process = True
         else:
             raise ValueError("Too many symbols selected.")
+
+        set_default_values(data, weak=True)
 
         # store process name
         st.session_state['process'] = process
@@ -121,129 +142,131 @@ def render_processes(data, save_file, advanced, date_of_change):
             descendants = nx.algorithms.dag.descendants(G, process)
             dep_options = sorted(list(set(dep_options) - descendants - {process}))
 
-        
         st.multiselect("Dependencies:",
                        dep_options,
+                       default=st.session_state['process_dependencies'],
                        help="What are the dependencies of this process.",
                        key='process_dependencies')
 
-        process_done = st.checkbox("Process Done",
-                                   help="Is this process done?",
-                                   key='process_done')
 
-        if process_done:
-            def _clean_date():
-                st.session_state['process_done_date'] = next_business_day(
-                    strip_time(st.session_state['process_done_date']))
+        if found_process:
+            st.checkbox("Process Started",
+                        value=st.session_state['process_started'],
+                                          help="Is this process underway?",
+                                          key='process_started')
+            if st.session_state['process_started']:#st.session_state['process_started']:
+                def _clean_date():
+                    st.session_state['process_date_started'] = next_business_day(
+                        strip_time(st.session_state['process_date_started']))
+                st.date_input("Date started",
+                              min_value=None,
+                              max_value=st.session_state['process_done_date'] if st.session_state['process_done'] else datetime.datetime.now(),
+                              help="When was the process done?",
+                              key='process_date_started',
+                              on_change=_clean_date)
 
-            st.date_input("Date finished",
-                          min_value=None,
-                          max_value=datetime.datetime.now(),
-                          help="When was the process done?",
-                          key='process_done_date',
-                          on_change=_clean_date)
-
-        if process_done:
-            st.session_state['process_started'] = True
-
-        process_started = st.checkbox("Process Started",
-                                      help="Is this process underway?",
-                                      key='process_started')
-
-        if process_started:
-            def _clean_date():
-                st.session_state['process_date_started'] = next_business_day(
-                    strip_time(st.session_state['process_date_started']))
-
-            st.date_input("Date started",
-                          min_value=None,
-                          max_value=st.session_state['process_done_date'] if process_done else datetime.datetime.now(),
-                          help="When was the process done?",
-                          key='process_date_started',
-                          on_change=_clean_date)
+                st.checkbox("Process Done",
+                                           value=st.session_state['process_done'],
+                                           help="Is this process done?",
+                                           key='process_done')
+            else:
+                st.session_state['process_done'] = False
 
 
-        if process_started and not process_done:
-            # Turn duration into remaining using: s+d = t+r => r = count(t, s + d)
-            build_duration_to_remaining('process_duration')()
-            build_duration_to_remaining('pessimistic_duration')()
-            build_duration_to_remaining('optimistic_duration')()
+            if st.session_state['process_done']:
+                def _clean_date():
+                    st.session_state['process_done_date'] = next_business_day(
+                        strip_time(st.session_state['process_done_date']))
 
-            st.slider("Conservative remaining (days)",
-                      min_value=0,
-                      max_value=30,
-                      step=1,
-                      help='Days remaining until done.',
-                      key='process_remaining',
-                      on_change=build_remaining_to_duration('process_remaining'))
+                st.date_input("Date finished",
+                              min_value=st.session_state['process_date_started'],
+                              max_value=max(st.session_state['process_date_started'],datetime.datetime.now()),
+                              help="When was the process done?",
+                              key='process_done_date',
+                              on_change=_clean_date)
 
-            st.slider("Pessimistic remaining (days)",
-                      min_value=st.session_state['process_remaining'],
-                      max_value=st.session_state['process_remaining'] + 30,
-                      step=1,
-                      help='Pessimistic estimate of days remaining until done.',
-                      key='pessimistic_remaining',
-                      on_change=build_remaining_to_duration('pessimistic_remaining'))
+        # st.write(st.session_state)
 
-            st.slider("Optimistic remaining (days)",
-                      min_value=0,
-                      max_value=max(st.session_state['process_remaining'], 1),
-                      step=1,
-                      help='Optimistic estimate of days remaining until done.',
-                      key='optimistic_remaining',
-                      on_change=build_remaining_to_duration('optimistic_remaining'))
+        if 'process_started' not in st.session_state:
+            st.session_state['process_started'] = False
 
+        if 'process_done' not in st.session_state:
+            st.session_state['process_done'] = False
 
-        elif not process_started and not process_done:
-            st.slider("Conservative duration (days)",
-                      min_value=0,
-                      max_value=30,
-                      step=1,
-                      help='Conservative estimate days duration total.',
-                      key='process_duration')
-
-            if 'pessimistic_duration' in st.session_state:
-                st.session_state['pessimistic_duration'] = min(max(st.session_state['pessimistic_duration'],
-                              st.session_state['process_duration']),
-                              st.session_state['process_duration'] + 30)
-
-            st.slider("Pessimistic duration (days)",
-                      min_value=st.session_state['process_duration'],
-                      max_value=st.session_state['process_duration'] + 30,
-                      step=1,
-                      help='Pessimisic estimate of days to do.',
-                      key='pessimistic_duration')
-
-            if 'optimistic_duration' in st.session_state:
-                st.session_state['optimistic_duration'] = max(0,min(st.session_state['optimistic_duration'],
-                              st.session_state['process_duration']))
-
-            st.slider("Optimistic duration (days)",
-                      min_value=0,
-                      max_value=max(st.session_state['process_duration'], 1),
-                      step=1,
-                      help='Optimistic estimate of days to do.',
-                      key='optimistic_duration')
-
-        elif process_started and process_done:
-            st.session_state['process_duration'] = count_business_days(
+        if st.session_state['process_started'] and st.session_state['process_done']:
+            st.session_state['duration'] = count_business_days(
                 strip_time(st.session_state['process_date_started']),
                 strip_time(st.session_state['process_done_date']))
             st.session_state['pessimistic_duration'] = st.session_state['optimistic_duration'] = st.session_state[
-                'process_duration']
-            st.info(f"Duration {st.session_state['process_duration']} days.")
-        elif process_done and not process_started:
-            st.info("If process done then a start date must be chosen too.")
+                'duration']
+            st.info(f"Duration {st.session_state['duration']} days.")
+
+
+        # Durations
+        duration_text = st.text_input("Conservative duration (days)",
+            max_chars=3,
+            value=st.session_state['duration'],
+            help='Conservative estimate days duration total.')
+        if duration_text != "":
+            try:
+                if str(int(duration_text)) != duration_text:
+                    st.warning("Duration much be an integer, e.g. 10")
+            except:
+                st.warning("Duration much be an integer, e.g. 10")
+
+        st.slider("Conservative duration (days)",
+                  min_value=0,
+                  max_value=90,
+                  value=int(duration_text),
+                  step=1,
+                  help='Conservative estimate days duration total.',
+                  key='duration')
+
+
+
+
+
+        if 'pessimistic_duration' in st.session_state:
+            st.session_state['pessimistic_duration'] = min(max(st.session_state['pessimistic_duration'],
+                          st.session_state['duration']),
+                          st.session_state['duration'] + 30)
+
+        st.slider("Pessimistic duration (days)",
+                  min_value=st.session_state['duration'],
+                  max_value=st.session_state['duration'] + 30,
+                  value=st.session_state['pessimistic_duration'],
+                  step=1,
+                  help='Pessimisic estimate of days to do.',
+                  key='pessimistic_duration')
+
+        if 'optimistic_duration' in st.session_state:
+            st.session_state['optimistic_duration'] = max(0,min(st.session_state['optimistic_duration'],
+                          st.session_state['duration']))
+
+        st.slider("Optimistic duration (days)",
+                  min_value=0,
+                  max_value=max(st.session_state['duration'], 1),
+                  value=st.session_state['optimistic_duration'],
+                  step=1,
+                  help='Optimistic estimate of days to do.',
+                  key='optimistic_duration')
 
         st.subheader("Starting constraints")
 
         # Earliest start
         st.date_input("Earliest start:",
+                      value=st.session_state['process_earliest_start'],
                       help="What date is the earliest this process can start?",
                       key='process_earliest_start')
 
+        st.checkbox("Start exactly at earliest date?",
+                    value=st.session_state['process_start_earliest_start'],
+                      help="Should this be planned to start exactly at the earliest date?",
+                      key='process_start_earliest_start')
+
         # Delay start
         st.slider("Delay start:", min_value=0, max_value=30,
+                  value=st.session_state['process_delay_start'],
                   help="Delay stary by this many days after all dependencies end.",
                   key='process_delay_start')
 
@@ -334,11 +357,12 @@ def set_process(save_file, data):
         strip_time(st.session_state['process_done_date'])) if 'process_done_date' in st.session_state else today
     process_started = bool(st.session_state['process_started'])
     process_start_date = next_business_day(
-        strip_time(st.session_state['process_start_date'])) if 'process_start_date' in st.session_state else today
-    process_duration = int(st.session_state['process_duration'])
+        strip_time(st.session_state['process_date_started'])) if 'process_date_started' in st.session_state else today
+    process_duration = int(st.session_state['duration'])
     pessimistic_duration = int(st.session_state['pessimistic_duration'])
     optimistic_duration = int(st.session_state['optimistic_duration'])
     process_earliest_start = next_business_day(strip_time(st.session_state['process_earliest_start']))
+    process_start_earliest_start = st.session_state['process_start_earliest_start']
     process_delay_start = int(st.session_state['process_delay_start'])
     process_roles = []# list(st.session_state['process_roles'])
     process_commitment = dict()#st.session_state['process_commitment']
@@ -363,6 +387,7 @@ def set_process(save_file, data):
         pessimistic_duration=pessimistic_duration,
         optimistic_duration=optimistic_duration,
         earliest_start=process_earliest_start.isoformat(),
+        start_earliest_start=process_start_earliest_start,
         delay_start=process_delay_start
     )
     data['processes'][process]['last_date'] = today.isoformat()

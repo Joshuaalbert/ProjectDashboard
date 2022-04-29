@@ -54,6 +54,28 @@ class CPM(nx.DiGraph):
         self._dirty = True
         super().remove_edges_from(*args, **kwargs)
 
+    def _refine_start_dates(self):
+        for n in self.nodes:
+            if self.nodes[n]['started']:
+                if self.nodes[n]['started_date'] < self.nodes[n]['ES']:
+                    st.warning(f"Node {n} started date is before earliest possible start date {self.nodes[n]['ES']}.")
+                if self.nodes[n]['started_date'] > self.nodes[n]['LS']:
+                    st.warning(f"Node {n} started date is after latest possible start date {self.nodes[n]['LS']}.")
+                self.add_node(n,
+                              expected_start_date=self.nodes[n]['started_date'],
+                              expected_done_date=add_business_days(self.nodes[n]['started_date'], self.nodes[n]['_duration']))
+            elif self.nodes[n]['start_earliest_start']:
+                self.add_node(n,
+                              expected_start_date=self.nodes[n]['ES'],
+                              expected_done_date=add_business_days(self.nodes[n]['ES'],
+                                                                   self.nodes[n]['_duration']))
+            else:
+                self.add_node(n,
+                              expected_start_date=None,
+                              expected_done_date=None)
+
+
+
     def _forward(self):
         start_time = next_business_day(strip_time(self.graph['start_date']))# min([self.nodes[j]['earliest_start'] for j in self.nodes], default=next_business_day(strip_time(datetime.datetime.now())))
         for n in nx.topological_sort(self):
@@ -70,40 +92,28 @@ class CPM(nx.DiGraph):
             else:
                 raise ValueError(f"{self._method} invalid.")
 
-            if self.nodes[n]['started']:
-                es = ls = self.nodes[n]['started_date']
-                ef = lf = add_business_days(es, duration)
-                self.add_node(n,
-                              ES=es,
-                              LS=ls,
-                              EF=ef,
-                              LF=lf,
-                              total_float=datetime.timedelta(days=0),
-                              _duration=duration)
-            else:
-                es = max([self.nodes[j]['EF'] for j in self.predecessors(n)], default=start_time)
-                extra_constraints = []
-                if self.nodes[n]['earliest_start'] is not None:
-                    extra_constraints.append(self.nodes[n]['earliest_start'])
-                if self.nodes[n]['delay_start'] is not None:
-                    extra_constraints.append(add_business_days(es, self.nodes[n]['delay_start']))
-                # extend earliest start to the maximum of the constraints
-                es = max([es]+extra_constraints)
-                ef = add_business_days(es, duration)
-                self.add_node(n,
-                              ES=es,
-                              EF=ef,
-                              _duration=duration)
+            es = max([self.nodes[j]['EF'] for j in self.predecessors(n)], default=start_time)
+            extra_constraints = []
+            if self.nodes[n]['earliest_start'] is not None:
+                extra_constraints.append(self.nodes[n]['earliest_start'])
+            if self.nodes[n]['delay_start'] is not None:
+                extra_constraints.append(add_business_days(es, self.nodes[n]['delay_start']))
+            # extend earliest start to the maximum of the constraints
+            es = max([es]+extra_constraints)
+            ef = add_business_days(es, duration)
+            self.add_node(n,
+                          ES=es,
+                          EF=ef,
+                          _duration=duration)
 
     def _backward(self):
         for n in reversed(list(nx.topological_sort(self))):
-            if not self.nodes[n]['started']:
-                lf = min([self.nodes[j]['LS'] for j in self.successors(n)], default=self._critical_path_end)
-                ls = subtract_business_days(lf,self.nodes[n]['_duration'])
-                self.add_node(n,
-                              LS=ls,
-                              LF=lf,
-                              total_float=datetime.timedelta(days=count_business_days(self.nodes[n]['ES'], lf)) - self.nodes[n]['_duration'])
+            lf = min([self.nodes[j]['LS'] for j in self.successors(n)], default=self._critical_path_end)
+            ls = subtract_business_days(lf, self.nodes[n]['_duration'])
+            self.add_node(n,
+                          LS=ls,
+                          LF=lf,
+                          total_float=datetime.timedelta(days=count_business_days(self.nodes[n]['ES'], lf)) - self.nodes[n]['_duration'])
 
     def _compute_critical_path(self):
         graph = set()
@@ -147,6 +157,7 @@ class CPM(nx.DiGraph):
             self._critical_path_end = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0))
             self._critical_path_length = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0)) - min(nx.get_node_attributes(self, 'ES').values(), default=datetime.timedelta(0))
             self._backward()
+            self._refine_start_dates()
             self._compute_critical_path()
             self._dirty = False
         elif self._method == 'stochastic':
@@ -158,6 +169,7 @@ class CPM(nx.DiGraph):
                 self._critical_path_end = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0))
                 self._critical_path_length = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0)) - min(nx.get_node_attributes(self, 'ES').values(), default=datetime.timedelta(0))
                 self._backward()
+                self._refine_start_dates()
                 self._compute_critical_path()
                 for n in self.nodes:
                     if n not in stochastic_results:
@@ -182,8 +194,13 @@ def get_critical_path(cache: Cache, date_of_change, termination_nodes=None):
             termination_nodes = [termination_nodes]
         ancestors = set()
         for source in termination_nodes:
+            # skip node if not available in history (may lead to empty graph)
+            if source not in G.nodes:
+                continue
             _ancestors = nx.algorithms.ancestors(G, source)
             ancestors = ancestors.union(_ancestors)
+            # also add in the node so that we show it
+            ancestors = ancestors.union({source})
         for node in list(G.nodes):
             if node not in ancestors:
                 G.remove_node(node)
@@ -241,6 +258,18 @@ def plot_gantt_chart(G, critical_path, display_resources):
                            facecolors=('green', 'blue', 'yellow'),
                            edgecolor='black',
                            alpha=0.5)
+
+        if G.nodes[process]['expected_start_date'] is not None:
+            ax.scatter(G.nodes[process]['expected_start_date'], bar_idx+0.5, c='black', marker='o')
+
+        if G.nodes[process]['expected_done_date'] is not None:
+            ax.scatter(G.nodes[process]['expected_done_date'], bar_idx+0.5, c='black', marker='o')
+
+        if (G.nodes[process]['expected_start_date'] is not None) and (G.nodes[process]['expected_done_date'] is not None):
+            ax.plot([G.nodes[process]['expected_start_date'], G.nodes[process]['expected_done_date']],
+                    [bar_idx+0.5, bar_idx+0.5],
+                    ls='dotted', c='black')
+
     ax.grid()
     ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
     ax.legend(loc='lower right')

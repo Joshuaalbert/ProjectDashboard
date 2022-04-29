@@ -5,6 +5,8 @@ from .critical_path import get_critical_path
 
 
 def display_graph(data, date_of_change):
+    def fix_node_name(node):
+        return node.replace(":",".")
     if st.checkbox("Display graph", False):
 
         G, critical_path = get_critical_path(Cache(data=data), date_of_change)
@@ -16,9 +18,9 @@ def display_graph(data, date_of_change):
                 label = "{}\nDur={} days".format(process, G.nodes[process]['duration'].days)
             else:
                 label = "{}\nSlack={} days".format(process, G.nodes[process]['total_float'].days)
-            H.node(process, penwidth="3" if process in critical_path else "1",
+            H.node(fix_node_name(process), penwidth="3" if process in critical_path else "1",
                    label=label)
             for dep in G.pred[process]:
-                H.edge(dep, process, penwidth="3" if (dep in critical_path) and (process in critical_path) else "1")
+                H.edge(fix_node_name(dep), fix_node_name(process), penwidth="3" if (dep in critical_path) and (process in critical_path) else "1")
 
         st.graphviz_chart(H)
