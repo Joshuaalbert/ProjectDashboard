@@ -89,6 +89,13 @@ def render_components():
     else:
         date_of_change = datetime.datetime.fromisoformat(data['start_date'])
 
+    ## data
+    with container:
+        if advanced:
+            render_roles(data, save_file, advanced)
+            render_resources(data, save_file, advanced)
+        render_processes(data, save_file, advanced, date_of_change)
+
     display_graph(data, date_of_change)
 
     render_critical_path(data, date_of_change)
@@ -97,12 +104,7 @@ def render_components():
 
     render_resource_usage(data, date_of_change)
 
-    ## data
-    with container:
-        if advanced:
-            render_roles(data, save_file, advanced)
-            render_resources(data, save_file, advanced)
-        render_processes(data, save_file, advanced, date_of_change)
+
 
 
 
