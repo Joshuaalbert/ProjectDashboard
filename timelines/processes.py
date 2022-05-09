@@ -287,8 +287,8 @@ def render_processes(data, save_file, advanced, date_of_change):
                 continue
             last_date = data['processes'][process]['last_date']
             if data['processes'][process]['history'][last_date]['started']:
-                _done_date = add_business_days(data['processes'][process]['history'][last_date]['started_date'],
-                                      st.session_state['duration'])
+                _done_date = add_business_days(datetime.datetime.fromisoformat(data['processes'][process]['history'][last_date]['started_date']),
+                                      datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
                 _done = datetime.datetime.now() >= _done_date
             else:
                 _done = False
