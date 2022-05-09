@@ -61,6 +61,7 @@ def fill_graph(G, data, date):
             if dates[i] > date:
                 break
             key_date = dates[i]
+        st.write(date, key_date)
         process_data = data['processes'][process]['history'][key_date.isoformat()]
 
         _commitment = {key: com * hours_per_attention * process_data['duration'] / 5. for key, com in process_data['commitment'].items()}
