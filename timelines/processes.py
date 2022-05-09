@@ -165,42 +165,15 @@ def render_processes(data, save_file, advanced, date_of_change):
                               key='process_date_started',
                               on_change=_clean_date)
 
-                st.checkbox("Process Done",
-                                           value=st.session_state['process_done'],
-                                           help="Is this process done?",
-                                           key='process_done')
-            else:
-                st.session_state['process_done'] = False
-
-
-            if st.session_state['process_done']:
-                def _clean_date():
-                    st.session_state['process_done_date'] = next_business_day(
-                        strip_time(st.session_state['process_done_date']))
-
-                st.date_input("Date finished",
-                              min_value=st.session_state['process_date_started'],
-                              max_value=max(st.session_state['process_date_started'],datetime.datetime.now()),
-                              help="When was the process done?",
-                              key='process_done_date',
-                              on_change=_clean_date)
+                process_done = datetime.datetime.now() >= (add_business_days(st.session_state['process_date_started'],st.session_state['process_date_started']))
+                if process_done:
+                    process_date_done = add_business_days(st.session_state['process_date_started'],st.session_state['process_date_started'])
+                    st.sidebar.info(f"Process completed on {process_date_done.isoformat()}.")
 
         # st.write(st.session_state)
 
         if 'process_started' not in st.session_state:
             st.session_state['process_started'] = False
-
-        if 'process_done' not in st.session_state:
-            st.session_state['process_done'] = False
-
-        if st.session_state['process_started'] and st.session_state['process_done']:
-            st.session_state['duration'] = count_business_days(
-                strip_time(st.session_state['process_date_started']),
-                strip_time(st.session_state['process_done_date']))
-            st.session_state['pessimistic_duration'] = st.session_state['optimistic_duration'] = st.session_state[
-                'duration']
-            st.info(f"Duration {st.session_state['duration']} days.")
-
 
         # Durations
         duration_text = st.text_input("Conservative duration (days)",
@@ -352,9 +325,6 @@ def set_process(save_file, data):
     process = st.session_state['process']
     process_name = st.session_state['process_name']
     process_dependencies = list(st.session_state['process_dependencies'])
-    process_done = bool(st.session_state['process_done'])
-    process_done_date = next_business_day(
-        strip_time(st.session_state['process_done_date'])) if 'process_done_date' in st.session_state else today
     process_started = bool(st.session_state['process_started'])
     process_start_date = next_business_day(
         strip_time(st.session_state['process_date_started'])) if 'process_date_started' in st.session_state else today
@@ -379,8 +349,6 @@ def set_process(save_file, data):
         roles=process_roles,
         dependencies=process_dependencies,
         commitment=process_commitment,
-        done=process_done,
-        done_date=process_done_date.isoformat(),
         started=process_started,
         started_date=process_start_date.isoformat(),
         duration=process_duration,

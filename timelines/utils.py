@@ -68,8 +68,6 @@ def fill_graph(G, data, date):
                    optimistic_duration=datetime.timedelta(days=process_data['optimistic_duration']),
                    started = process_data['started'],
                    started_date = next_business_day(datetime.datetime.fromisoformat(process_data['started_date'])),
-                   done=process_data['done'],
-                   done_date=next_business_day(datetime.datetime.fromisoformat(process_data['done_date'])),
                    roles=process_data['roles'],
                    resources=[resource for resource in data['resources'] if any([role in process_data['roles']
                                                                                  for role in process_data['roles']])],

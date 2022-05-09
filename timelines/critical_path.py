@@ -64,19 +64,11 @@ class CPM(nx.DiGraph):
                 self.add_node(n,
                               expected_start_date=self.nodes[n]['started_date'],
                               expected_done_date=add_business_days(self.nodes[n]['started_date'], self.nodes[n]['_duration']))
-                if self.nodes[n]['done']:
-                    if self.nodes[n]['LF'] < self.nodes[n]['done_date']:
-                        st.warning(f"Node {n} has done date after latest possible finish date {self.nodes[n]['LF']}.")
-                    self.add_node(n, expected_done_date=self.nodes[n]['done_date'])
             elif self.nodes[n]['start_earliest_start']:
                 self.add_node(n,
                               expected_start_date=self.nodes[n]['ES'],
                               expected_done_date=add_business_days(self.nodes[n]['ES'],
                                                                    self.nodes[n]['_duration']))
-                if self.nodes[n]['done']:
-                    if self.nodes[n]['LF'] < self.nodes[n]['done_date']:
-                        st.warning(f"Node {n} has done date after latest possible finish date {self.nodes[n]['LF']}.")
-                    self.add_node(n, expected_done_date=self.nodes[n]['done_date'])
             else:
                 self.add_node(n,
                               expected_start_date=None,
@@ -267,16 +259,19 @@ def plot_gantt_chart(G, critical_path, display_resources):
                            edgecolor='black',
                            alpha=0.5)
 
+        process_done = G.nodes[process]['expected_done_date'] <= datetime.datetime.now()
+        process_started = G.nodes[process]['expected_start_date'] <= datetime.datetime.now()
+
         if G.nodes[process]['expected_start_date'] is not None:
-            ax.scatter(G.nodes[process]['expected_start_date'], bar_idx+0.5, c='black', marker='o')
+            ax.scatter(G.nodes[process]['expected_start_date'], bar_idx+0.5, c='cyan' if process_started else 'black', marker='x' if process_started else 'o')
 
         if G.nodes[process]['expected_done_date'] is not None:
-            ax.scatter(G.nodes[process]['expected_done_date'], bar_idx+0.5, c='black', marker='o')
+            ax.scatter(G.nodes[process]['expected_done_date'], bar_idx+0.5, c='cyan' if process_done else 'black', marker='x' if process_done else 'o')
 
         if (G.nodes[process]['expected_start_date'] is not None) and (G.nodes[process]['expected_done_date'] is not None):
             ax.plot([G.nodes[process]['expected_start_date'], G.nodes[process]['expected_done_date']],
                     [bar_idx+0.5, bar_idx+0.5],
-                    ls='dotted', c='black')
+                    ls='dashed' if process_done else 'dotted', c='cyan' if process_done else 'black')
 
     ax.grid()
     ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
