@@ -46,8 +46,6 @@ def load_from_data(data, process):
     session_state = dict(
         process=process,  # symbol
         process_name=process_data['name'],  # Name
-        process_done=process_data['done'],
-        process_done_date=datetime.datetime.fromisoformat(process_data['done_date']),
         process_dependencies=process_data['dependencies'],
         process_date_started=datetime.datetime.fromisoformat(
             process_data['started_date']),
@@ -68,8 +66,6 @@ def set_default_values(data, weak=False):
         session_state = dict(
             process="",
             process_name="",
-            process_done=False,
-            process_done_date=strip_time(datetime.datetime.now()),
             process_dependencies=[],
             process_date_started=strip_time(datetime.datetime.now()),
             process_started=False,
