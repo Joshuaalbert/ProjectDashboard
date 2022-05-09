@@ -259,16 +259,17 @@ def plot_gantt_chart(G, critical_path, display_resources):
                            edgecolor='black',
                            alpha=0.5)
 
-        process_done = G.nodes[process]['expected_done_date'] <= datetime.datetime.now()
-        process_started = G.nodes[process]['expected_start_date'] <= datetime.datetime.now()
 
         if G.nodes[process]['expected_start_date'] is not None:
+            process_started = G.nodes[process]['expected_start_date'] <= datetime.datetime.now()
             ax.scatter(G.nodes[process]['expected_start_date'], bar_idx+0.5, c='cyan' if process_started else 'black', marker='x' if process_started else 'o')
 
         if G.nodes[process]['expected_done_date'] is not None:
+            process_done = G.nodes[process]['expected_done_date'] <= datetime.datetime.now()
             ax.scatter(G.nodes[process]['expected_done_date'], bar_idx+0.5, c='cyan' if process_done else 'black', marker='x' if process_done else 'o')
 
         if (G.nodes[process]['expected_start_date'] is not None) and (G.nodes[process]['expected_done_date'] is not None):
+            process_done = G.nodes[process]['expected_done_date'] <= datetime.datetime.now()
             ax.plot([G.nodes[process]['expected_start_date'], G.nodes[process]['expected_done_date']],
                     [bar_idx+0.5, bar_idx+0.5],
                     ls='dashed' if process_done else 'dotted', c='cyan' if process_done else 'black')
