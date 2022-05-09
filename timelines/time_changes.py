@@ -25,41 +25,7 @@ def render_timeline_changes(cache: Cache, dates_of_change):
                     continue
             _dates.append(date)
             _total_lengths.append(G.critical_path_end)
-            #
-            # for process in nx.algorithms.topological_sort(G):
-            #     if process in critical_path:
-            #         print(process)
-            #         start_day = G.nodes[process]['ES']
-            #         end_day = G.nodes[process]['LF']
-            #
-            #         ax.bar(date,
-            #                end_day - start_day,
-            #                bottom=start_day,
-            #                facecolor='red',
-            #                edgecolor='none',
-            #                alpha=0.5)
-            #     else:
-            #         print(process, G.nodes[process]['ES'])
-            #         ax.bar(date,
-            #                G.nodes[process]['LS'] - G.nodes[process]['ES'],
-            #                bottom=G.nodes[process]['ES'],
-            #                facecolor='green',
-            #                edgecolor='none',
-            #                alpha=0.15)
-            #
-            #         ax.bar(date,
-            #                G.nodes[process]['LF'] - G.nodes[process]['EF'],
-            #                bottom=G.nodes[process]['EF'],
-            #                facecolor='blue',
-            #                edgecolor='none',
-            #                alpha=0.15)
-            #
-            #         ax.bar(date,
-            #                (G.nodes[process]['EF'] - G.nodes[process]['LS']).days,
-            #                bottom=G.nodes[process]['LS'],
-            #                facecolor='yellow',
-            #                edgecolor='none',
-            #                alpha=0.15)
+
 
         G, critical_path = get_critical_path(cache, datetime.datetime.now(), termination_nodes=termination_nodes)
         _dates.append(datetime.datetime.now())
