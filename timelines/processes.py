@@ -291,7 +291,6 @@ def render_processes(data, save_file, advanced, date_of_change):
                 _done = False
                 _done_date = None
             if _done:
-                st.sidebar.info(f"Process completed on {_done_date.isoformat()}.")
                 st.markdown(f" - [x] ({process}) {data['processes'][process]['history'][last_date]['name']} done on {date_label(_done_date)}")
             else:
                 st.markdown(f" - [ ] ({process}) {data['processes'][process]['history'][last_date]['name']}")
