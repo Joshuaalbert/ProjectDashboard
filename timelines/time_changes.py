@@ -13,9 +13,6 @@ def render_timeline_changes(cache: Cache, dates_of_change):
         fig, ax = plt.subplots(1,1,figsize=(12,28//3))
         _dates = []
         _total_lengths = []
-        G, critical_path = get_critical_path(cache, datetime.datetime.now(), termination_nodes=termination_nodes)
-        _dates.append(datetime.datetime.now())
-        _total_lengths.append(G.critical_path_end)
 
         for date in dates_of_change:
             G, critical_path = get_critical_path(cache, date, termination_nodes=termination_nodes)
@@ -63,6 +60,11 @@ def render_timeline_changes(cache: Cache, dates_of_change):
             #                facecolor='yellow',
             #                edgecolor='none',
             #                alpha=0.15)
+
+        G, critical_path = get_critical_path(cache, datetime.datetime.now(), termination_nodes=termination_nodes)
+        _dates.append(datetime.datetime.now())
+        _total_lengths.append(G.critical_path_end)
+
         ax.scatter(_dates, _total_lengths)
         ax.plot(_dates, _total_lengths)
         ax.set_ylim(min(_total_lengths) - datetime.timedelta(days=5), max(_total_lengths) + datetime.timedelta(days=5))
