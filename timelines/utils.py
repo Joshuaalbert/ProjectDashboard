@@ -51,14 +51,16 @@ def fill_graph(G, data, date):
     G.graph['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
 
     for process in data['processes']:
+        # all sorted dates where the process had an update
         dates = sorted(map(lambda date: datetime.datetime.fromisoformat(date), data['processes'][process]['history']))
-        if date < dates[0]:
-            continue # don't add this process
-        key_date = dates[-1]
-        for _date in dates[::-1]:
-            if date <= _date:
-                key_date = _date
+        if date < dates[0]:# if date of simulation before oldest date, don't add this process
+            continue
+        # we pick the infimum of dates wrt this date, largest lower bounding date.
+        key_date = None
+        for i in range(len(dates)):
+            if dates[i] > date:
                 break
+            key_date = dates[i]
         process_data = data['processes'][process]['history'][key_date.isoformat()]
 
         _commitment = {key: com * hours_per_attention * process_data['duration'] / 5. for key, com in process_data['commitment'].items()}
