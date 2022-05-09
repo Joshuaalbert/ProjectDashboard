@@ -165,11 +165,11 @@ def render_processes(data, save_file, advanced, date_of_change):
                               key='process_date_started',
                               on_change=_clean_date)
 
-                process_date_done = add_business_days(st.session_state['process_date_started'],
-                                                      datetime.timedelta(days=st.session_state['process_duration']))
-                process_done = datetime.datetime.now() >= process_date_done
-                if process_done:
-                    st.sidebar.info(f"Process completed on {process_date_done.isoformat()}.")
+                # process_date_done = add_business_days(st.session_state['process_date_started'],
+                #                                       datetime.timedelta(days=st.session_state['process_duration']))
+                # process_done = datetime.datetime.now() >= process_date_done
+                # if process_done:
+                #     st.sidebar.info(f"Process completed on {process_date_done.isoformat()}.")
 
         # st.write(st.session_state)
 
