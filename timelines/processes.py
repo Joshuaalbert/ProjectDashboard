@@ -286,9 +286,15 @@ def render_processes(data, save_file, advanced, date_of_change):
             if (process not in display_process) and (len(display_process) > 0):
                 continue
             last_date = data['processes'][process]['last_date']
-            _done = data['processes'][process]['history'][last_date]['done']
-            _done_date = datetime.datetime.fromisoformat(data['processes'][process]['history'][last_date]['done_date'])
+            if data['processes'][process]['history'][last_date]['started']:
+                _done_date = add_business_days(data['processes'][process]['history'][last_date]['started_date'],
+                                      st.session_state['duration'])
+                _done = datetime.datetime.now() >= _done_date
+            else:
+                _done = False
+                _done_date = None
             if _done:
+                st.sidebar.info(f"Process completed on {_done_date.isoformat()}.")
                 st.markdown(f" - [x] ({process}) {data['processes'][process]['history'][last_date]['name']} done on {date_label(_done_date)}")
             else:
                 st.markdown(f" - [ ] ({process}) {data['processes'][process]['history'][last_date]['name']}")
