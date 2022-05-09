@@ -19,7 +19,7 @@ def render_timeline_changes(cache: Cache, dates_of_change):
 
         for date in dates_of_change:
             G, critical_path = get_critical_path(cache, date, termination_nodes=termination_nodes)
-            st.write(critical_path)
+            st.write(critical_path, G.critical_path_end, G.critical_path_length)
             _available_in_data = True
             if termination_nodes is not None:
                 for _node in termination_nodes:
