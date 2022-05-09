@@ -26,6 +26,7 @@ def render_timeline_changes(cache: Cache, dates_of_change):
                         _available_in_data = False
                 if not _available_in_data:
                     continue
+            st.write([date, G.critical_path_end])
             _dates.append(date)
             _total_lengths.append(G.critical_path_end)
             #
