@@ -5,10 +5,10 @@ import numpy as np
 import pylab as plt
 import streamlit as st
 
-from .utils import Cache, hash_map
-
+from .utils import Cache
 from .utils import add_business_days, subtract_business_days, count_business_days, next_business_day, strip_time, \
     fill_graph
+
 
 class CPM(nx.DiGraph):
 
@@ -63,7 +63,8 @@ class CPM(nx.DiGraph):
                     st.warning(f"Node {n} started date is after latest possible start date {self.nodes[n]['LS']}.")
                 self.add_node(n,
                               expected_start_date=self.nodes[n]['started_date'],
-                              expected_done_date=add_business_days(self.nodes[n]['started_date'], self.nodes[n]['_duration']))
+                              expected_done_date=add_business_days(self.nodes[n]['started_date'],
+                                                                   self.nodes[n]['_duration']))
             elif self.nodes[n]['start_earliest_start']:
                 self.add_node(n,
                               expected_start_date=self.nodes[n]['ES'],
@@ -74,10 +75,9 @@ class CPM(nx.DiGraph):
                               expected_start_date=None,
                               expected_done_date=None)
 
-
-
     def _forward(self):
-        start_time = next_business_day(strip_time(self.graph['start_date']))# min([self.nodes[j]['earliest_start'] for j in self.nodes], default=next_business_day(strip_time(datetime.datetime.now())))
+        start_time = next_business_day(strip_time(self.graph[
+                                                      'start_date']))  # min([self.nodes[j]['earliest_start'] for j in self.nodes], default=next_business_day(strip_time(datetime.datetime.now())))
         for n in nx.topological_sort(self):
             # required information:
             # start date & time remaining
@@ -99,7 +99,7 @@ class CPM(nx.DiGraph):
             if self.nodes[n]['delay_start'] is not None:
                 extra_constraints.append(add_business_days(es, self.nodes[n]['delay_start']))
             # extend earliest start to the maximum of the constraints
-            es = max([es]+extra_constraints)
+            es = max([es] + extra_constraints)
             ef = add_business_days(es, duration)
             self.add_node(n,
                           ES=es,
@@ -113,7 +113,8 @@ class CPM(nx.DiGraph):
             self.add_node(n,
                           LS=ls,
                           LF=lf,
-                          total_float=datetime.timedelta(days=count_business_days(self.nodes[n]['ES'], lf)) - self.nodes[n]['_duration'])
+                          total_float=datetime.timedelta(days=count_business_days(self.nodes[n]['ES'], lf)) -
+                                      self.nodes[n]['_duration'])
 
     def _compute_critical_path(self):
         graph = set()
@@ -141,7 +142,6 @@ class CPM(nx.DiGraph):
         elif self._method == 'stochastic':
             return self._stochastic_critical_path_end
 
-
     @property
     def critical_path(self):
         if self._dirty:
@@ -155,7 +155,9 @@ class CPM(nx.DiGraph):
         if self._method == 'single':
             self._forward()
             self._critical_path_end = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0))
-            self._critical_path_length = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0)) - min(nx.get_node_attributes(self, 'ES').values(), default=datetime.timedelta(0))
+            self._critical_path_length = max(nx.get_node_attributes(self, 'EF').values(),
+                                             default=datetime.timedelta(0)) - min(
+                nx.get_node_attributes(self, 'ES').values(), default=datetime.timedelta(0))
             self._backward()
             self._refine_start_dates()
             self._compute_critical_path()
@@ -166,14 +168,17 @@ class CPM(nx.DiGraph):
             stochastic_critical_path_length = []
             for _ in range(self._num_particles):
                 self._forward()
-                self._critical_path_end = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0))
-                self._critical_path_length = max(nx.get_node_attributes(self, 'EF').values(), default=datetime.timedelta(0)) - min(nx.get_node_attributes(self, 'ES').values(), default=datetime.timedelta(0))
+                self._critical_path_end = max(nx.get_node_attributes(self, 'EF').values(),
+                                              default=datetime.timedelta(0))
+                self._critical_path_length = max(nx.get_node_attributes(self, 'EF').values(),
+                                                 default=datetime.timedelta(0)) - min(
+                    nx.get_node_attributes(self, 'ES').values(), default=datetime.timedelta(0))
                 self._backward()
                 self._refine_start_dates()
                 self._compute_critical_path()
                 for n in self.nodes:
                     if n not in stochastic_results:
-                        stochastic_results[n] = dict(ES=[],EF=[],LS=[],LF=[],total_float=[])
+                        stochastic_results[n] = dict(ES=[], EF=[], LS=[], LF=[], total_float=[])
                     for key in stochastic_results[n]:
                         stochastic_results[n][key].append(self.nodes[n][key])
                 stochastic_critical_path_end.append(self._critical_path_end)
@@ -182,6 +187,7 @@ class CPM(nx.DiGraph):
             self._stochastic_critical_path_end = stochastic_critical_path_end
             self._stochastic_critical_path_length = stochastic_critical_path_length
             self._dirty = False
+
 
 # @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def get_critical_path(cache: Cache, date_of_change, termination_nodes=None):
@@ -209,7 +215,6 @@ def get_critical_path(cache: Cache, date_of_change, termination_nodes=None):
 
 
 def render_critical_path(data, date_of_change):
-
     if st.checkbox("Display critical path", False):
         # display_resources = st.multiselect("Gantt chart only some resources? ", list(data['resources']), [],
         #                                    help="Whether to GANTT chart certain resources.")
@@ -225,11 +230,13 @@ def render_critical_path(data, date_of_change):
 
 
 def plot_gantt_chart(G, critical_path, display_resources):
-    fig, ax = plt.subplots(1, 1, figsize=(12, 28//3))
+    fig, ax = plt.subplots(1, 1, figsize=(12, 28 // 3))
 
     if len(display_resources) > 0:
         # resource_nodes = [node for node in G.nodes if (any([resource in G.nodes[node]['resources'] for resource in display_resources]) or (len(G.nodes[node]['roles']) == 0))]
-        resource_nodes = list(filter(lambda node: any([resource in G.nodes[node]['resources'] for resource in display_resources]), G.nodes))
+        resource_nodes = list(
+            filter(lambda node: any([resource in G.nodes[node]['resources'] for resource in display_resources]),
+                   G.nodes))
     else:
         resource_nodes = list(G.nodes)
     order = []
@@ -259,23 +266,25 @@ def plot_gantt_chart(G, critical_path, display_resources):
                            edgecolor='black',
                            alpha=0.5)
 
-
         if G.nodes[process]['expected_start_date'] is not None:
             process_started = G.nodes[process]['expected_start_date'] <= datetime.datetime.now()
-            ax.scatter(G.nodes[process]['expected_start_date'], bar_idx+0.5, c='black', marker='x' if process_started else 'o')
+            ax.scatter(G.nodes[process]['expected_start_date'], bar_idx + 0.5, c='black',
+                       marker='x' if process_started else 'o')
 
         if G.nodes[process]['expected_done_date'] is not None:
             process_done = G.nodes[process]['expected_done_date'] <= datetime.datetime.now()
-            ax.scatter(G.nodes[process]['expected_done_date'], bar_idx+0.5, c='black', marker='x' if process_done else 'o')
+            ax.scatter(G.nodes[process]['expected_done_date'], bar_idx + 0.5, c='black',
+                       marker='x' if process_done else 'o')
 
-        if (G.nodes[process]['expected_start_date'] is not None) and (G.nodes[process]['expected_done_date'] is not None):
+        if (G.nodes[process]['expected_start_date'] is not None) and (
+                G.nodes[process]['expected_done_date'] is not None):
             process_done = G.nodes[process]['expected_done_date'] <= datetime.datetime.now()
             ax.plot([G.nodes[process]['expected_start_date'], G.nodes[process]['expected_done_date']],
-                    [bar_idx+0.5, bar_idx+0.5],
+                    [bar_idx + 0.5, bar_idx + 0.5],
                     ls='dashed' if process_done else 'dotted', c='black')
 
     ax.grid()
-    ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
+    ax.axvline(datetime.datetime.now(), c='black', lw=3., alpha=0.75, label='Now')
     ax.legend(loc='lower right')
     ax.set_yticks(np.arange(len(order)) + 0.5)
     ax.set_yticklabels(order, rotation=0)

@@ -25,16 +25,16 @@ def render_resources(data, save_file, advanced):
         cost_per_week = st.checkbox("Fixed resource cost ($/week)?", _default_cost_per_week)
         if cost_per_week:
             new_resource_wage = st.slider("Resource cost ($ / week): ", 0., 5000., _default_wage, 50.,
-                                                        help="What is the resource cost per week.")
+                                          help="What is the resource cost per week.")
         else:
             new_resource_wage = st.slider("Resource cost ($ / hour): ", 0., 200., _default_wage, 0.5,
                                           help="What is the resource cost in ($ / hour).")
 
         new_resource_roles = st.multiselect("Resource roles:", data['roles'], _default_roles,
-                                                    help="What roles this resource can fill.")
+                                            help="What roles this resource can fill.")
 
         new_resource_start_date = st.date_input("Start date: ", _default_start_date,
-                                                        help="From what date the resource can work.")
+                                                help="From what date the resource can work.")
 
         if st.button("Add/Mod resource") and (new_resource != ""):
             data['resources'][new_resource] = dict(roles=new_resource_roles,

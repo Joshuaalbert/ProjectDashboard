@@ -1,19 +1,18 @@
+import base64
 import datetime
-
-import streamlit as st
-from streamlit import caching
 import json
 import os
-from .critical_path import render_critical_path
 
+import streamlit as st
+
+from .critical_path import render_critical_path
+from .graph import display_graph
 from .processes import render_processes
+from .resource_usage_analysis import render_resource_usage
 from .resources import render_resources
 from .roles import render_roles
-from .resource_usage_analysis import render_resource_usage
-from .utils import flush_state, Cache, get_dates_of_prediction_change, strip_time
-from .graph import display_graph
 from .time_changes import render_timeline_changes
-import base64
+from .utils import flush_state, Cache, get_dates_of_prediction_change, strip_time
 
 
 def get_table_download_link(save_file):
@@ -42,7 +41,6 @@ def render_components():
         flush_state(save_file, data)
         st.sidebar.info(f"Loaded {file} into {save_file}. Previous contents of {save_file} are deleted.")
 
-
     if os.path.isfile(save_file):
         with open(save_file, 'r') as f:
             data = json.load(f)
@@ -60,6 +58,7 @@ def render_components():
     advanced = st.sidebar.checkbox("Advanced options", False, help="Whether to enable advanced options.")
 
     st.session_state['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
+
     def _on_change():
         data['start_date'] = strip_time(st.session_state['start_date']).isoformat()
         flush_state(save_file, data)
@@ -73,7 +72,6 @@ def render_components():
         data['start_date'] = start_date.isoformat()
 
     container = st.container()
-
 
     ### display sections
 
@@ -103,8 +101,3 @@ def render_components():
     render_timeline_changes(Cache(data), dates_of_change)
 
     render_resource_usage(data, date_of_change)
-
-
-
-
-

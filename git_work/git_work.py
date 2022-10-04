@@ -1,22 +1,20 @@
+import base64
 import datetime
+import json
 import os.path
-
-import streamlit as st
-from streamlit import caching
-from github import Github, Repository, Issue, NamedUser, Label
 import re
+
+import networkx as nx
 import numpy as np
 import pylab as plt
-import base64
-import networkx as nx
-import json
+import streamlit as st
+from github import Github, Repository, Issue, NamedUser, Label
 
 
 def hash(x):
     if isinstance(x, int):
         return x
     return x.__hash__()
-
 
 
 hash_map = {Repository.Repository: lambda x: hash(x.name),
@@ -31,7 +29,8 @@ hash_map = {Repository.Repository: lambda x: hash(x.name),
 def get_issues(repo, label, assignee="*"):
     if not isinstance(label, (list, tuple)):
         label = [label]
-    return repo.get_issues(state='all', labels=label)#, assignee=assignee)
+    return repo.get_issues(state='all', labels=label)  # , assignee=assignee)
+
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def search_issues(repo, labels, assignees):
@@ -97,7 +96,6 @@ def get_table_download_link(save_file):
     return f'<a href="data:application/octet-stream;base64,{b64.decode()}" download="{save_file}.json">Download Data File</a>'  # decode b'abc' => abc
 
 
-
 def user_assigned_for_interval(intervals, start, end):
     """
     Determine if user was assigned at `end`.
@@ -110,7 +108,6 @@ def user_assigned_for_interval(intervals, start, end):
     for assigned, interval_start in intervals:
         if end <= interval_start:
             return assigned
-
 
 
 class EventLog(object):
@@ -126,12 +123,14 @@ class EventLog(object):
         self.intervals.append((v, self.b))
         self.b = None
 
-def serialise_graph(G:nx.DiGraph):
+
+def serialise_graph(G: nx.DiGraph):
     data = dict(id=G['id'],
                 nodes=list(G.nodes),
                 edges=list(G.edges),
                 subgraphs=list(G['subgraphs']))
     return data
+
 
 def deserialise_graph(data):
     G = nx.DiGraph(id=data['id'], subgraphs=data['subgraphs'])
@@ -139,18 +138,21 @@ def deserialise_graph(data):
     G.add_edges_from(data['nodes'])
     return G
 
+
 def save_data(data, save_file):
     with open(save_file, 'w') as f:
         json.dump(data, f)
+
 
 def load_data(data_file):
     if os.path.isfile(data_file):
         with open(data_file, 'r') as f:
             data = json.load(f)
     else:
-        data = dict(id=0, subgraphs=[],nodes=[],edges=[], token="")
+        data = dict(id=0, subgraphs=[], nodes=[], edges=[], token="")
         save_data(data, data_file)
     return data
+
 
 def get_start_time(issue):
     start_time = None
@@ -193,9 +195,10 @@ def get_label_story_points(repo, issues, storypoint_regex, use_story_points=True
             complete_story_points += story_points
     return total_story_points, complete_story_points, start_time
 
+
 def plot_label_healthbar(repo, issues, storypoint_regex):
     total_story_points, complete_story_points, start_time = get_label_story_points(repo, issues, storypoint_regex)
-    completeness = complete_story_points/total_story_points if total_story_points > 0 else 1.
+    completeness = complete_story_points / total_story_points if total_story_points > 0 else 1.
     if completeness >= 0.:
         color = 'red'
     if completeness > 0.33:
@@ -205,7 +208,7 @@ def plot_label_healthbar(repo, issues, storypoint_regex):
     width = 30
     done_width = int(completeness * width)
     not_done_width = width - done_width
-    st.markdown(f"Completeness: |{'#'*done_width}{'-'*not_done_width}| {round(completeness*100,1)}%")
+    st.markdown(f"Completeness: |{'#' * done_width}{'-' * not_done_width}| {round(completeness * 100, 1)}%")
 
     if start_time is not None:
         dt = datetime.datetime.now() - start_time
@@ -215,15 +218,11 @@ def plot_label_healthbar(repo, issues, storypoint_regex):
     if rate == 0:
         time_left = "NaN"
     else:
-        time_left = (1. - completeness)/rate/86400./7
+        time_left = (1. - completeness) / rate / 86400. / 7
     st.markdown(f"Time remaining: {time_left} weeks")
 
 
 def render_data():
-    if st.sidebar.button("Refresh GitHub Data"):
-        caching.clear_cache()
-
-
     token = st.sidebar.text_input("Github token: ", help="A github token giving you read access to the repo.")
 
     repo_name = st.sidebar.text_input("Repo :", 'Touch-Physio/Touch-Meta', help="Repo in format `owner/repo`")
@@ -240,13 +239,14 @@ def render_data():
 
     render_report(repo, epic_regex, storypoint_regex)
 
+
 def safe_index(list, item):
     if item not in list:
         return 0
     return list.index(item)
 
 
-def get_storypoints_on_date(issue:Issue.Issue, storypoint_regex, date):
+def get_storypoints_on_date(issue: Issue.Issue, storypoint_regex, date):
     events = list(get_events(issue))
     labels = set()
     _date = issue.created_at
@@ -265,13 +265,15 @@ def get_storypoints_on_date(issue:Issue.Issue, storypoint_regex, date):
     st.warning(f"[#{issue.number}]({issue.html_url}) {issue.title} has no story points!")
     return None
 
-def same_day(date1:datetime.datetime, date2:datetime.datetime):
+
+def same_day(date1: datetime.datetime, date2: datetime.datetime):
     date1 = datetime.datetime(year=date1.year, month=date1.month, day=date1.day)
     date2 = datetime.datetime(year=date2.year, month=date2.month, day=date2.day)
     return date1 == date2
 
+
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def was_labeled_on_date(issue:Issue.Issue, label, date):
+def was_labeled_on_date(issue: Issue.Issue, label, date):
     events = list(get_events(issue))
     was_labeled = False
     _date = issue.created_at
@@ -286,7 +288,7 @@ def was_labeled_on_date(issue:Issue.Issue, label, date):
 
 
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def has_label_on_date(issue:Issue.Issue, label, date):
+def has_label_on_date(issue: Issue.Issue, label, date):
     events = list(get_events(issue))
     labels = set()
     _date = issue.created_at
@@ -301,8 +303,9 @@ def has_label_on_date(issue:Issue.Issue, label, date):
         return any([lab in labels for lab in label])
     return label in labels
 
+
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def has_assignee_on_date(issue:Issue.Issue, assignee, date):
+def has_assignee_on_date(issue: Issue.Issue, assignee, date):
     events = list(get_events(issue))
     assignees = set()
     _date = issue.created_at
@@ -315,8 +318,9 @@ def has_assignee_on_date(issue:Issue.Issue, assignee, date):
             assignees = assignees - {event.assignee.login}
     return assignee.login in assignees
 
+
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def is_closed_on_date(issue:Issue.Issue, date):
+def is_closed_on_date(issue: Issue.Issue, date):
     events = list(get_events(issue))
     closed = False
     _date = issue.created_at
@@ -327,8 +331,9 @@ def is_closed_on_date(issue:Issue.Issue, date):
             closed = True
     return closed
 
+
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def time_with_label(issue:Issue.Issue, label):
+def time_with_label(issue: Issue.Issue, label):
     events = list(get_events(issue))
     _total_time = datetime.timedelta(days=0.)
     _on_time = None
@@ -344,8 +349,6 @@ def time_with_label(issue:Issue.Issue, label):
     return _total_time
 
 
-
-
 def render_report(repo, epic_regex, storypoint_regex):
     repo_labels = get_labels(repo)
     repo_label_names = [lab.name for lab in repo_labels]
@@ -356,16 +359,14 @@ def render_report(repo, epic_regex, storypoint_regex):
                                             help='What labels signifies the user story?')
 
     bug_label = st.sidebar.selectbox("Bug label: ",
-                                            repo_label_names,
-                                            safe_index(repo_label_names, 'bug'),
-                                            help='What labels signifies the bug?')
+                                     repo_label_names,
+                                     safe_index(repo_label_names, 'bug'),
+                                     help='What labels signifies the bug?')
 
     default_dev_tickets = ['frontend', 'backend']
     dev_ticket_labels = st.sidebar.multiselect("Dev ticket labels: ", repo_label_names,
-                                         [lab for lab in default_dev_tickets if lab in repo_label_names],
-                                         help="What labels signifies dev work?")
-
-
+                                               [lab for lab in default_dev_tickets if lab in repo_label_names],
+                                               help="What labels signifies dev work?")
 
     epics_labels = list(filter(lambda label: re.match(epic_regex, label.name) is not None, repo_labels))
     epics_to_report = st.sidebar.multiselect("Which Epics to report on: ", epics_labels, [])
@@ -420,7 +421,8 @@ def render_report(repo, epic_regex, storypoint_regex):
     with st.beta_expander(f"Dev tickets missing story points:"):
         dev_tickets_missing_container = st.beta_container()
 
-    sum_labels = st.sidebar.multiselect("Labels to measure time in: ", tracking_labels, [], help="Sum up time in these labels.")
+    sum_labels = st.sidebar.multiselect("Labels to measure time in: ", tracking_labels, [],
+                                        help="Sum up time in these labels.")
 
     run_report = st.sidebar.button("Run Report")
     # for each epic print numbers of bugs, user stories, and dev tickets that have been created and closed during this period.
@@ -434,13 +436,17 @@ def render_report(repo, epic_regex, storypoint_regex):
                 # over all health
                 user_story_issues = list(get_issues(repo, [epic, user_story_label]))
                 bug_issues = list(get_issues(repo, [epic, bug_label]))
-                dev_issues = sum([list(get_issues(repo, [epic, dev_ticket_label])) for dev_ticket_label in dev_ticket_labels], [])
+                dev_issues = sum(
+                    [list(get_issues(repo, [epic, dev_ticket_label])) for dev_ticket_label in dev_ticket_labels], [])
                 all_user_stories += user_story_issues
                 all_bugs += bug_issues
                 all_dev_tickets += dev_issues
 
-                for issues, name in zip([user_story_issues, bug_issues, dev_issues], ['user stories', 'bugs', 'dev tickets']):
-                    opened_issues = list(filter(lambda issue: (issue.created_at >= report_start_date) and (issue.created_at < report_end_date), issues))
+                for issues, name in zip([user_story_issues, bug_issues, dev_issues],
+                                        ['user stories', 'bugs', 'dev tickets']):
+                    opened_issues = list(filter(
+                        lambda issue: (issue.created_at >= report_start_date) and (issue.created_at < report_end_date),
+                        issues))
                     num_opened = len(opened_issues)
                     st.subheader(f"{num_opened} opened {name}")
                     for issue in opened_issues:
@@ -457,13 +463,13 @@ def render_report(repo, epic_regex, storypoint_regex):
                     for issue in closed_issues:
                         st.markdown(f" - [#{issue.number}]({issue.html_url}) {issue.title}")
                         devs = devs.union(set(issue.assignees))
-                    story_points_per_dev = {assignee.login: sum(filter(lambda s: s is not None, map(lambda issue: get_story_points(issue, storypoint_regex),
-                                                                    filter(lambda issue: assignee in issue.assignees, closed_issues))))
+                    story_points_per_dev = {assignee.login: sum(
+                        filter(lambda s: s is not None, map(lambda issue: get_story_points(issue, storypoint_regex),
+                                                            filter(lambda issue: assignee in issue.assignees,
+                                                                   closed_issues))))
                                             for assignee in list(devs)}
                     for dev in story_points_per_dev.keys():
                         st.markdown(f" - [x] {dev} closed {story_points_per_dev[dev]} story points of {name}.")
-
-
 
                 ### issues that are newly created and put on the backlog
                 fig, ax = plt.subplots(1, 1, figsize=(8, 8))
@@ -501,7 +507,8 @@ def render_report(repo, epic_regex, storypoint_regex):
                     dates.append(_date)
                     _date += datetime.timedelta(days=1.)
 
-                ax.plot(dates, story_points, c=f"#{color_map[dev_ticket_labels[0]]}", label="Dev ticket curation", lw=2.)
+                ax.plot(dates, story_points, c=f"#{color_map[dev_ticket_labels[0]]}", label="Dev ticket curation",
+                        lw=2.)
 
                 dates = []
                 story_points = []
@@ -524,11 +531,12 @@ def render_report(repo, epic_regex, storypoint_regex):
                 ax.legend()
                 st.write(fig)
 
-
         st.header("Aggregated report")
-        [get_story_points(issue, storypoint_regex,container=user_story_missing_container) for issue in all_user_stories]
-        [get_story_points(issue, storypoint_regex,container=bugs_missing_container) for issue in all_bugs]
-        [get_story_points(issue, storypoint_regex,container=dev_tickets_missing_container) for issue in all_dev_tickets]
+        [get_story_points(issue, storypoint_regex, container=user_story_missing_container) for issue in
+         all_user_stories]
+        [get_story_points(issue, storypoint_regex, container=bugs_missing_container) for issue in all_bugs]
+        [get_story_points(issue, storypoint_regex, container=dev_tickets_missing_container) for issue in
+         all_dev_tickets]
 
         for issues, name in zip([all_user_stories, all_bugs, all_dev_tickets], ['user stories', 'bugs', 'dev tickets']):
 
@@ -546,11 +554,11 @@ def render_report(repo, epic_regex, storypoint_regex):
             story_points_per_dev = {assignee.login: sum(
                 filter(lambda s: s is not None, map(lambda issue: get_story_points(issue, storypoint_regex),
                                                     filter(lambda issue: assignee in issue.assignees, closed_issues))))
-                                    for assignee in list(devs)}
+                for assignee in list(devs)}
             for dev in story_points_per_dev.keys():
                 st.markdown(f" - [x] {dev} closed {story_points_per_dev[dev]} story points of {name}.")
 
-        fig, ax = plt.subplots(1, 1,figsize=(8,8))
+        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
         totals = None
         for tracking_label in tracking_label_names:
             dates = []
@@ -558,15 +566,18 @@ def render_report(repo, epic_regex, storypoint_regex):
             _date = report_start_date
             while _date < report_end_date:
                 filtered_issues = list(filter(
-                    lambda issue: has_label_on_date(issue, tracking_label, _date) and not is_closed_on_date(issue, _date) , all_user_stories))
-                _story_points = sum(filter(lambda x: x is not None, [get_story_points(issue, storypoint_regex) for issue in filtered_issues]))
+                    lambda issue: has_label_on_date(issue, tracking_label, _date) and not is_closed_on_date(issue,
+                                                                                                            _date),
+                    all_user_stories))
+                _story_points = sum(filter(lambda x: x is not None,
+                                           [get_story_points(issue, storypoint_regex) for issue in filtered_issues]))
                 story_points.append(_story_points)
                 dates.append(_date)
                 _date += datetime.timedelta(days=1.)
             if totals is None:
                 totals = story_points
             else:
-                totals = [s + t for s,t in zip(story_points, totals)]
+                totals = [s + t for s, t in zip(story_points, totals)]
             if any([s > 0 for s in story_points]):
                 ax.plot(dates, story_points, c=f"#{color_map[tracking_label]}", label=tracking_label)
 
@@ -595,7 +606,7 @@ def render_report(repo, epic_regex, storypoint_regex):
             if totals is None:
                 totals = story_points
             else:
-                totals = [s + t for s,t in zip(story_points, totals)]
+                totals = [s + t for s, t in zip(story_points, totals)]
             if any([s > 0 for s in story_points]):
                 ax.plot(dates, story_points, c=f"#{color_map[tracking_label]}", label=tracking_label)
         ax.set_title("Bug burn-down")
@@ -651,7 +662,8 @@ def render_report(repo, epic_regex, storypoint_regex):
                 st.markdown(f"{num_closed} closed")
 
                 for issue in closed_issues:
-                    st.markdown(f" - [#{issue.number}]({issue.html_url}) {issue.title} ({get_story_points(issue, storypoint_regex)} SPs)")
+                    st.markdown(
+                        f" - [#{issue.number}]({issue.html_url}) {issue.title} ({get_story_points(issue, storypoint_regex)} SPs)")
 
                 st.subheader("Tickets still open after report period")
                 open_issues = list(filter(lambda issue: issue.state == 'open', user_issues))
@@ -664,7 +676,6 @@ def render_report(repo, epic_regex, storypoint_regex):
                 for issue in open_issues:
                     st.markdown(
                         f" - [#{issue.number}]({issue.html_url}) {issue.title} ({get_story_points(issue, storypoint_regex)} SPs)")
-
 
                 st.subheader("Story board")
                 _story_board_issues = closed_issues + open_issues
@@ -683,7 +694,8 @@ def render_report(repo, epic_regex, storypoint_regex):
                                     current_labels[event.label.name] = event.created_at
                             if event.event == 'unlabeled':
                                 if event.label.name == tracking_label:
-                                    xranges.append((current_labels[event.label.name], event.created_at - current_labels[event.label.name]))
+                                    xranges.append((current_labels[event.label.name],
+                                                    event.created_at - current_labels[event.label.name]))
                                     colors.append(f"#{color_map[tracking_label]}")
                                     del current_labels[event.label.name]
                     for label in current_labels.keys():
@@ -701,12 +713,13 @@ def render_report(repo, epic_regex, storypoint_regex):
                         colors = _colors
                     ax.broken_barh(xranges, yrange, color=colors, edgecolor='black', alpha=1.)
                     if issue.state == 'closed':
-                        ax.scatter(issue.closed_at, bar_idx+0.5, c='black', s=100, marker="o")
+                        ax.scatter(issue.closed_at, bar_idx + 0.5, c='black', s=100, marker="o")
                 ax.legend(loc='lower left')
                 ax.set_xlim(report_start_date, report_end_date)
                 ax.set_yticks(np.arange(len(_story_board_issues)) + 0.5)
                 ax.set_yticklabels(
-                    [f"#{issue.number}-{get_story_points(issue, storypoint_regex)}SPs" for issue in _story_board_issues],
+                    [f"#{issue.number}-{get_story_points(issue, storypoint_regex)}SPs" for issue in
+                     _story_board_issues],
                     rotation=0)
                 plt.setp(ax.get_xticklabels(), Rotation=30, horizontalalignment='right')
                 ax.set_title(
@@ -716,31 +729,35 @@ def render_report(repo, epic_regex, storypoint_regex):
         st.header("Velocity estimation")
         _normal_velocity = dict()
         if len(sum_labels) > 0:
-            for issues, name in zip([all_user_stories, all_bugs, all_dev_tickets], ['user stories', 'bugs', 'dev tickets']):
+            for issues, name in zip([all_user_stories, all_bugs, all_dev_tickets],
+                                    ['user stories', 'bugs', 'dev tickets']):
                 _close_times = []
                 _story_points = []
                 _time_with_label = []
                 for issue in filter(lambda issue: issue.state == 'closed', issues):
-                    _story_point = get_story_points(issue,storypoint_regex)
+                    _story_point = get_story_points(issue, storypoint_regex)
                     if _story_point is None:
                         continue
-                    _time_with_label.append(sum([time_with_label(issue, lab.name).total_seconds()/86400. for lab in sum_labels], 0))
+                    _time_with_label.append(
+                        sum([time_with_label(issue, lab.name).total_seconds() / 86400. for lab in sum_labels], 0))
                     _story_points.append(_story_point)
                     _close_times.append(issue.closed_at)
-                fig, ax = plt.subplots(1,1,figsize=(6,6))
-                y = np.asarray(list(map(lambda x, y: x/y, _time_with_label, _story_points)))
+                fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+                y = np.asarray(list(map(lambda x, y: x / y, _time_with_label, _story_points)))
                 if len(y) == 0:
                     _normal_velocity[name] = 1.
                     continue
                 ax.scatter(_close_times, y)
-                fastest = np.mean(y[y<np.percentile(y, 33)])
-                slowest = np.mean(y[y>np.percentile(y, 66)])
-                normal = np.mean(y[(y>np.percentile(y, 33)) & (y<np.percentile(y, 66))])
+                fastest = np.mean(y[y < np.percentile(y, 33)])
+                slowest = np.mean(y[y > np.percentile(y, 66)])
+                normal = np.mean(y[(y > np.percentile(y, 33)) & (y < np.percentile(y, 66))])
                 _normal_velocity[name] = normal
 
-                ax.axhline(normal, c='black', ls='dashed', label=f'Normal Vel.={round(float(np.median(y)),2)} days/SP')
-                ax.axhline(fastest, c='green', ls='dotted', label=f'Optimistic Vel.={round(float(fastest),2)} days/SP (x {round(float(fastest/normal),2)})')
-                ax.axhline(slowest, c='red', ls='dotted', label=f'Pessimistic Vel.={round(float(slowest),2)} days/SP (x {round(float(slowest/normal),2)})')
+                ax.axhline(normal, c='black', ls='dashed', label=f'Normal Vel.={round(float(np.median(y)), 2)} days/SP')
+                ax.axhline(fastest, c='green', ls='dotted',
+                           label=f'Optimistic Vel.={round(float(fastest), 2)} days/SP (x {round(float(fastest / normal), 2)})')
+                ax.axhline(slowest, c='red', ls='dotted',
+                           label=f'Pessimistic Vel.={round(float(slowest), 2)} days/SP (x {round(float(slowest / normal), 2)})')
                 ax.legend()
                 ax.set_title(f"Velocity chart of {name}")
                 ax.set_ylabel("Velocity [days/story point]")
@@ -751,19 +768,22 @@ def render_report(repo, epic_regex, storypoint_regex):
             with st.beta_expander(f"{epic.name}"):
                 # over all health
                 user_story_issues = list(get_issues(repo, [epic, user_story_label]))
-                open_user_story_issues = list(filter(lambda issue: issue.state=='open', user_story_issues))
+                open_user_story_issues = list(filter(lambda issue: issue.state == 'open', user_story_issues))
                 bug_issues = list(get_issues(repo, [epic, bug_label]))
-                open_bug_issues = list(filter(lambda issue: issue.state=='open', bug_issues))
-                dev_issues = sum([list(get_issues(repo, [epic, dev_ticket_label])) for dev_ticket_label in dev_ticket_labels], [])
-                open_dev_issues = list(filter(lambda issue: issue.state=='open', dev_issues))
+                open_bug_issues = list(filter(lambda issue: issue.state == 'open', bug_issues))
+                dev_issues = sum(
+                    [list(get_issues(repo, [epic, dev_ticket_label])) for dev_ticket_label in dev_ticket_labels], [])
+                open_dev_issues = list(filter(lambda issue: issue.state == 'open', dev_issues))
 
                 for all_issues, issues, open_issues, name in zip([all_user_stories, all_bugs, all_dev_tickets],
-                                        [user_story_issues, bug_issues, dev_issues],
+                                                                 [user_story_issues, bug_issues, dev_issues],
                                                                  [open_user_story_issues, open_bug_issues,
                                                                   open_dev_issues],
-                                        ['user stories', 'bugs', 'dev tickets']):
+                                                                 ['user stories', 'bugs', 'dev tickets']):
                     _story_points = [get_story_points(issue, storypoint_regex) for issue in open_issues]
                     _story_points_remaining = sum(filter(lambda x: x is not None, _story_points), 0.)
-                    _num_missing = len( list(filter(lambda x: x is None, _story_points)))
-                    _story_points_missing = _num_missing * np.mean(list(filter(lambda x: x is not None, [get_story_points(issue, storypoint_regex) for issue in all_issues])))
-                    st.markdown(f"{name} story points remaining: {_story_points_remaining}, missing: {_story_points_missing}, which is about {(_story_points_remaining + _story_points_missing) * _normal_velocity[name]} days (normal).")
+                    _num_missing = len(list(filter(lambda x: x is None, _story_points)))
+                    _story_points_missing = _num_missing * np.mean(list(filter(lambda x: x is not None, [
+                        get_story_points(issue, storypoint_regex) for issue in all_issues])))
+                    st.markdown(
+                        f"{name} story points remaining: {_story_points_remaining}, missing: {_story_points_missing}, which is about {(_story_points_remaining + _story_points_missing) * _normal_velocity[name]} days (normal).")

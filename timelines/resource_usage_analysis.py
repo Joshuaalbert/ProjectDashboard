@@ -3,17 +3,18 @@ import datetime
 import networkx as nx
 import numpy as np
 import pylab as plt
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 import streamlit as st
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from .critical_path import get_critical_path
 from .utils import add_business_days, Cache
 
 # make a color map of fixed colors
-cmap = plt.cm.colors.ListedColormap(['tab:cyan','tab:blue','tab:green','tab:olive','orange','red','pink','lime'])
+cmap = plt.cm.colors.ListedColormap(['tab:cyan', 'tab:blue', 'tab:green', 'tab:olive', 'orange', 'red', 'pink', 'lime'])
 bounds = [0, 2., 4., 6., 8., 10., 15., 20., 100.]
 norm = plt.cm.colors.BoundaryNorm(bounds, cmap.N)
 hours_per_attention = 40.
+
 
 def add_colorbar_to_axes(ax, label):
     """
@@ -29,16 +30,17 @@ def add_colorbar_to_axes(ax, label):
     divider = make_axes_locatable(ax)
     cax = divider.append_axes('right', size='5%', pad=0.05)
     sm = plt.cm.ScalarMappable(norm, cmap=cmap)
-    ax.figure.colorbar(sm,label=label ,cax=cax, orientation='vertical')
+    ax.figure.colorbar(sm, label=label, cax=cax, orientation='vertical')
 
 
-hash_map = {Cache:lambda c: c.cache_hash, np.ndarray: lambda x: np.sum(x)}
+hash_map = {Cache: lambda c: c.cache_hash, np.ndarray: lambda x: np.sum(x)}
+
 
 def hours_distibution(start_date, end_date, es, ls, duration):
     num_days = (end_date - start_date).days
     h = []
     # st.write(es, ls, duration)
-    for start_day in range((ls-es).days+1):
+    for start_day in range((ls - es).days + 1):
         count = 0
         date = es + datetime.timedelta(days=start_day)
         # st.write(start_day, date)
@@ -49,13 +51,14 @@ def hours_distibution(start_date, end_date, es, ls, duration):
             count += 1
 
     if len(h) > 0:
-        weights = np.bincount(np.asarray(h),minlength=num_days)
+        weights = np.bincount(np.asarray(h), minlength=num_days)
         # st.write(h, weights, np.sum(weights), np.min(h), np.max(h))
         weights = weights / np.sum(weights)
     else:
         weights = np.zeros(num_days)
 
     return weights
+
 
 def compute_hours_per_role(G, data, use_weighted_hours):
     # construct per-role requirements over time
@@ -96,6 +99,7 @@ def compute_hours_per_role(G, data, use_weighted_hours):
             reward += density * reward
     return hours, reward
 
+
 @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
 def get_hour_stats(cache: Cache, use_weighted_hours):
     data = cache['data']
@@ -105,12 +109,13 @@ def get_hour_stats(cache: Cache, use_weighted_hours):
     cost_per_resource = compute_cost_per_resource(G, data, hours_per_resource)
     return hours_per_role, hours_per_resource, cost_per_resource, reward
 
+
 # @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def plot_usage_figs(cache:Cache, hours_per_role, hours_per_resource):
+def plot_usage_figs(cache: Cache, hours_per_role, hours_per_resource):
     G = cache['G']
     data = cache['data']
 
-    fig, axs = plt.subplots(2, 1, figsize=(12, 28//2), sharex=True)
+    fig, axs = plt.subplots(2, 1, figsize=(12, 28 // 2), sharex=True)
 
     plot_role_usage(G, data, hours_per_role, axs[0])
 
@@ -126,23 +131,26 @@ def render_resource_usage(data, date_of_change):
     if st.checkbox("Display resource requirements"):
         use_weighted_hours = st.checkbox("Display probability weighted resource usage.", False,
                                          help="Whether to compute the expected resource usage based on probability of being able to perform process.")
-        display_resources = st.multiselect("Display resource usage of only some resources? ", list(data['resources']), [],
-                                       help="Whether to display resource usage of certain resources.")
+        display_resources = st.multiselect("Display resource usage of only some resources? ", list(data['resources']),
+                                           [],
+                                           help="Whether to display resource usage of certain resources.")
 
         G, critical_path = get_critical_path(Cache(data), date_of_change)
 
-        hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache(data=data, G=G), use_weighted_hours)
+        hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache(data=data, G=G),
+                                                                                       use_weighted_hours)
         plot_usage_figs(Cache(data=data, G=G), hours_per_role, hours_per_resource)
 
         if st.checkbox("Display resource costs"):
             plot_costs_per_resource(G, data, cost_per_resource)
+
 
 def compute_cost_per_resource(G, data, hours_per_resource):
     start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.now())
     end_date = max([G.nodes[node]['LF'] for node in G.nodes], default=datetime.datetime.now())
     diff_date = end_date - start_date
     num_days = diff_date.days
-    num_weeks = num_days/7.
+    num_weeks = num_days / 7.
     cost_per_resource = dict()
     for resource in data['resources']:
         if not data['resources'][resource]['cost_per_week']:
@@ -152,7 +160,6 @@ def compute_cost_per_resource(G, data, hours_per_resource):
             _cost = np.ones_like(hours_per_resource[resource]) * total_cost / num_days
         cost_per_resource[resource] = _cost
     return cost_per_resource
-
 
 
 def compute_hours_per_resource(hours_per_role, data):
@@ -170,9 +177,8 @@ def compute_hours_per_resource(hours_per_role, data):
         hours_per_resource[resource] = _bar
     return hours_per_resource
 
+
 def plot_resource_usage(G, data, hours_per_resource, ax):
-
-
     resources = sorted(list(data['resources']))
     # st.write(np.stack([hours_per_resource[res] for res in resources], axis=0), resources)
 
@@ -183,7 +189,8 @@ def plot_resource_usage(G, data, hours_per_resource, ax):
         facecolors = []
         annotations = []
         for _start_range, _end_range in get_breaks(_bar):
-            xranges.append((start_date + datetime.timedelta(days=_start_range), datetime.timedelta(days=_end_range - _start_range)))
+            xranges.append((start_date + datetime.timedelta(days=_start_range),
+                            datetime.timedelta(days=_end_range - _start_range)))
             hour_req = _bar[_start_range]
             if np.isnan(hour_req):
                 hour_req = 0
@@ -205,15 +212,17 @@ def plot_resource_usage(G, data, hours_per_resource, ax):
         #             color='black',
         #             )
     ax.grid()
-    ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
+    ax.axvline(datetime.datetime.now(), c='black', lw=3., alpha=0.75, label='Now')
     ax.legend(loc='lower right')
     ax.set_yticks(np.arange(len(resources)) + 0.5)
     ax.set_yticklabels(resources, rotation=0)
     ax.set_title("Hours per resource")
     plt.tight_layout()
 
+
 def colour_hours(t):
-    return cmap(norm(np.clip(t,0., 100)))
+    return cmap(norm(np.clip(t, 0., 100)))
+
 
 def get_breaks(a):
     changes = np.concatenate([np.asarray([0]), np.diff(a)])
@@ -225,6 +234,7 @@ def get_breaks(a):
         yield (_start_range, i)
         _start_range = i
 
+
 def plot_role_usage(G, data, hours_per_role, ax):
     # construct per-role requirements over time
     roles = data['roles']
@@ -232,14 +242,16 @@ def plot_role_usage(G, data, hours_per_role, ax):
     for resource in data['resources']:
         for role in data['resources'][resource]['roles']:
             num_per_role[role] += 1
-    start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.fromisoformat(data['start_date']))
+    start_date = min([G.nodes[node]['ES'] for node in G.nodes],
+                     default=datetime.datetime.fromisoformat(data['start_date']))
     for bar_idx, role in enumerate(roles):
         xranges = []
         facecolors = []
         annotations = []
         for _start_range, _end_range in get_breaks(hours_per_role[bar_idx, :]):
             xranges.append(
-                (start_date + datetime.timedelta(days=_start_range), datetime.timedelta(days=_end_range - _start_range)))
+                (
+                start_date + datetime.timedelta(days=_start_range), datetime.timedelta(days=_end_range - _start_range)))
             hour_req = hours_per_role[bar_idx, _start_range] / num_per_role[role]
             if np.isnan(hour_req):
                 hour_req = 0.
@@ -260,7 +272,7 @@ def plot_role_usage(G, data, hours_per_role, ax):
         #             color='black',
         #             )
     ax.grid()
-    ax.axvline(datetime.datetime.now(), c='black', lw=3.,alpha=0.75, label='Now')
+    ax.axvline(datetime.datetime.now(), c='black', lw=3., alpha=0.75, label='Now')
     ax.legend(loc='lower right')
     ax.set_yticks(np.arange(len(roles)) + 0.5)
     ax.set_yticklabels(roles, rotation=0)
@@ -269,17 +281,19 @@ def plot_role_usage(G, data, hours_per_role, ax):
 
 
 def plot_costs_per_resource(G, data, cost_per_resource):
-    start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.fromisoformat(data['start_date']))
-    end_date = max([G.nodes[node]['LF'] for node in G.nodes], default=datetime.datetime.fromisoformat(data['start_date']))
+    start_date = min([G.nodes[node]['ES'] for node in G.nodes],
+                     default=datetime.datetime.fromisoformat(data['start_date']))
+    end_date = max([G.nodes[node]['LF'] for node in G.nodes],
+                   default=datetime.datetime.fromisoformat(data['start_date']))
     num_days = (end_date - start_date).days
     time = [start_date + datetime.timedelta(days=i) for i in range(num_days)]
-    fig, ax = plt.subplots(1,1, figsize=(8,6))
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
     total_cost = np.zeros(num_days)
-    cum_cost_per_resource = {resource:np.cumsum(cost_per_resource[resource]) for resource in data['resources']}
+    cum_cost_per_resource = {resource: np.cumsum(cost_per_resource[resource]) for resource in data['resources']}
     vmin = min([cum_cost_per_resource[resource][-1] for resource in data['resources']], default=0)
     vmax = max([cum_cost_per_resource[resource][-1] for resource in data['resources']], default=0)
     for resource in sorted(data['resources'],
-                           key=lambda res:cum_cost_per_resource[res][-1],
+                           key=lambda res: cum_cost_per_resource[res][-1],
                            reverse=True):
         ax.plot(time, cum_cost_per_resource[resource],
                 c=plt.cm.jet(plt.Normalize(vmin, vmax)(cum_cost_per_resource[resource][-1])),

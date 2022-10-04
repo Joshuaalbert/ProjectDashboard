@@ -2,8 +2,9 @@ import datetime
 import json
 
 import numpy as np
-import streamlit as st
+
 hours_per_attention = 40.
+
 
 class Cache(object):
     def __init__(self, data, **kwargs):
@@ -19,7 +20,9 @@ class Cache(object):
     def __getitem__(self, item):
         return self._kwargs[item]
 
-hash_map = {Cache:lambda c: c.cache_hash}
+
+hash_map = {Cache: lambda c: c.cache_hash}
+
 
 def flush_state(save_file, data):
     with open(save_file, 'w') as f:
@@ -46,6 +49,7 @@ def merge_nodes(G, nodes, new_node, attr_dict=None, **attr):
     for n in nodes:  # remove the merged nodes
         G.remove_node(n)
 
+
 def fill_graph(G, data, date):
     G.graph['cache_hash'] = data['cache_hash']
     G.graph['start_date'] = datetime.datetime.fromisoformat(data['start_date'])
@@ -53,7 +57,7 @@ def fill_graph(G, data, date):
     for process in data['processes']:
         # all sorted dates where the process had an update
         dates = sorted(map(lambda date: datetime.datetime.fromisoformat(date), data['processes'][process]['history']))
-        if date < dates[0]:# if date of simulation before oldest date, don't add this process
+        if date < dates[0]:  # if date of simulation before oldest date, don't add this process
             continue
         # we pick the infimum of dates wrt this date, largest lower bounding date.
         key_date = None
@@ -63,13 +67,14 @@ def fill_graph(G, data, date):
             key_date = dates[i]
         process_data = data['processes'][process]['history'][key_date.isoformat()]
 
-        _commitment = {key: com * hours_per_attention * process_data['duration'] / 5. for key, com in process_data['commitment'].items()}
+        _commitment = {key: com * hours_per_attention * process_data['duration'] / 5. for key, com in
+                       process_data['commitment'].items()}
         G.add_node(f"{process}",
                    duration=datetime.timedelta(days=process_data['duration']),
                    pessimistic_duration=datetime.timedelta(days=process_data['pessimistic_duration']),
                    optimistic_duration=datetime.timedelta(days=process_data['optimistic_duration']),
-                   started = process_data['started'],
-                   started_date = next_business_day(datetime.datetime.fromisoformat(process_data['started_date'])),
+                   started=process_data['started'],
+                   started_date=next_business_day(datetime.datetime.fromisoformat(process_data['started_date'])),
                    roles=process_data['roles'],
                    resources=[resource for resource in data['resources'] if any([role in process_data['roles']
                                                                                  for role in process_data['roles']])],
@@ -86,15 +91,18 @@ def fill_graph(G, data, date):
         if G.nodes[node].get('duration', None) is None:
             G.remove_node(node)
 
+
 def prod(x):
     if len(x) == 0:
         return 1.
     return np.prod(x)
 
+
 def symbolify(text):
     nonchars = "!@#$%^&*()_-=+"
     for c in nonchars:
-        text = text.replace(c," ")
+        text = text.replace(c, " ")
+
     def _first_char(t):
         if t.isnumeric():
             return t
@@ -102,6 +110,7 @@ def symbolify(text):
             return t
         else:
             return t.upper()[0]
+
     s = text.split(" ")
     s = [_first_char(t.strip()) for t in s if len(t.strip()) > 0]
     s = "".join(s)
@@ -114,6 +123,7 @@ def next_business_day(date):
         return date
     return date + datetime.timedelta(days=weekday % 4)
 
+
 def prev_business_day(date):
     weekday = date.weekday()
     if weekday < 5:
@@ -121,8 +131,8 @@ def prev_business_day(date):
     return date - datetime.timedelta(days=weekday % 4)
 
 
-def strip_time(date:datetime.datetime):
-    return datetime.datetime(year=date.year,month=date.month, day=date.day)
+def strip_time(date: datetime.datetime):
+    return datetime.datetime(year=date.year, month=date.month, day=date.day)
 
 
 def add_business_days(date: datetime.datetime, days: datetime.timedelta) -> datetime.datetime:
@@ -138,9 +148,9 @@ def add_business_days(date: datetime.datetime, days: datetime.timedelta) -> date
     lim = days
     oneday = datetime.timedelta(days=1)
 
-    #start = friday, saturday
-    #duration = 2 days
-    #end = tuesday, tuesday
+    # start = friday, saturday
+    # duration = 2 days
+    # end = tuesday, tuesday
 
     while count < lim:
         output += oneday
@@ -150,7 +160,7 @@ def add_business_days(date: datetime.datetime, days: datetime.timedelta) -> date
     return output
 
 
-def subtract_business_days(date: datetime.datetime, days:datetime.timedelta)->datetime.datetime:
+def subtract_business_days(date: datetime.datetime, days: datetime.timedelta) -> datetime.datetime:
     """
     Subtracts one business day from the date.
 
@@ -163,9 +173,9 @@ def subtract_business_days(date: datetime.datetime, days:datetime.timedelta)->da
     lim = days
     oneday = datetime.timedelta(days=1)
 
-    #start = friday, saturday
-    #duration = 2 days
-    #end = wednesday, wednesday
+    # start = friday, saturday
+    # duration = 2 days
+    # end = wednesday, wednesday
 
     while count < lim:
         output -= oneday
@@ -173,17 +183,18 @@ def subtract_business_days(date: datetime.datetime, days:datetime.timedelta)->da
             count += oneday
     return output
 
+
 def test_add_subtract_business_days():
-    for h in range(1,8):
-        date = datetime.datetime(year=2021,month=1,day=h)
-        if date.weekday()>=5:
+    for h in range(1, 8):
+        date = datetime.datetime(year=2021, month=1, day=h)
+        if date.weekday() >= 5:
             continue
         for d in range(0, 8):
             delta = datetime.timedelta(days=d)
             assert subtract_business_days(add_business_days(date, delta), delta) == date
 
 
-def count_business_days(start:datetime.datetime, end:datetime.datetime) -> int:
+def count_business_days(start: datetime.datetime, end: datetime.datetime) -> int:
     """
     Count business days (exclusive) of start date.
     That is from the SOB on `start` to SOB on `end`.
@@ -196,7 +207,7 @@ def count_business_days(start:datetime.datetime, end:datetime.datetime) -> int:
     date = start
     count = 0
     while date < end:
-        if date.weekday()<5:
+        if date.weekday() < 5:
             count += 1
         date += datetime.timedelta(days=1)
     return count
