@@ -20,7 +20,7 @@ def display_graph(data, date_of_change):
                 label = "{}\nDur={} days".format(process, G.nodes[process]['duration'].days)
             else:
                 label = "{}\nSlack={} days".format(process, G.nodes[process]['total_float'].days)
-            tooltip = f"{G.nodes[process]['name']}\nES:{G.nodes[process]['ES']}\nLF:{G.nodes[process]['LF']}"
+            tooltip = f"{G.nodes[process]['name']}\nES:{G.nodes[process]['ES'].date()}\nLF:{G.nodes[process]['LF'].date()}"
             H.node(fix_node_name(process), penwidth="3" if process in critical_path else "1",
                    label=label, tooltip=tooltip)
             for dep in G.pred[process]:
