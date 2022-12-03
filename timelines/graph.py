@@ -22,7 +22,7 @@ def display_graph(data, date_of_change):
                 label = "{}\nSlack={} days".format(process, G.nodes[process]['total_float'].days)
             tooltip = f"{G.nodes[process]['name']}"
             H.node(fix_node_name(process), penwidth="3" if process in critical_path else "1",
-                   label=label)
+                   label=label, tooltip=tooltip)
             for dep in G.pred[process]:
                 H.edge(fix_node_name(dep), fix_node_name(process),
                        penwidth="3" if (dep in critical_path) and (process in critical_path) else "1")
