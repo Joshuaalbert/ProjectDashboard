@@ -82,7 +82,8 @@ def fill_graph(G, data, date):
                    attention=process_data['commitment'],
                    earliest_start=next_business_day(datetime.datetime.fromisoformat(process_data['earliest_start'])),
                    start_earliest_start=process_data['start_earliest_start'],
-                   delay_start=datetime.timedelta(days=process_data['delay_start'])
+                   delay_start=datetime.timedelta(days=process_data['delay_start']),
+                   name=process_data['name']
                    )
         for dep in process_data['dependencies']:
             G.add_edge(f"{dep}", f"{process}")
