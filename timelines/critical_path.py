@@ -98,6 +98,8 @@ class CPM(nx.DiGraph):
                 extra_constraints.append(self.nodes[n]['earliest_start'])
             if self.nodes[n]['delay_start'] is not None:
                 extra_constraints.append(add_business_days(es, self.nodes[n]['delay_start']))
+            if self.nodes[n]['started']:
+                extra_constraints.append(self.nodes[n]['started_date'])
             # extend earliest start to the maximum of the constraints
             es = max([es] + extra_constraints)
             ef = add_business_days(es, duration)
