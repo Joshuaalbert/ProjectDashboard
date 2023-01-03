@@ -289,6 +289,11 @@ def render_processes(data, save_file, advanced, date_of_change):
                     datetime.datetime.fromisoformat(data['processes'][process]['history'][last_date]['started_date']),
                     datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
                 _done = datetime.datetime.now() >= _done_date
+            elif data['processes'][process]['history'][last_date]['earliest_start']:
+                _done_date = add_business_days(
+                    G.nodes[process]['ES'],
+                    datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
+                _done = datetime.datetime.now() >= _done_date
             else:
                 _done = False
                 _done_date = None
