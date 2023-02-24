@@ -27,3 +27,13 @@ sudo docker run -dp 8502:8501 project_dashboard
 
 # observe the app running at localhost:8502
 ```
+
+
+## Screenshots
+
+### Easily define complex processes, with advanced dependency options, and isolate critical paths.
+![Screenshot from 2023-02-23 21-17-29](https://user-images.githubusercontent.com/14807032/221076007-1623b01c-dd78-4ace-9503-570c3db178a9.png)
+
+### See at a glance what you should be doing, and how your completion timelines have changed over time
+![Screenshot from 2023-02-23 21-18-42](https://user-images.githubusercontent.com/14807032/221076140-8f99f5c8-9129-4302-9a2c-c04b473bdb1c.png)
+
