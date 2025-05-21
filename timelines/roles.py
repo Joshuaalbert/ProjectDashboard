@@ -22,10 +22,11 @@ def render_roles(data, save_file, advanced):
                         idx = data['resources'][resource]['roles'].index(role)
                         del data['resources'][resource]['roles'][idx]
                 for process in data['processes']:
-                    if role in data['processes'][process]['roles']:
-                        idx = data['processes'][process]['roles'].index(role)
-                        del data['processes'][process]['roles'][idx]
-                        del data['processes'][process]['commitment'][role]
+                    for history_date in data['processes'][process]['history']:
+                        if role in data['processes'][process]['history'][history_date]['roles']:
+                            idx = data['processes'][process]['history'][history_date]['roles'].index(role)
+                            del data['processes'][process]['history'][history_date]['roles'][idx]
+                            del data['processes'][process]['history'][history_date]['commitment'][role]
 
             flush_state(save_file, data)
     with st.expander("Roles"):

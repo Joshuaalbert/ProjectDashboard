@@ -72,9 +72,8 @@ def compute_hours_per_role(G, data, use_weighted_hours):
     start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.now())
     end_date = max([G.nodes[node]['LF'] for node in G.nodes], default=datetime.datetime.now())
     diff_date = end_date - start_date
-    num_days = diff_date.days
+    num_days = max(1, diff_date.days)
     hours = np.zeros((num_roles, num_days))
-    reward = np.zeros(num_days)
     total_commitment = 0.
     order = []
     for bar_idx, process in enumerate(nx.topological_sort(G)):
@@ -86,32 +85,27 @@ def compute_hours_per_role(G, data, use_weighted_hours):
         for role in G.nodes[process]['roles']:
             commitment = G.nodes[process]['commitment'][role]
             total_commitment += commitment
-            reward = G.nodes[process]['reward']
             idx = roles.index(role)
             if use_weighted_hours:
                 hours[idx, :] += G.nodes[process]['start_prob'] * density * commitment
             else:
                 hours[idx, :] += density * commitment
 
-        if use_weighted_hours:
-            reward += G.nodes[process]['success'] * density * reward
-        else:
-            reward += density * reward
-    return hours, reward
+    return hours
 
 
-@st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
+@st.cache_resource(show_spinner=True, ttl=3600., hash_funcs=hash_map)
 def get_hour_stats(cache: Cache, use_weighted_hours):
     data = cache['data']
     G = cache['G']
-    hours_per_role, reward = compute_hours_per_role(G, data, use_weighted_hours)
+    hours_per_role = compute_hours_per_role(G, data, use_weighted_hours)
     hours_per_resource = compute_hours_per_resource(hours_per_role, data)
     cost_per_resource = compute_cost_per_resource(G, data, hours_per_resource)
-    return hours_per_role, hours_per_resource, cost_per_resource, reward
+    return hours_per_role, hours_per_resource, cost_per_resource
 
 
 # @st.cache(show_spinner=True, suppress_st_warning=True, ttl=3600., allow_output_mutation=True, hash_funcs=hash_map)
-def plot_usage_figs(cache: Cache, hours_per_role, hours_per_resource):
+def plot_usage_figs(cache: Cache, hours_per_role, hours_per_resource, display_resources_filter):
     G = cache['G']
     data = cache['data']
 
@@ -119,7 +113,7 @@ def plot_usage_figs(cache: Cache, hours_per_role, hours_per_resource):
 
     plot_role_usage(G, data, hours_per_role, axs[0])
 
-    plot_resource_usage(G, data, hours_per_resource, axs[1])
+    plot_resource_usage(G, data, hours_per_resource, axs[1], display_resources_filter)
 
     add_colorbar_to_axes(axs[0], "hours / b.day / res.")
     add_colorbar_to_axes(axs[1], "hours / b.day")
@@ -129,20 +123,21 @@ def plot_usage_figs(cache: Cache, hours_per_role, hours_per_resource):
 
 def render_resource_usage(data, date_of_change):
     if st.checkbox("Display resource requirements"):
-        use_weighted_hours = st.checkbox("Display probability weighted resource usage.", False,
-                                         help="Whether to compute the expected resource usage based on probability of being able to perform process.")
-        display_resources = st.multiselect("Display resource usage of only some resources? ", list(data['resources']),
-                                           [],
-                                           help="Whether to display resource usage of certain resources.")
+        # use_weighted_hours = st.checkbox("Display probability weighted resource usage.", False,
+        #                                  help="Whether to compute the expected resource usage based on probability of being able to perform process.")
+        display_resources_filter = st.multiselect("Display resource usage of only some resources? ",
+                                                  list(data['resources']),
+                                                  [],
+                                                  help="Whether to display resource usage of certain resources.")
 
         G, critical_path = get_critical_path(Cache(data), date_of_change)
 
-        hours_per_role, hours_per_resource, cost_per_resource, reward = get_hour_stats(Cache(data=data, G=G),
-                                                                                       use_weighted_hours)
-        plot_usage_figs(Cache(data=data, G=G), hours_per_role, hours_per_resource)
+        hours_per_role, hours_per_resource, cost_per_resource = get_hour_stats(Cache(data=data, G=G),
+                                                                               False)
+        plot_usage_figs(Cache(data=data, G=G), hours_per_role, hours_per_resource, display_resources_filter)
 
         if st.checkbox("Display resource costs"):
-            plot_costs_per_resource(G, data, cost_per_resource)
+            plot_costs_per_resource(G, data, cost_per_resource, display_resources_filter)
 
 
 def compute_cost_per_resource(G, data, hours_per_resource):
@@ -178,8 +173,10 @@ def compute_hours_per_resource(hours_per_role, data):
     return hours_per_resource
 
 
-def plot_resource_usage(G, data, hours_per_resource, ax):
+def plot_resource_usage(G, data, hours_per_resource, ax, display_resources_filter):
     resources = sorted(list(data['resources']))
+    if len(display_resources_filter) > 0:
+        resources = [res for res in resources if res in display_resources_filter]
     # st.write(np.stack([hours_per_resource[res] for res in resources], axis=0), resources)
 
     start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.now())
@@ -251,7 +248,8 @@ def plot_role_usage(G, data, hours_per_role, ax):
         for _start_range, _end_range in get_breaks(hours_per_role[bar_idx, :]):
             xranges.append(
                 (
-                start_date + datetime.timedelta(days=_start_range), datetime.timedelta(days=_end_range - _start_range)))
+                    start_date + datetime.timedelta(days=_start_range),
+                    datetime.timedelta(days=_end_range - _start_range)))
             hour_req = hours_per_role[bar_idx, _start_range] / num_per_role[role]
             if np.isnan(hour_req):
                 hour_req = 0.
@@ -280,7 +278,7 @@ def plot_role_usage(G, data, hours_per_role, ax):
     plt.tight_layout()
 
 
-def plot_costs_per_resource(G, data, cost_per_resource):
+def plot_costs_per_resource(G, data, cost_per_resource, display_resources_filter):
     start_date = min([G.nodes[node]['ES'] for node in G.nodes],
                      default=datetime.datetime.fromisoformat(data['start_date']))
     end_date = max([G.nodes[node]['LF'] for node in G.nodes],
@@ -295,6 +293,8 @@ def plot_costs_per_resource(G, data, cost_per_resource):
     for resource in sorted(data['resources'],
                            key=lambda res: cum_cost_per_resource[res][-1],
                            reverse=True):
+        if len(display_resources_filter) > 0 and resource not in display_resources_filter:
+            continue
         ax.plot(time, cum_cost_per_resource[resource],
                 c=plt.cm.jet(plt.Normalize(vmin, vmax)(cum_cost_per_resource[resource][-1])),
                 label=f"{resource}")

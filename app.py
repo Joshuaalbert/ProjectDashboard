@@ -1,6 +1,4 @@
-import streamlit as st
 from timelines.components import render_components
-
 
 
 def main():

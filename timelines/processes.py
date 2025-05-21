@@ -150,11 +150,11 @@ def render_processes(data, save_file, advanced, date_of_change):
                        key='process_dependencies')
 
         if found_process:
-            st.checkbox("Process Started",
+            process_started = st.checkbox("Process Started",
                         value=st.session_state['process_started'],
                         help="Is this process underway?",
                         key='process_started')
-            if st.session_state['process_started']:  # st.session_state['process_started']:
+            if process_started:  # st.session_state['process_started']:
                 def _clean_date():
                     st.session_state['process_date_started'] = next_business_day(
                         strip_time(st.session_state['process_date_started']))
@@ -241,7 +241,7 @@ def render_processes(data, save_file, advanced, date_of_change):
                   help="Delay stary by this many days after all dependencies end.",
                   key='process_delay_start')
 
-        if advanced:
+        if advanced and process in data['processes']:
             # Roles
             process_roles = st.multiselect("Required roles:", data['roles'],
                                            help="Which roles are needed for process success.",
@@ -262,6 +262,7 @@ def render_processes(data, save_file, advanced, date_of_change):
                 else:
                     _commitment = _default_commitment
                 commitment[role] = _commitment
+            st.session_state['process_commitment'] = commitment
         else:
             st.session_state['process_roles'] = []
 
@@ -289,7 +290,7 @@ def render_processes(data, save_file, advanced, date_of_change):
                     datetime.datetime.fromisoformat(data['processes'][process]['history'][last_date]['started_date']),
                     datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
                 _done = datetime.datetime.now() >= _done_date
-            elif data['processes'][process]['history'][last_date]['earliest_start']:
+            elif data['processes'][process]['history'][last_date]['start_earliest_start']:
                 _done_date = add_business_days(
                     G.nodes[process]['ES'],
                     datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
@@ -335,7 +336,7 @@ def set_process(save_file, data):
     process = st.session_state['process']
     process_name = st.session_state['process_name']
     process_dependencies = list(st.session_state['process_dependencies'])
-    process_started = bool(st.session_state['process_started'])
+    process_started = bool(st.session_state.get('process_started', False))
     process_start_date = next_business_day(
         strip_time(st.session_state['process_date_started'])) if 'process_date_started' in st.session_state else today
     process_duration = int(st.session_state['duration'])
@@ -344,10 +345,10 @@ def set_process(save_file, data):
     process_earliest_start = next_business_day(strip_time(st.session_state['process_earliest_start']))
     process_start_earliest_start = st.session_state['process_start_earliest_start']
     process_delay_start = int(st.session_state['process_delay_start'])
-    process_roles = []  # list(st.session_state['process_roles'])
-    process_commitment = dict()  # st.session_state['process_commitment']
-    # for role in process_roles:
-    #     assert role in data['roles']
+    process_roles = list(st.session_state['process_roles'])
+    process_commitment = st.session_state['process_commitment']
+    for role in process_roles:
+        assert role in data['roles']
 
     # Use this to make note of duration, and modifiers
 
