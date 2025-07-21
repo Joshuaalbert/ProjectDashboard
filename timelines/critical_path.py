@@ -163,6 +163,21 @@ class CPM(nx.DiGraph):
             self._backward()
             self._refine_start_dates()
             self._compute_critical_path()
+            # Determine done nodes using:
+            for node in self.nodes:
+                if self.nodes[node]['started']:
+                    done_date = add_business_days(self.nodes[node]['expected_start_date'],
+                                                  self.nodes[node]['_duration'])
+                    done = datetime.datetime.now() >= done_date
+                elif self.nodes[node]['start_earliest_start']:
+                    done_date = add_business_days(self.nodes[node]['ES'], self.nodes[node]['_duration'])
+                    done = datetime.datetime.now() >= done_date
+                else:
+                    done = False
+                    done_date = None
+                self.nodes[node]['expected_done_date'] = done_date
+                self.nodes[node]['expected_done'] = done
+
             self._dirty = False
         elif self._method == 'stochastic':
             stochastic_results = dict()

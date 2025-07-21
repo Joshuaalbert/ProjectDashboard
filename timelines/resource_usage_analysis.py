@@ -69,8 +69,9 @@ def compute_hours_per_role(G, data, use_weighted_hours):
             num_per_role[role] += 1
 
     num_roles = len(roles)
-    start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=datetime.datetime.now())
-    end_date = max([G.nodes[node]['LF'] for node in G.nodes], default=datetime.datetime.now())
+    now = datetime.datetime.now()
+    start_date = min([G.nodes[node]['ES'] for node in G.nodes], default=now)
+    end_date = max([G.nodes[node]['LF'] for node in G.nodes], default=now)
     diff_date = end_date - start_date
     num_days = max(1, diff_date.days)
     hours = np.zeros((num_roles, num_days))
@@ -78,9 +79,14 @@ def compute_hours_per_role(G, data, use_weighted_hours):
     order = []
     for bar_idx, process in enumerate(nx.topological_sort(G)):
         order.append(process)
-
-        density = hours_distibution(start_date, end_date,
-                                    G.nodes[process]['ES'], G.nodes[process]['LS'], G.nodes[process]['duration'])
+        if G.nodes[process]['expected_done']:
+            density = hours_distibution(start_date, end_date,
+                                        G.nodes[process]['expected_start_date'],
+                                        G.nodes[process]['expected_done_date'],
+                                        G.nodes[process]['duration'])
+        else:
+            density = hours_distibution(start_date, end_date,
+                                        max(now, G.nodes[process]['ES']), G.nodes[process]['LS'], G.nodes[process]['duration'])
 
         for role in G.nodes[process]['roles']:
             commitment = G.nodes[process]['commitment'][role]

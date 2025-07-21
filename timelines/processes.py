@@ -58,7 +58,7 @@ def load_from_data(data, process):
         duration=process_data['duration'],
         pessimistic_duration=process_data['pessimistic_duration'],
         optimistic_duration=process_data['optimistic_duration'],
-        process_roles=process_data['roles'],
+        process_roles=sorted(process_data['commitment'].keys()),
         process_commitment=process_data['commitment'],
         process_earliest_start=datetime.datetime.fromisoformat(
             process_data['earliest_start']),
@@ -66,6 +66,7 @@ def load_from_data(data, process):
         process_delay_start=process_data['delay_start'])
     for key in session_state:
         st.session_state[key] = session_state[key]
+
 
 
 def set_default_values(data, weak=False):
@@ -285,28 +286,46 @@ def render_processes(data, save_file, advanced, date_of_change):
             if (process not in display_process) and (len(display_process) > 0):
                 continue
             last_date = data['processes'][process]['last_date']
-            if data['processes'][process]['history'][last_date]['started']:
-                _done_date = add_business_days(
-                    datetime.datetime.fromisoformat(data['processes'][process]['history'][last_date]['started_date']),
-                    datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
-                _done = datetime.datetime.now() >= _done_date
-            elif data['processes'][process]['history'][last_date]['start_earliest_start']:
-                _done_date = add_business_days(
-                    G.nodes[process]['ES'],
-                    datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
-                _done = datetime.datetime.now() >= _done_date
-            else:
-                _done = False
-                _done_date = None
+            # if data['processes'][process]['history'][last_date]['started']:
+            #     _done_date = add_business_days(
+            #         datetime.datetime.fromisoformat(data['processes'][process]['history'][last_date]['started_date']),
+            #         datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
+            #     _done = datetime.datetime.now() >= _done_date
+            # elif data['processes'][process]['history'][last_date]['start_earliest_start']:
+            #     _done_date = add_business_days(
+            #         G.nodes[process]['ES'],
+            #         datetime.timedelta(days=data['processes'][process]['history'][last_date]['duration']))
+            #     _done = datetime.datetime.now() >= _done_date
+            # else:
+            #     _done = False
+            #     _done_date = None
+            _done = G.nodes[process]['expected_done']
+            _done_date = G.nodes[process]['expected_done_date']
+
+            s = []
             if _done:
-                st.markdown(
-                    f" - [x] ({process}) {data['processes'][process]['history'][last_date]['name']} done on {date_label(_done_date)}")
+                s.append(
+                    f" - [x] (**{process}**) {data['processes'][process]['history'][last_date]['name']} done on {date_label(_done_date)}\n")
             else:
-                st.markdown(f" - [ ] ({process}) {data['processes'][process]['history'][last_date]['name']}")
-                st.markdown(f"Earliest Start: {date_label(G.nodes[process]['ES'])}")
-                st.markdown(f"Latest Start: {date_label(G.nodes[process]['LS'])}")
-                st.markdown(f"Earliest Finish: {date_label(G.nodes[process]['EF'])}")
-                st.markdown(f"Latest Finish: {date_label(G.nodes[process]['LF'])}")
+                s.append(f" - [ ] (**{process}**) {data['processes'][process]['history'][last_date]['name']}\n")
+            # Display dependencies
+            if len(data['processes'][process]['history'][last_date]['dependencies']) > 0:
+                s.append("**Dependencies**: " + ", ".join(
+                    [f"**{dep}**" for dep in data['processes'][process]['history'][last_date]['dependencies']]) + "\n")
+            # Display roles and commitment
+            if advanced:
+                # roles = data['processes'][process]['history'][last_date]['roles']
+                commitment = data['processes'][process]['history'][last_date]['commitment']
+                s.append("**Role Commitment**: " + ", ".join([f"{role}: {round(commitment[role],2)} FTE" for role in commitment]))
+
+            if not _done:
+                s.append('```')
+                s.append(f"Earliest Start: {date_label(G.nodes[process]['ES'])}")
+                s.append(f"Latest Start: {date_label(G.nodes[process]['LS'])}")
+                s.append(f"Earliest Finish: {date_label(G.nodes[process]['EF'])}")
+                s.append(f"Latest Finish: {date_label(G.nodes[process]['LF'])}")
+                s.append('```')
+            st.markdown('\n'.join(s))
 
 
 def date_label(date: datetime.datetime):
