@@ -79,15 +79,16 @@ def compute_hours_per_role(G, data, use_weighted_hours):
     order = []
     for bar_idx, process in enumerate(nx.topological_sort(G)):
         order.append(process)
-        if G.nodes[process]['expected_done']:
+        if G.nodes[process]['started']:
+            # If started use expected start and done date
             density = hours_distibution(start_date, end_date,
                                         G.nodes[process]['expected_start_date'],
                                         G.nodes[process]['expected_done_date'],
                                         G.nodes[process]['duration'])
         else:
+            # if the earliest date is max of now and ES
             density = hours_distibution(start_date, end_date,
                                         max(now, G.nodes[process]['ES']), G.nodes[process]['LS'], G.nodes[process]['duration'])
-
         for role in G.nodes[process]['roles']:
             commitment = G.nodes[process]['commitment'][role]
             total_commitment += commitment

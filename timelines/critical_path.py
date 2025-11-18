@@ -112,6 +112,7 @@ class CPM(nx.DiGraph):
         for n in reversed(list(nx.topological_sort(self))):
             lf = min([self.nodes[j]['LS'] for j in self.successors(n)], default=self._critical_path_end)
             ls = subtract_business_days(lf, self.nodes[n]['_duration'])
+
             self.add_node(n,
                           LS=ls,
                           LF=lf,

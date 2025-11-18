@@ -68,7 +68,6 @@ def load_from_data(data, process):
         st.session_state[key] = session_state[key]
 
 
-
 def set_default_values(data, weak=False):
     session_state = dict(
         process="",
@@ -152,9 +151,9 @@ def render_processes(data, save_file, advanced, date_of_change):
 
         if found_process:
             process_started = st.checkbox("Process Started",
-                        value=st.session_state['process_started'],
-                        help="Is this process underway?",
-                        key='process_started')
+                                          value=st.session_state['process_started'],
+                                          help="Is this process underway?",
+                                          key='process_started')
             if process_started:  # st.session_state['process_started']:
                 def _clean_date():
                     st.session_state['process_date_started'] = next_business_day(
@@ -316,9 +315,17 @@ def render_processes(data, save_file, advanced, date_of_change):
             if advanced:
                 # roles = data['processes'][process]['history'][last_date]['roles']
                 commitment = data['processes'][process]['history'][last_date]['commitment']
-                s.append("**Role Commitment**: " + ", ".join([f"{role}: {round(commitment[role],2)} FTE" for role in commitment]))
+                s.append("**Role Commitment**: " + ", ".join(
+                    [f"{role}: {round(commitment[role], 2)} FTE" for role in commitment]))
 
             if not _done:
+                if not G.nodes[process]['started']:
+                    days_until_ls = count_business_days(
+                        datetime.datetime.utcnow(),
+                        G.nodes[process]['LS'])
+                    s.append(f"\n**{days_until_ls} business days until latest start.**\n")
+                else:
+                    s.append(f"\n__Process started on:__ **{date_label(G.nodes[process]['started_date'].date())}**\n")
                 s.append('```')
                 s.append(f"Earliest Start: {date_label(G.nodes[process]['ES'])}")
                 s.append(f"Latest Start: {date_label(G.nodes[process]['LS'])}")
