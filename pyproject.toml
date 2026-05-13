@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "projdash"
+version = "0.1.0"
+description = "Agent-friendly project planning service and dashboard."
+requires-python = ">=3.10"
+dependencies = [
+    "graphviz",
+    "matplotlib",
+    "networkx",
+    "numpy",
+    "pydantic>=2",
+    "real_ladybug",
+    "streamlit",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["old_code"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

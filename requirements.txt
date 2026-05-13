@@ -6,6 +6,9 @@ networkx
 PyGithub
 jax
 jaxlib
-numpy
 pygraphviz
 graphviz
+pydantic>=2
+real_ladybug
+pytest
+ruff
