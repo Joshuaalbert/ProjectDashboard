@@ -71,8 +71,6 @@ def fill_graph(G, data, date):
                        process_data['commitment'].items()}
         G.add_node(f"{process}",
                    duration=datetime.timedelta(days=process_data['duration']),
-                   pessimistic_duration=datetime.timedelta(days=process_data['pessimistic_duration']),
-                   optimistic_duration=datetime.timedelta(days=process_data['optimistic_duration']),
                    started=process_data['started'],
                    started_date=next_business_day(datetime.datetime.fromisoformat(process_data['started_date'])),
                    roles=process_data['roles'],

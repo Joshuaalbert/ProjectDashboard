@@ -86,9 +86,6 @@ class CPM(nx.DiGraph):
             # if ef is specified, then duration
             if self._method == 'single':
                 duration = self.nodes[n]['duration']
-            elif self._method == 'stochastic':
-                duration = datetime.timedelta(days=np.random.uniform(self.nodes[n]['optimistic_duration'].days,
-                                                                     self.nodes[n]['pessimistic_duration'].days))
             else:
                 raise ValueError(f"{self._method} invalid.")
 

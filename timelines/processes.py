@@ -56,8 +56,6 @@ def load_from_data(data, process):
             process_data['started_date']),
         process_started=process_data['started'],
         duration=process_data['duration'],
-        pessimistic_duration=process_data['pessimistic_duration'],
-        optimistic_duration=process_data['optimistic_duration'],
         process_roles=sorted(process_data['commitment'].keys()),
         process_commitment=process_data['commitment'],
         process_earliest_start=datetime.datetime.fromisoformat(
@@ -76,8 +74,6 @@ def set_default_values(data, weak=False):
         process_date_started=strip_time(datetime.datetime.now()),
         process_started=False,
         duration=0,
-        pessimistic_duration=0,
-        optimistic_duration=0,
         process_roles=[],
         process_commitment=dict(),
         process_earliest_start=strip_time(datetime.datetime.fromisoformat(data['start_date'])),
@@ -197,30 +193,6 @@ def render_processes(data, save_file, advanced, date_of_change):
                   help='Conservative estimate days duration total.',
                   key='duration')
 
-        if 'pessimistic_duration' in st.session_state:
-            st.session_state['pessimistic_duration'] = min(max(st.session_state['pessimistic_duration'],
-                                                               st.session_state['duration']),
-                                                           st.session_state['duration'] + 30)
-
-        st.slider("Pessimistic duration (days)",
-                  min_value=st.session_state['duration'],
-                  max_value=st.session_state['duration'] + 30,
-                  value=st.session_state['pessimistic_duration'],
-                  step=1,
-                  help='Pessimisic estimate of days to do.',
-                  key='pessimistic_duration')
-
-        if 'optimistic_duration' in st.session_state:
-            st.session_state['optimistic_duration'] = max(0, min(st.session_state['optimistic_duration'],
-                                                                 st.session_state['duration']))
-
-        st.slider("Optimistic duration (days)",
-                  min_value=0,
-                  max_value=max(st.session_state['duration'], 1),
-                  value=st.session_state['optimistic_duration'],
-                  step=1,
-                  help='Optimistic estimate of days to do.',
-                  key='optimistic_duration')
 
         st.subheader("Starting constraints")
 
@@ -366,8 +338,6 @@ def set_process(save_file, data):
     process_start_date = next_business_day(
         strip_time(st.session_state['process_date_started'])) if 'process_date_started' in st.session_state else today
     process_duration = int(st.session_state['duration'])
-    pessimistic_duration = int(st.session_state['pessimistic_duration'])
-    optimistic_duration = int(st.session_state['optimistic_duration'])
     process_earliest_start = next_business_day(strip_time(st.session_state['process_earliest_start']))
     process_start_earliest_start = st.session_state['process_start_earliest_start']
     process_delay_start = int(st.session_state['process_delay_start'])
@@ -389,8 +359,6 @@ def set_process(save_file, data):
         started=process_started,
         started_date=process_start_date.isoformat(),
         duration=process_duration,
-        pessimistic_duration=pessimistic_duration,
-        optimistic_duration=optimistic_duration,
         earliest_start=process_earliest_start.isoformat(),
         start_earliest_start=process_start_earliest_start,
         delay_start=process_delay_start
