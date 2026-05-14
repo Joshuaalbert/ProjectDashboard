@@ -4,6 +4,7 @@ import matplotlib.dates as mdates
 import pytest
 
 from projdash.ui.adapters import (
+    aggregate_process_properties,
     allowed_dependency_symbols,
     allowed_shared_dependency_symbols,
     allowed_successor_symbols,
@@ -16,7 +17,9 @@ from projdash.ui.adapters import (
     gantt_rows,
     process_symbol_maps,
     process_table_rows,
+    resource_priority_rows,
     resource_utilization_heatmap,
+    role_priority_rows,
     role_utilization_heatmap,
 )
 from projdash.ui.app import (
@@ -74,6 +77,14 @@ def test_guided_form_parsers_accept_compact_rows():
         "A | First child | role_eng:6,role_review:2 | First definition\n"
         "B | Second child | role_eng:4,role_qa:2"
     )
+    patterned_children = parse_subgraph_process_lines(
+        "C | Patterned child | *_lead:8,role_qa:5",
+        ["role_design_lead", "role_qa", "role_writer"],
+    )
+    regex_children = parse_subgraph_process_lines(
+        "D | Regex child | role_[eq][a-z]+:3",
+        ["role_eng", "role_qa", "role_writer"],
+    )
     roots, leaves = infer_subgraph_roots_and_leaves(
         [
             {"process_symbol": "A"},
@@ -104,6 +115,14 @@ def test_guided_form_parsers_accept_compact_rows():
     assert children[1]["role_requirements"] == [
         {"role_id": "role_eng", "effort_hours": 4.0},
         {"role_id": "role_qa", "effort_hours": 2.0},
+    ]
+    assert patterned_children[0]["role_requirements"] == [
+        {"role_id": "role_design_lead", "effort_hours": 8.0},
+        {"role_id": "role_qa", "effort_hours": 5.0},
+    ]
+    assert regex_children[0]["role_requirements"] == [
+        {"role_id": "role_eng", "effort_hours": 3.0},
+        {"role_id": "role_qa", "effort_hours": 3.0},
     ]
     assert roots == ["A", "C"]
     assert leaves == ["B", "C"]
@@ -140,7 +159,7 @@ def test_display_datetime_helpers_use_selected_timezone_and_visible_format():
     rows = [
         {
             "process_symbol": "A",
-            "due_at": value,
+            "started_at": value,
             "resource_start": value,
             "nested": {"finished_at": value},
         }
@@ -158,7 +177,7 @@ def test_display_datetime_helpers_use_selected_timezone_and_visible_format():
     assert format_display_datetimes(rows, "America/New_York") == [
         {
             "process_symbol": "A",
-            "due_at": "Thu, 01 Jan 2026, 13:00",
+            "started_at": "Thu, 01 Jan 2026, 13:00",
             "resource_start": "Thu, 01 Jan 2026, 13:00",
             "nested": {"finished_at": "Thu, 01 Jan 2026, 13:00"},
         }
@@ -369,6 +388,108 @@ def test_process_symbol_helpers_filter_cycle_safe_dependency_choices():
     assert ancestor_scope_symbols(graph, ["C"]) == ["A", "B", "C"]
 
 
+def test_process_aggregation_and_priority_rows_use_schedule_windows():
+    now = dt.datetime(2026, 5, 13, 12, tzinfo=dt.UTC)
+    graph = {
+        "nodes": [
+            {
+                "process_id": "p1",
+                "process_symbol": "A",
+                "name": "Design",
+                "status": "planned",
+                "started_at": None,
+                "finished_at": None,
+                "earliest_start_at": "2026-05-13T09:00:00+00:00",
+                "blocker_summary": {"blocker_ids": ["b1"]},
+                "role_requirements": [
+                    {"role_id": "role_eng", "effort_hours": 2},
+                ],
+                "dependency_only": {
+                    "es_at": "2026-05-13T09:00:00+00:00",
+                    "ef_at": "2026-05-13T11:00:00+00:00",
+                    "ls_at": "2026-05-13T10:00:00+00:00",
+                    "lf_at": "2026-05-13T14:00:00+00:00",
+                },
+                "resource_aware": {
+                    "starts_at": "2026-05-13T09:00:00+00:00",
+                    "ends_at": "2026-05-13T11:00:00+00:00",
+                    "es_at": "2026-05-13T09:00:00+00:00",
+                    "ef_at": "2026-05-13T11:00:00+00:00",
+                    "ls_at": "2026-05-13T13:00:00+00:00",
+                    "lf_at": "2026-05-13T15:00:00+00:00",
+                    "slack_hours": 4,
+                    "criticality_label": "non_critical",
+                },
+            },
+            {
+                "process_id": "p2",
+                "process_symbol": "B",
+                "name": "Build",
+                "status": "planned",
+                "role_requirements": [
+                    {"role_id": "role_eng", "effort_hours": 3},
+                    {"role_id": "role_qa", "effort_hours": 5},
+                ],
+                "dependency_only": {
+                    "es_at": "2026-05-13T13:00:00+00:00",
+                    "ef_at": "2026-05-13T14:00:00+00:00",
+                    "ls_at": "2026-05-13T15:00:00+00:00",
+                    "lf_at": "2026-05-13T17:00:00+00:00",
+                },
+            },
+        ],
+        "edges": [
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "B",
+            }
+        ],
+    }
+    schedule = {
+        "allocation_slices": [
+            {
+                "process_id": "A",
+                "resource_id": "ignored",
+                "role_id": "role_eng",
+                "effort_hours": 10,
+            },
+            {
+                "process_id": "p1",
+                "resource_id": "res_alice",
+                "role_id": "role_eng",
+                "effort_hours": 1.5,
+            }
+        ]
+    }
+
+    aggregate = aggregate_process_properties(graph, ["A", "B"])
+    role_rows = role_priority_rows(graph, now)
+    resource_rows = resource_priority_rows(graph, schedule, now)
+
+    assert aggregate["predecessors"] == []
+    assert aggregate["children"] == []
+    assert aggregate["role_efforts"] == {"role_eng": 5.0, "role_qa": 5.0}
+    assert aggregate["blocker_ids"] == ["b1"]
+    assert role_rows[0]["priority"] == "P2"
+    assert role_rows[0]["process_symbol"] == "A"
+    assert role_rows[-1]["priority"] == "P3"
+    assert resource_rows == [
+        {
+            "priority": "P2",
+            "priority_rank": 2,
+            "process_symbol": "A",
+            "process_name": "Design",
+            "es_at": dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC),
+            "ls_at": dt.datetime(2026, 5, 13, 13, tzinfo=dt.UTC),
+            "lf_at": dt.datetime(2026, 5, 13, 15, tzinfo=dt.UTC),
+            "hours_until_lf": 3.0,
+            "resource_id": "res_alice",
+            "allocated_hours": 1.5,
+            "role_ids": "role_eng",
+        }
+    ]
+
+
 def test_auto_horizon_and_gantt_rows_use_terminal_ancestor_scope():
     as_of = dt.datetime(2026, 5, 13, 10, tzinfo=dt.UTC)
     graph = {
@@ -391,7 +512,6 @@ def test_auto_horizon_and_gantt_rows_use_terminal_ancestor_scope():
                 "process_id": "p2",
                 "process_symbol": "B",
                 "name": "Finish",
-                "due_at": "2026-05-15T17:00:00+00:00",
                 "dependency_only": {
                     "es_at": "2026-05-14T09:00:00+00:00",
                     "ef_at": "2026-05-15T17:00:00+00:00",

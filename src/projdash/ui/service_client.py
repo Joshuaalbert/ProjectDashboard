@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import fnmatch
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -22,11 +23,8 @@ DISPLAY_DATETIME_KEYS = {
     "committed_at",
     "completion_at",
     "created_at",
-    "current_due_at",
     "dep_finish",
     "dep_start",
-    "derived_due_at",
-    "due_at",
     "edit_at",
     "ef_at",
     "ends_at",
@@ -366,7 +364,10 @@ def parse_dependency_lines(value: str) -> list[tuple[str, str]]:
     return dependencies
 
 
-def parse_subgraph_process_lines(value: str) -> list[dict[str, Any]]:
+def parse_subgraph_process_lines(
+    value: str,
+    role_ids: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
     """Parse child rows as `SYMBOL | Name | role_id:hours,... | Description`.
 
     The service still accepts a diagnostic ``duration_hours`` field for
@@ -395,7 +396,7 @@ def parse_subgraph_process_lines(value: str) -> list[dict[str, Any]]:
             "name": name,
             "description": description,
         }
-        role_requirements = _parse_role_effort_tokens(effort_text)
+        role_requirements = _parse_role_effort_tokens(effort_text, role_ids)
         process["role_requirements"] = role_requirements
         process["duration_hours"] = sum(
             requirement["effort_hours"] for requirement in role_requirements
@@ -459,24 +460,55 @@ def infer_subgraph_roots_and_leaves(
     return roots, leaves
 
 
-def _parse_role_effort_tokens(value: str) -> list[dict[str, Any]]:
+def _parse_role_effort_tokens(
+    value: str,
+    role_ids: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
     requirements = []
     seen: set[str] = set()
     for token in split_csv(value):
-        role_id, separator, hours_text = token.partition(":")
-        role_id = role_id.strip()
-        if not separator or not role_id or not hours_text.strip():
+        role_pattern, separator, hours_text = token.partition(":")
+        role_pattern = role_pattern.strip()
+        if not separator or not role_pattern or not hours_text.strip():
             raise ValueError("Role effort tokens must use `role_id:hours`.")
-        if role_id in seen:
-            raise ValueError(f"Duplicate role id in child row: {role_id}")
-        seen.add(role_id)
         effort_hours = float(hours_text)
         if effort_hours <= 0:
             raise ValueError("Role effort hours must be greater than 0.")
-        requirements.append({"role_id": role_id, "effort_hours": effort_hours})
+        matched_role_ids = _match_role_pattern(role_pattern, role_ids)
+        for role_id in matched_role_ids:
+            if role_id in seen:
+                raise ValueError(f"Duplicate role id in child row: {role_id}")
+            seen.add(role_id)
+            requirements.append({"role_id": role_id, "effort_hours": effort_hours})
     if not requirements:
         raise ValueError("At least one role effort token is required.")
     return requirements
+
+
+def _match_role_pattern(
+    role_pattern: str,
+    role_ids: list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    if role_ids is None:
+        return [role_pattern]
+    if role_pattern in role_ids:
+        return [role_pattern]
+    matches = [
+        role_id
+        for role_id in role_ids
+        if fnmatch.fnmatchcase(role_id, role_pattern)
+        or _regex_fullmatch(role_pattern, role_id)
+    ]
+    if not matches:
+        raise ValueError(f"Role pattern matched no defined roles: {role_pattern}")
+    return sorted(matches)
+
+
+def _regex_fullmatch(pattern: str, value: str) -> bool:
+    try:
+        return re.fullmatch(pattern, value) is not None
+    except re.error:
+        return False
 
 
 def command_envelope(command: Any) -> CommandEnvelope:

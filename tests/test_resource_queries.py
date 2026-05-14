@@ -3,6 +3,8 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from projdash.service.commands import CommandEnvelope
 from projdash.service.queries import QueryEnvelope
 from projdash.service.repository import InMemoryProjectRepository
@@ -159,7 +161,6 @@ def _seed_dependency_project(service: ProjectService) -> dict[str, str]:
             "name": "Design API",
             "effective_at": _iso(13, 9, NYC),
             "duration_business_days": 1,
-            "due_at": _iso(15, 17, NYC),
         },
     )["process_id"]
     build_id = _handle(
@@ -172,7 +173,6 @@ def _seed_dependency_project(service: ProjectService) -> dict[str, str]:
             "effective_at": _iso(13, 9, NYC),
             "duration_business_days": 2,
             "dependencies": [design_id],
-            "due_at": _iso(18, 17, NYC),
         },
     )["process_id"]
     _handle(
@@ -537,7 +537,6 @@ def test_process_graph_dependency_only_contract_includes_cpm_status_and_blockers
         "description",
         "duration_hours",
         "earliest_start_at",
-        "due_at",
         "status",
         "started_at",
         "finished_at",
@@ -626,6 +625,10 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
         "ready_at",
         "starts_at",
         "ends_at",
+        "es_at",
+        "ef_at",
+        "ls_at",
+        "lf_at",
         "resource_delay_hours",
         "slack_hours",
         "criticality_label",
@@ -633,6 +636,94 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
     }
     assert build["resource_aware"]["allocation_state"] == "complete"
     assert build["resource_aware"]["ends_at"] < build["dependency_only"]["ef_at"]
+    assert build["resource_aware"]["es_at"] == build["resource_aware"]["starts_at"]
+    assert build["resource_aware"]["ef_at"] == build["resource_aware"]["ends_at"]
+    assert build["resource_aware"]["lf_at"] >= build["resource_aware"]["ef_at"]
+
+
+def test_process_graph_resource_aware_status_uses_role_effort_windows():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _handle(
+        service,
+        {
+            "action": "create_project",
+            "name": "Resource Windows",
+            "start_at": _iso(13, 9),
+        },
+    )["project_id"]
+    role_id = _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role_eng",
+            "name": "Engineer",
+        },
+    )["role_id"]
+    calendar_id = _handle(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-nyc",
+            "name": "NYC Weekdays",
+            "timezone": "America/New_York",
+            "weekly_windows": _weekday_windows(),
+        },
+    )["calendar_id"]
+    _handle(
+        service,
+        {
+            "action": "upsert_resource",
+            "project_id": project_id,
+            "resource_id": "resource-ada",
+            "name": "Ada",
+            "role_ids": [role_id],
+            "calendar_id": calendar_id,
+            "available_from_at": _iso(13, 13),
+            "cost_rate": "0",
+            "cost_unit": "hour",
+        },
+    )
+    process_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-build",
+            "name": "Build",
+            "effective_at": _iso(13, 9),
+            "duration_business_days": 0,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-build-eng",
+                    "role_id": role_id,
+                    "effort_hours": 16,
+                }
+            ],
+        },
+    )["process_id"]
+
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 12),
+            "horizon_starts_at": _iso(13, 13),
+            "horizon_ends_at": _iso(16, 0),
+            "include_resource_fields": True,
+            "planning_granularity": "hour",
+        },
+    )
+    node = next(item for item in graph["nodes"] if item["process_id"] == process_id)
+
+    assert node["dependency_only"]["ls_at"] == _iso(13, 9)
+    assert node["resource_aware"]["ls_at"] == _iso(13, 13)
+    assert node["resource_aware"]["lf_at"] == _iso(14, 21)
+    assert node["computed_status"] == "ready"
+    assert node["late_risk_window"]["active"] is False
 
 
 def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
@@ -682,6 +773,11 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
         "ends_at",
         "dependency_only_starts_at",
         "dependency_only_ends_at",
+        "resource_es_at",
+        "resource_ef_at",
+        "resource_ls_at",
+        "resource_lf_at",
+        "resource_slack_hours",
         "resource_delay_hours",
         "allocation_state",
         "status",
@@ -692,6 +788,9 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
     assert row["allocation_state"] == "complete"
     assert row["description"] == ""
     assert row["finished_at"] is None
+    assert row["resource_es_at"] == row["starts_at"]
+    assert row["resource_ef_at"] == row["ends_at"]
+    assert row["resource_lf_at"] >= row["resource_ef_at"]
 
     capacity = _query(
         service,
@@ -1958,364 +2057,20 @@ def test_project_currency_changes_reprice_resources_to_project_currency():
     }
 
 
-def test_due_date_history_query_shape_for_project_target_and_topology_filters():
+def test_target_history_query_is_removed_from_resource_contract():
     service = ProjectService(InMemoryProjectRepository())
     ids = _seed_dependency_project(service)
-    _handle(
-        service,
-        {
-            "action": "set_project_due_at",
-            "project_id": ids["project_id"],
-            "due_at": _iso(20, 17, NYC),
-            "edit_at": _iso(13, 12, NYC),
-        },
-    )
-    _handle(
-        service,
-        {
-            "action": "set_process_due_at",
-            "project_id": ids["project_id"],
-            "process_id": ids["build_id"],
-            "due_at": _iso(19, 17, NYC),
-            "edit_at": _iso(14, 12, NYC),
-        },
-    )
 
-    project_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": ids["project_id"],
-            "as_of": _iso(15, 12, NYC),
-        },
-    )
-    assert set(project_history) == {
-        "project_id",
-        "as_of",
-        "scope",
-        "target_process_id",
-        "process_events",
-        "project_total_events",
-        "current_due_at",
-        "current_project_due_at",
-        "derived_project_due_at",
-    }
-    assert project_history["current_project_due_at"] == _iso(20, 17, NYC)
-    assert project_history["derived_project_due_at"] == _iso(19, 17, NYC)
-    total_event = project_history["project_total_events"][0]
-    assert set(total_event) == {
-        "event_id",
-        "project_id",
-        "process_id",
-        "process_symbol",
-        "mutation_action",
-        "edit_at",
-        "before_due_at",
-        "after_due_at",
-        "command_id",
-    }
-    assert total_event["process_id"] is None
-    assert total_event["mutation_action"] == "set_project_due_at"
-
-    target_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": ids["project_id"],
-            "as_of": _iso(15, 12, NYC),
-            "target_process_symbol": "process-build",
-            "include_project_total": False,
-        },
-    )
-    assert target_history["scope"] == {
-        "type": "target_process",
-        "process_id": ids["build_id"],
-    }
-    assert target_history["target_process_id"] == ids["build_id"]
-    assert target_history["current_due_at"] == _iso(19, 17, NYC)
-    assert target_history["project_total_events"] == []
-
-    topology_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": ids["project_id"],
-            "as_of": _iso(15, 12, NYC),
-            "scope": {
-                "type": "topo_filter",
-                "root_process_symbols": ["process-design"],
-                "direction": "descendants",
-            },
-        },
-    )
-    assert {
-        event["process_id"] for event in topology_history["process_events"]
-    } <= {ids["design_id"], ids["build_id"]}
-
-
-def test_due_date_history_by_retired_process_id_survives_replace_and_collapse():
-    service = ProjectService(InMemoryProjectRepository())
-    ids = _seed_dependency_project(service)
-    project_id = ids["project_id"]
-    design_id = ids["design_id"]
-    build_id = ids["build_id"]
-    ship_id = _handle(
-        service,
-        {
-            "action": "upsert_process_revision",
-            "project_id": project_id,
-            "process_id": "process-ship",
-            "name": "Ship API",
-            "effective_at": _iso(13, 9, NYC),
-            "duration_business_days": 1,
-            "dependencies": [build_id],
-            "due_at": _iso(22, 17, NYC),
-        },
-    )["process_id"]
-    _handle(
-        service,
-        {
-            "action": "set_process_due_at",
-            "project_id": project_id,
-            "process_id": build_id,
-            "due_at": _iso(25, 17, NYC),
-            "edit_at": _iso(14, 12, NYC),
-        },
-    )
-    replace = _handle(
-        service,
-        {
-            "action": "replace_process_with_subgraph",
-            "project_id": project_id,
-            "process_id": build_id,
-            "edit_at": _iso(15, 9, NYC),
-            "processes": [
-                {"process_symbol": "api", "name": "API", "duration_hours": 4},
-                {"process_symbol": "worker", "name": "Worker", "duration_hours": 4},
-            ],
-            "dependencies": [
-                {"predecessor_symbol": "api", "successor_symbol": "worker"}
-            ],
-            "root_symbols": ["api"],
-            "leaf_symbols": ["worker"],
-            "parent_alias_target_symbol": "api",
-        },
-    )
-    api_id = replace["process_ids"][0]
-    worker_id = replace["process_ids"][1]
-    _handle(
-        service,
-        {
-            "action": "set_process_due_at",
-            "project_id": project_id,
-            "process_id": api_id,
-            "due_at": _iso(20, 17, NYC),
-            "edit_at": _iso(15, 12, NYC),
-        },
-    )
-    _handle(
-        service,
-        {
-            "action": "set_process_due_at",
-            "project_id": project_id,
-            "process_id": worker_id,
-            "due_at": _iso(27, 17, NYC),
-            "edit_at": _iso(16, 7, NYC),
-        },
-    )
-    collapse = _handle(
-        service,
-        {
-            "action": "collapse_subgraph",
-            "project_id": project_id,
-            "edit_at": _iso(16, 9, NYC),
-            "process_symbols": ["api", "worker"],
-            "new_process": {
-                "process_symbol": "implementation",
-                "name": "Implementation",
-            },
-        },
-    )
-    pre_collapse_project_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(16, 8, NYC),
-        },
-    )
-    post_collapse_project_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(16, 12, NYC),
-        },
-    )
-    historical_project_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(15, 8, NYC),
-        },
-    )
-    active_project_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(15, 13, NYC),
-        },
-    )
-    historical_topology_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(15, 8, NYC),
-            "scope": {
-                "type": "topo_filter",
-                "root_process_symbols": ["process-design"],
-                "direction": "descendants",
-            },
-        },
-    )
-    active_topology_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(15, 13, NYC),
-            "scope": {
-                "type": "topo_filter",
-                "root_process_symbols": ["process-design"],
-                "direction": "descendants",
-            },
-        },
-    )
-    pre_collapse_topology_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(16, 8, NYC),
-            "scope": {
-                "type": "topo_filter",
-                "root_process_symbols": ["process-design"],
-                "direction": "descendants",
-            },
-        },
-    )
-    post_collapse_topology_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(16, 12, NYC),
-            "scope": {
-                "type": "topo_filter",
-                "root_process_symbols": ["process-design"],
-                "direction": "descendants",
-            },
-        },
-    )
-
-    replaced_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(16, 12, NYC),
-            "target_process_id": build_id,
-            "include_project_total": False,
-        },
-    )
-    collapsed_history = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(16, 12, NYC),
-            "target_process_id": api_id,
-            "include_project_total": False,
-        },
-    )
-
-    assert {design_id, ship_id}.isdisjoint(collapse["retired_process_ids"])
-    assert build_id in replace["retired_process_ids"]
-    assert api_id in collapse["retired_process_ids"]
-    assert worker_id in collapse["retired_process_ids"]
-    assert replaced_history["scope"] == {
-        "type": "target_process",
-        "process_id": build_id,
-    }
-    assert replaced_history["target_process_id"] == build_id
-    assert replaced_history["current_due_at"] == _iso(25, 17, NYC)
-    assert replaced_history["project_total_events"] == []
-    assert [
-        event["process_id"] for event in replaced_history["process_events"]
-    ] == [build_id]
-    assert historical_project_history["derived_project_due_at"] == _iso(
-        25,
-        17,
-        NYC,
-    )
-    assert active_project_history["derived_project_due_at"] == _iso(22, 17, NYC)
-    assert pre_collapse_project_history["derived_project_due_at"] == _iso(
-        27,
-        17,
-        NYC,
-    )
-    assert post_collapse_project_history["derived_project_due_at"] == _iso(
-        22,
-        17,
-        NYC,
-    )
-    assert historical_topology_history["derived_project_due_at"] == _iso(
-        25,
-        17,
-        NYC,
-    )
-    assert active_topology_history["derived_project_due_at"] == _iso(22, 17, NYC)
-    assert pre_collapse_topology_history["derived_project_due_at"] == _iso(
-        27,
-        17,
-        NYC,
-    )
-    assert post_collapse_topology_history["derived_project_due_at"] == _iso(
-        22,
-        17,
-        NYC,
-    )
-    assert build_id in {
-        event["process_id"] for event in historical_topology_history["process_events"]
-    }
-    assert build_id not in {
-        event["process_id"] for event in active_topology_history["process_events"]
-    }
-    assert worker_id in {
-        event["process_id"] for event in pre_collapse_project_history["process_events"]
-    }
-    assert worker_id not in {
-        event["process_id"] for event in post_collapse_project_history["process_events"]
-    }
-    assert worker_id in {
-        event["process_id"] for event in pre_collapse_topology_history["process_events"]
-    }
-    assert worker_id not in {
-        event["process_id"] for event in post_collapse_topology_history["process_events"]
-    }
-    assert collapsed_history["scope"] == {
-        "type": "target_process",
-        "process_id": api_id,
-    }
-    assert collapsed_history["target_process_id"] == api_id
-    assert collapsed_history["current_due_at"] == _iso(20, 17, NYC)
-    assert collapsed_history["project_total_events"] == []
-    assert [
-        event["process_id"] for event in collapsed_history["process_events"]
-    ] == [api_id]
+    with pytest.raises(ValueError):
+        QueryEnvelope.model_validate(
+            {
+                "query": {
+                    "action": "query_target_history",
+                    "project_id": ids["project_id"],
+                    "as_of": _iso(15, 12, NYC),
+                }
+            }
+        )
 
 
 def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
@@ -2331,7 +2086,18 @@ def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
             "effective_at": _iso(13, 9, NYC),
             "duration_business_days": 1,
             "earliest_start_at": _iso(13, 9, NYC),
-            "due_at": _iso(14, 17, NYC),
+        },
+    )["process_id"]
+    zero_slack_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-critical",
+            "name": "Critical Work",
+            "effective_at": _iso(13, 9, NYC),
+            "duration_business_days": 3,
+            "earliest_start_at": _iso(13, 9, NYC),
         },
     )["process_id"]
 
@@ -2361,8 +2127,8 @@ def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
         {
             "action": "query_process_graph",
             "project_id": project_id,
-            "as_of": _iso(14, 12, NYC),
-            "now": _iso(14, 12, NYC),
+            "as_of": _iso(15, 12, NYC),
+            "now": _iso(15, 12, NYC),
             "include_resource_fields": False,
         },
     )
@@ -2376,19 +2142,6 @@ def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
         "active": True,
     }
 
-    zero_slack_id = _handle(
-        service,
-        {
-            "action": "upsert_process_revision",
-            "project_id": project_id,
-            "process_id": "process-zero-slack",
-            "name": "Zero Slack",
-            "effective_at": _iso(13, 9, NYC),
-            "duration_business_days": 1,
-            "earliest_start_at": _iso(13, 9, NYC),
-            "due_at": _iso(13, 17, NYC),
-        },
-    )["process_id"]
     boundary = _at(13, 9, NYC).isoformat()
     after_boundary = (_at(13, 9, NYC) + dt.timedelta(minutes=1)).isoformat()
 

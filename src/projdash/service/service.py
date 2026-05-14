@@ -24,7 +24,6 @@ from projdash.service.commands import (
     AddRoleRequirementOperation,
     BatchCommandEnvelope,
     BatchUpdateProcessGraph,
-    ClearProjectDueAt,
     CollapseSubgraph,
     CommandEnvelope,
     CommitProjectState,
@@ -40,10 +39,8 @@ from projdash.service.commands import (
     ReplaceProcessWithSubgraph,
     ResolveBlocker,
     SetCalendarActive,
-    SetProcessDueAt,
     SetProcessStatus,
     SetProjectDefaultCurrency,
-    SetProjectDueAt,
     SetResourceActive,
     SetResourceCalendar,
     SetResourceCalendarOperation,
@@ -69,7 +66,6 @@ from projdash.service.queries import (
     QueryBlockers,
     QueryCosts,
     QueryCriticalPath,
-    QueryDueDateHistory,
     QueryEnvelope,
     QueryProcessGraph,
     QueryProjectCatalog,
@@ -249,38 +245,6 @@ class ProjectService:
                 command_id=envelope.command_id,
                 entity_ids={"project_id": command.project_id},
             )
-        if isinstance(command, SetProjectDueAt):
-            event_id = self._repository_call(
-                "set_project_due_at",
-                project_id=command.project_id,
-                due_at=command.due_at,
-                edit_at=command.edit_at,
-                command_id=str(envelope.command_id),
-                mutation_action=command.action,
-            )
-            return CommandResult(
-                command_id=envelope.command_id,
-                entity_ids={
-                    "project_id": command.project_id,
-                    "due_history_event_id": event_id,
-                },
-            )
-        if isinstance(command, ClearProjectDueAt):
-            event_id = self._repository_call(
-                "set_project_due_at",
-                project_id=command.project_id,
-                due_at=None,
-                edit_at=command.edit_at,
-                command_id=str(envelope.command_id),
-                mutation_action=command.action,
-            )
-            return CommandResult(
-                command_id=envelope.command_id,
-                entity_ids={
-                    "project_id": command.project_id,
-                    "due_history_event_id": event_id,
-                },
-            )
         if isinstance(command, CreateRole):
             role_id = self._repository.create_role(
                 project_id=command.project_id,
@@ -314,7 +278,6 @@ class ProjectService:
                 effective_at=command.effective_at,
                 duration_business_days=command.duration_business_days,
                 dependencies=command.dependencies,
-                due_at=command.due_at,
                 earliest_start_at=command.earliest_start_at,
                 start_at_earliest=command.start_at_earliest,
                 delay_after_dependencies_business_days=(
@@ -360,27 +323,6 @@ class ProjectService:
                 entity_ids={
                     "project_id": command.project_id,
                     "schedule_snapshot_id": snapshot.snapshot_id,
-                },
-            )
-        if isinstance(command, SetProcessDueAt):
-            process_id = self._resolve_process_id(
-                project_id=command.project_id,
-                process_id=command.process_id,
-                process_symbol=command.process_symbol,
-            )
-            event_id = self._repository_call(
-                "set_process_due_at",
-                project_id=command.project_id,
-                process_id=process_id,
-                due_at=command.due_at,
-                edit_at=command.edit_at,
-                command_id=str(envelope.command_id),
-            )
-            return CommandResult(
-                command_id=envelope.command_id,
-                entity_ids={
-                    "process_id": process_id,
-                    "due_history_event_id": event_id,
                 },
             )
         if isinstance(command, UpsertResourceCalendar):
@@ -579,17 +521,23 @@ class ProjectService:
                 entity_ids={"role_id": role_id},
             )
         if isinstance(command, ReplaceProcessWithSubgraph):
-            process_id = self._resolve_process_id(
-                project_id=command.project_id,
-                process_id=command.process_id,
-                process_symbol=command.process_symbol,
-            )
+            if command.process_ids is not None:
+                process_ids = list(command.process_ids)
+            else:
+                process_ids = [
+                    self._resolve_process_id(
+                        project_id=command.project_id,
+                        process_id=None,
+                        process_symbol=symbol,
+                    )
+                    for symbol in (command.process_symbols or [])
+                ]
             staged = self._repository.clone()
             ids = self._repository_call_on(
                 staged,
                 "replace_process_with_subgraph",
                 project_id=command.project_id,
-                process_id=process_id,
+                process_ids=process_ids,
                 edit_at=command.edit_at,
                 processes=command.processes,
                 dependencies=command.dependencies,
@@ -781,8 +729,6 @@ class ProjectService:
             }
         elif isinstance(query, QueryBlockers):
             data = self._blocker_data(query)
-        elif isinstance(query, QueryDueDateHistory):
-            data = self._due_date_history_data(query)
         elif isinstance(query, QueryScheduleSnapshots):
             data = self._schedule_snapshot_data(query)
         elif isinstance(query, QueryProcessGraph):
@@ -894,20 +840,6 @@ class ProjectService:
         completion_at = None
         if terminal_rows and len(ends_at_values) == len(terminal_rows):
             completion_at = max(ends_at_values)
-        scoped_ids = None
-        if scope is not None:
-            scoped_ids, _scope_data, _target_id = (
-                self._repository.process_ids_for_scope(
-                    command.project_id,
-                    command.committed_at,
-                    schedule_query.scope,
-                )
-            )
-        derived_due_at = self._repository.derived_project_due_at(
-            command.project_id,
-            command.committed_at,
-            scoped_ids,
-        )
         snapshot = ScheduleSnapshotRecord(
             snapshot_id=self._schedule_snapshot_id(
                 command.project_id,
@@ -919,7 +851,6 @@ class ProjectService:
             terminal_process_symbols=terminal_symbols,
             schedule_basis=ScheduleBasis.RESOURCE_AWARE,
             completion_at=completion_at,
-            derived_due_at=derived_due_at,
             horizon_starts_at=horizon_starts_at,
             horizon_ends_at=horizon_ends_at,
             converged=schedule.get("converged"),
@@ -1055,7 +986,9 @@ class ProjectService:
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
         return f"snapshot-{digest}"
 
-    def _parse_datetime(self, value: Any) -> dt.datetime:
+    def _parse_datetime(self, value: Any) -> dt.datetime | None:
+        if value is None:
+            return None
         if isinstance(value, dt.datetime):
             return value
         return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -1104,15 +1037,57 @@ class ProjectService:
                 row = resource_by_process.get(node["process_id"])
                 node["resource_aware"] = None
                 if row is not None:
-                    resource_ends_at = row["ends_at"]
+                    resource_es_at = self._parse_datetime(
+                        row.get("resource_es_at") or row.get("starts_at")
+                    )
+                    resource_ls_at = self._parse_datetime(row.get("resource_ls_at"))
+                    resource_lf_at = self._parse_datetime(row.get("resource_lf_at"))
+                    allocation_state = str(row["allocation_state"])
+                    node["computed_status"] = self._resource_allocation_status(
+                        explicit_status=str(node["status"]),
+                        allocation_state=allocation_state,
+                        is_blocked=bool(node["blocker_summary"].get("blocking_count")),
+                        fallback_status=str(node["computed_status"]),
+                    )
+                    if resource_es_at is not None and resource_ls_at is not None:
+                        node["computed_status"] = self._resource_graph_computed_status(
+                            explicit_status=str(node["status"]),
+                            allocation_state=allocation_state,
+                            earliest_start_at=resource_es_at,
+                            latest_start_at=resource_ls_at,
+                            now=query.now,
+                            is_blocked=bool(
+                                node["blocker_summary"].get("blocking_count")
+                            ),
+                        )
+                        node["work_now_window"] = {
+                            "starts_at": resource_es_at.isoformat(),
+                            "ends_at": resource_ls_at.isoformat(),
+                            "active": (
+                                node["computed_status"] == "work_now"
+                                and resource_es_at <= query.now < resource_ls_at
+                            ),
+                        }
+                    if resource_ls_at is not None and resource_lf_at is not None:
+                        node["late_risk_window"] = {
+                            "starts_at": resource_ls_at.isoformat(),
+                            "ends_at": resource_lf_at.isoformat(),
+                            "active": (
+                                node["computed_status"] in {"late_risk", "blocked"}
+                                and node["status"] not in {"done", "canceled"}
+                                and query.now >= resource_ls_at
+                            ),
+                        }
                     node["resource_aware"] = {
                         "ready_at": row["ready_at"],
                         "starts_at": row["starts_at"],
-                        "ends_at": resource_ends_at,
+                        "ends_at": row["ends_at"],
+                        "es_at": row.get("resource_es_at"),
+                        "ef_at": row.get("resource_ef_at"),
+                        "ls_at": row.get("resource_ls_at"),
+                        "lf_at": row.get("resource_lf_at"),
                         "resource_delay_hours": row["resource_delay_hours"],
-                        "slack_hours": 0
-                        if node["process_id"] in resource_cp
-                        else None,
+                        "slack_hours": row.get("resource_slack_hours"),
                         "criticality_label": (
                             "critical"
                             if node["process_id"] in resource_cp
@@ -1186,15 +1161,13 @@ class ProjectService:
                 row.explicit_status,
                 row.computed_status.value,
                 row.earliest_start_at,
-                self._display_latest_start(row, duration_hours=(
-                    input_by_id[row.process_id].duration_business_days * 8
-                )),
+                row.latest_start_at,
                 now,
                 bool(blocker_summary.get(row.process_id, {}).get("blocking_count")),
             )
             duration_hours = input_by_id[row.process_id].duration_business_days * 8
-            latest_start_at = self._display_latest_start(row, duration_hours)
-            latest_finish_at = row.due_at if row.due_at is not None else row.latest_finish_at
+            latest_start_at = row.latest_start_at
+            latest_finish_at = row.latest_finish_at
             work_active = (
                 computed_status == "work_now"
                 and row.earliest_start_at <= now < latest_start_at
@@ -1220,7 +1193,6 @@ class ProjectService:
                     if input_by_id[row.process_id].earliest_start_at
                     else None
                 ),
-                "due_at": row.due_at.isoformat() if row.due_at else None,
                 "status": row.explicit_status,
                 "started_at": started_at.isoformat() if started_at else None,
                 "finished_at": finished_at.isoformat() if finished_at else None,
@@ -1311,15 +1283,54 @@ class ProjectService:
             return "late_risk"
         if earliest_start_at <= now < latest_start_at:
             return "work_now"
-        if schedule_status in {"late", "due_elapsed_unverified"}:
+        if schedule_status == "late":
             return "late_risk"
         return "ready"
 
-    def _display_latest_start(self, row, duration_hours: float) -> dt.datetime:
-        if row.due_at is None:
-            return row.latest_start_at
-        due_based_start = row.due_at - dt.timedelta(hours=duration_hours)
-        return max(row.earliest_start_at, due_based_start)
+    def _resource_graph_computed_status(
+        self,
+        explicit_status: str,
+        allocation_state: str,
+        earliest_start_at: dt.datetime,
+        latest_start_at: dt.datetime,
+        now: dt.datetime,
+        is_blocked: bool,
+    ) -> str:
+        if explicit_status == "done":
+            return "complete"
+        if explicit_status == "canceled":
+            return "canceled"
+        if is_blocked:
+            return "blocked"
+        if allocation_state == "blocked_zero_capacity":
+            return "blocked_zero_capacity"
+        if allocation_state == "unallocated":
+            return "unallocated"
+        if allocation_state == "partial":
+            return "partial"
+        if now >= latest_start_at:
+            return "late_risk"
+        if earliest_start_at <= now < latest_start_at:
+            return "work_now"
+        return "ready"
+
+    def _resource_allocation_status(
+        self,
+        *,
+        explicit_status: str,
+        allocation_state: str,
+        is_blocked: bool,
+        fallback_status: str,
+    ) -> str:
+        if explicit_status == "done":
+            return "complete"
+        if explicit_status == "canceled":
+            return "canceled"
+        if is_blocked:
+            return "blocked"
+        if allocation_state in {"partial", "unallocated", "blocked_zero_capacity"}:
+            return allocation_state
+        return fallback_status
 
     def _blocker_summary_by_process(
         self,
@@ -1451,88 +1462,6 @@ class ProjectService:
             "blocked_process_ids": list(dict.fromkeys(blocked_process_ids)),
         }
 
-    def _due_date_history_data(
-        self,
-        query: QueryDueDateHistory,
-    ) -> dict[str, object]:
-        scope = query.scope
-        if query.target_process_id is not None:
-            scope = type(
-                "Scope",
-                (),
-                {
-                    "type": "target_process",
-                    "process_id": query.target_process_id,
-                },
-            )()
-        if query.target_process_symbol is not None:
-            scope = type(
-                "Scope",
-                (),
-                {
-                    "type": "target_process",
-                    "process_id": None,
-                    "process_symbol": query.target_process_symbol,
-                },
-            )()
-        process_ids_for_scope = self._repository.process_ids_for_scope
-        scoped_ids, scope_data, target_process_id = process_ids_for_scope(
-            query.project_id,
-            query.as_of,
-            scope,
-        )
-        history = self._repository.due_history_as_of(
-            query.project_id,
-            query.as_of,
-        )
-        processes = getattr(self._repository, "processes", {})
-        process_events = [
-            self._due_event_json(event, processes)
-            for event in history
-            if event["process_id"] in scoped_ids
-            and (
-                target_process_id is None
-                or event["mutation_action"] != "upsert_process_revision"
-            )
-        ]
-        project_total_events = []
-        if query.include_project_total:
-            project_total_events = [
-                self._due_event_json(event, processes)
-                for event in history
-                if event["process_id"] is None
-            ]
-        current_due_at = None
-        if target_process_id is not None:
-            current_due_at = self._repository.current_process_due_at(
-                target_process_id,
-                query.as_of,
-            )
-        current_project_due_at = self._repository.current_project_due_at(
-            query.project_id,
-            query.as_of,
-        )
-        derived_project_due_at = self._repository.derived_project_due_at(
-            query.project_id,
-            query.as_of,
-            scoped_ids,
-        )
-        return {
-            "project_id": query.project_id,
-            "as_of": query.as_of.isoformat(),
-            "scope": scope_data,
-            "target_process_id": target_process_id,
-            "process_events": process_events,
-            "project_total_events": project_total_events,
-            "current_due_at": current_due_at.isoformat() if current_due_at else None,
-            "current_project_due_at": (
-                current_project_due_at.isoformat() if current_project_due_at else None
-            ),
-            "derived_project_due_at": (
-                derived_project_due_at.isoformat() if derived_project_due_at else None
-            ),
-        }
-
     def _schedule_snapshot_data(
         self,
         query: QueryScheduleSnapshots,
@@ -1550,32 +1479,6 @@ class ProjectService:
                 snapshot.model_dump(mode="json")
                 for snapshot in snapshots
             ],
-        }
-
-    def _due_event_json(
-        self,
-        event: dict[str, Any],
-        processes: dict[str, Any],
-    ) -> dict[str, object]:
-        process = processes.get(event["process_id"])
-        return {
-            "event_id": event["event_id"],
-            "project_id": event["project_id"],
-            "process_id": event["process_id"],
-            "process_symbol": getattr(process, "symbol", None),
-            "mutation_action": event["mutation_action"],
-            "edit_at": event["edit_at"].isoformat(),
-            "before_due_at": (
-                event["before_due_at"].isoformat()
-                if event["before_due_at"] is not None
-                else None
-            ),
-            "after_due_at": (
-                event["after_due_at"].isoformat()
-                if event["after_due_at"] is not None
-                else None
-            ),
-            "command_id": event["command_id"],
         }
 
     def _capacity_data(self, query: QueryResourceCapacity) -> dict[str, object]:
@@ -1694,7 +1597,6 @@ class ProjectService:
                         if process is not None
                         else None
                     ),
-                    "due_at": revision.due_at,
                     "earliest_start_at": revision.earliest_start_at,
                     "start_at_earliest": revision.start_at_earliest,
                     "delay_after_dependencies_business_days": (

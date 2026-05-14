@@ -80,7 +80,8 @@ sudo apt-get install -y graphviz libgraphviz-dev pkg-config
 - Raise specific exceptions with useful context; do not use bare `except`.
 - All API and persistence timestamps must be timezone-aware `datetime` values,
   not bare dates or naive datetimes. Use `*_at` names for moments such as
-  `start_at`, `effective_at`, `due_at`, `as_of`, and `now`.
+  `start_at`, `effective_at`, `as_of`, `now`, lifecycle anchors, calendar
+  exceptions, holidays, allocation slices, and schedule snapshots.
 - Keep scheduling/resource analysis pure and deterministic; pass `now`/`as_of`
   explicitly in tests instead of relying on wall-clock time.
 

@@ -76,7 +76,6 @@ def test_schema_statements_include_resource_graph_and_replay_contracts():
         "calendarexception",
         "rolerequirement",
         "processalias",
-        "duedatehistoryevent",
         "schedulesnapshot",
         "commandreplay",
         "has_role",
@@ -91,7 +90,6 @@ def test_schema_statements_include_resource_graph_and_replay_contracts():
         "requirement_role",
         "has_alias",
         "has_blocker",
-        "has_due_date_event",
     ]:
         assert expected in sql
 
@@ -108,9 +106,6 @@ def test_schema_statements_include_resource_graph_and_replay_contracts():
         "summary",
         "severity",
         "created_at",
-        "edit_at",
-        "before_due_at",
-        "after_due_at",
         "is_active",
         "started_at",
         "retired_at",
@@ -153,7 +148,6 @@ def test_bootstrap_creates_reopenable_schema_metadata(tmp_path: Path):
         "RoleRequirement",
         "ProcessAlias",
         "Blocker",
-        "DueDateHistoryEvent",
         "ScheduleSnapshot",
         "CommandReplay",
     }
@@ -174,7 +168,6 @@ def test_bootstrap_creates_reopenable_schema_metadata(tmp_path: Path):
         "REQUIREMENT_ROLE",
         "HAS_ALIAS",
         "HAS_BLOCKER",
-        "HAS_DUE_DATE_EVENT",
     }
     assert expected_tables <= _table_names(repository._conn)
     assert expected_relationship_tables <= _table_names(repository._conn)
@@ -239,7 +232,6 @@ def test_timezone_offsets_and_cost_fields_round_trip(tmp_path: Path):
 
     project_start = _aware_iso(13, 9, UTC_MINUS_FOUR)
     resource_start = _aware_iso(13, 9, UTC_PLUS_TWO)
-    due_before = _aware_iso(20, 17, UTC_MINUS_FOUR)
     due_after = _aware_iso(21, 17, UTC_MINUS_FOUR)
     retired_at = _aware_iso(14, 12, UTC_MINUS_FOUR)
     conn.execute(
@@ -278,14 +270,13 @@ def test_timezone_offsets_and_cost_fields_round_trip(tmp_path: Path):
             name: 'Build',
             description: 'Build the first release',
             duration_business_days: 1,
-            due_at: $due_before,
             earliest_start_at: NULL,
             start_at_earliest: false,
             delay_after_dependencies_business_days: 0,
             assumption_note: NULL
         })
         """,
-        {"project_start": project_start, "due_before": due_before},
+        {"project_start": project_start},
     )
     conn.execute(
         """
@@ -371,25 +362,6 @@ def test_timezone_offsets_and_cost_fields_round_trip(tmp_path: Path):
     )
     conn.execute(
         """
-        CREATE (:DueDateHistoryEvent {
-            event_id: 'due-event-build',
-            project_id: 'project-alpha',
-            process_id: 'process-build',
-            mutation_action: 'set_process_due_at',
-            edit_at: $retired_at,
-            before_due_at: $due_before,
-            after_due_at: $due_after,
-            command_id: '00000000-0000-4000-8000-000000000501'
-        })
-        """,
-        {
-            "retired_at": retired_at,
-            "due_before": due_before,
-            "due_after": due_after,
-        },
-    )
-    conn.execute(
-        """
         CREATE (:ProcessRetirementEvent {
             retirement_event_id: 'retire-build',
             project_id: 'project-alpha',
@@ -458,14 +430,6 @@ def test_timezone_offsets_and_cost_fields_round_trip(tmp_path: Path):
         RETURN blocker.created_at, blocker.resolved_at, blocker.severity
         """,
     ) == [project_start, due_after, "blocking"]
-    assert _one_row(
-        conn,
-        """
-        MATCH (event:DueDateHistoryEvent)
-        WHERE event.event_id = 'due-event-build'
-        RETURN event.edit_at, event.before_due_at, event.after_due_at
-        """,
-    ) == [retired_at, due_before, due_after]
     assert _one_row(
         conn,
         """
@@ -554,7 +518,6 @@ def test_role_requirements_belong_to_revisions_not_processes(tmp_path: Path):
                 name: 'Build',
                 description: 'Build implementation work',
                 duration_business_days: 1,
-                due_at: NULL,
                 earliest_start_at: NULL,
                 start_at_earliest: false,
                 delay_after_dependencies_business_days: 0,
@@ -874,8 +837,6 @@ def test_ladybug_service_projection_reopens_persisted_project_graph(
     repository = LadybugProjectRepository(db_path)
     service = ProjectService(repository)
     start_at = _aware_iso(13, 9, UTC_MINUS_FOUR)
-    due_at = _aware_iso(20, 17, UTC_MINUS_FOUR)
-    moved_due_at = _aware_iso(21, 17, UTC_MINUS_FOUR)
     holiday_start = _aware_iso(15, 9, UTC_MINUS_FOUR)
     holiday_end = _aware_iso(15, 17, UTC_MINUS_FOUR)
 
@@ -960,7 +921,6 @@ def test_ladybug_service_projection_reopens_persisted_project_graph(
             "name": "Build",
             "effective_at": start_at,
             "duration_business_days": 1,
-            "due_at": due_at,
             "role_requirements": [
                 {
                     "requirement_id": "req-build-engineer",
@@ -981,25 +941,6 @@ def test_ladybug_service_projection_reopens_persisted_project_graph(
             "details": "External review pending",
             "severity": "blocking",
             "created_at": start_at,
-        },
-    )
-    _handle_ok(
-        service,
-        {
-            "action": "set_process_due_at",
-            "project_id": project_id,
-            "process_id": process_id,
-            "due_at": moved_due_at,
-            "edit_at": _aware_iso(14, 12, UTC_MINUS_FOUR),
-        },
-    )
-    _handle_ok(
-        service,
-        {
-            "action": "set_project_due_at",
-            "project_id": project_id,
-            "due_at": moved_due_at,
-            "edit_at": _aware_iso(14, 13, UTC_MINUS_FOUR),
         },
     )
     _close(repository)
@@ -1023,18 +964,6 @@ def test_ladybug_service_projection_reopens_persisted_project_graph(
             },
         ),
     )
-    due_result = reopened_service.handle_query(
-        QueryEnvelope.model_validate(
-            {
-                "query": {
-                    "action": "query_due_date_history",
-                    "project_id": project_id,
-                    "as_of": _aware_iso(22, 12, UTC_MINUS_FOUR),
-                }
-            },
-        ),
-    )
-
     assert project_result.ok is True
     assert project_result.data["project"]["default_currency"] == "USD"
     assert reopened.processes[process_id].symbol == "process-build"
@@ -1054,12 +983,6 @@ def test_ladybug_service_projection_reopens_persisted_project_graph(
     ).get_all() == [[1]]
     assert blocker_result.ok is True
     assert blocker_result.data["blockers"][0]["blocker_id"] == "blocker-security"
-    assert due_result.ok is True
-    assert [
-        event["mutation_action"]
-        for event in due_result.data["process_events"]
-    ] == ["upsert_process_revision", "set_process_due_at"]
-    assert due_result.data["current_project_due_at"] == moved_due_at
     _close(reopened)
 
 

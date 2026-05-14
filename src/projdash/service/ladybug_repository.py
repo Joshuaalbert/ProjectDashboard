@@ -66,7 +66,6 @@ SCHEMA_STATEMENTS = (
         description STRING,
         duration_business_days INT64,
         required_roles_json STRING,
-        due_at STRING,
         earliest_start_at STRING,
         start_at_earliest BOOL,
         delay_after_dependencies_business_days INT64,
@@ -191,18 +190,6 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
-    CREATE NODE TABLE IF NOT EXISTS DueDateHistoryEvent(
-        event_id STRING PRIMARY KEY,
-        project_id STRING,
-        process_id STRING,
-        mutation_action STRING,
-        edit_at STRING,
-        before_due_at STRING,
-        after_due_at STRING,
-        command_id STRING
-    )
-    """,
-    """
     CREATE NODE TABLE IF NOT EXISTS ScheduleSnapshot(
         snapshot_id STRING PRIMARY KEY,
         project_id STRING,
@@ -210,7 +197,6 @@ SCHEMA_STATEMENTS = (
         terminal_process_symbols STRING[],
         schedule_basis STRING,
         completion_at STRING,
-        derived_due_at STRING,
         horizon_starts_at STRING,
         horizon_ends_at STRING,
         converged BOOL,
@@ -289,16 +275,10 @@ SCHEMA_STATEMENTS = (
     """
     CREATE REL TABLE IF NOT EXISTS HAS_BLOCKER(FROM Process TO Blocker)
     """,
-    """
-    CREATE REL TABLE IF NOT EXISTS HAS_DUE_DATE_EVENT(
-        FROM Process TO DueDateHistoryEvent
-    )
-    """,
 )
 
 SNAPSHOT_NODE_TABLES = (
     "ScheduleSnapshot",
-    "DueDateHistoryEvent",
     "Blocker",
     "ProcessAlias",
     "RoleRequirement",
@@ -331,7 +311,6 @@ SNAPSHOT_REL_TABLES = (
     "REQUIREMENT_ROLE",
     "HAS_ALIAS",
     "HAS_BLOCKER",
-    "HAS_DUE_DATE_EVENT",
 )
 
 MISSING_REQUIREMENT_ID_PREFIX = "__projdash_missing_requirement_id__"
@@ -993,8 +972,8 @@ class LadybugProjectRepository:
             RETURN revision.revision_id, revision.process_id, revision.project_id,
                    revision.effective_at, revision.name,
                    revision.description,
-                   revision.duration_business_days, revision.due_at,
-                   revision.earliest_start_at, revision.start_at_earliest,
+                   revision.duration_business_days, revision.earliest_start_at,
+                   revision.start_at_earliest,
                    revision.delay_after_dependencies_business_days,
                    revision.assumption_note
             ORDER BY revision.process_id, revision.effective_at, revision.revision_id
@@ -1012,13 +991,12 @@ class LadybugProjectRepository:
                 description=row[5] or "",
                 duration_business_days=row[6],
                 dependencies=list(dict.fromkeys(dependencies)),
-                due_at=_datetime_or_none(row[7]),
-                earliest_start_at=_datetime_or_none(row[8]),
-                start_at_earliest=bool(row[9]),
-                delay_after_dependencies_business_days=row[10] or 0,
+                earliest_start_at=_datetime_or_none(row[7]),
+                start_at_earliest=bool(row[8]),
+                delay_after_dependencies_business_days=row[9] or 0,
                 required_roles=self._load_required_roles(row[0]),
                 role_requirements=requirements_by_revision.get(row[0], []),
-                assumption_note=row[11],
+                assumption_note=row[10],
             )
             projection.revisions_by_process[revision.process_id].append(revision)
 
@@ -1026,7 +1004,6 @@ class LadybugProjectRepository:
         self._load_calendars(projection)
         self._load_resources(projection)
         self._load_blockers(projection)
-        self._load_due_history(projection)
         self._load_schedule_snapshots(projection)
         self._load_aliases(projection)
         self._load_retirements(projection)
@@ -1129,7 +1106,6 @@ class LadybugProjectRepository:
         self._persist_resources(repository)
         self._persist_aliases(repository)
         self._persist_blockers(repository)
-        self._persist_due_history(repository)
         self._persist_schedule_snapshots(repository)
 
     def _validate_snapshot_storage_keys(
@@ -1166,9 +1142,6 @@ class LadybugProjectRepository:
                 _stored_scoped_child_id(resource["resource_id"], holiday["holiday_id"])
                 for resource in repository.resources.values()
                 for holiday in resource.get("holidays", [])
-            ],
-            "DueDateHistoryEvent.event_id": [
-                event["event_id"] for event in repository.due_history_events
             ],
             "ScheduleSnapshot.snapshot_id": [
                 snapshot.snapshot_id for snapshot in repository.schedule_snapshots
@@ -1223,7 +1196,6 @@ class LadybugProjectRepository:
             "name": revision.name,
             "description": revision.description,
             "duration_business_days": revision.duration_business_days,
-            "due_at": _isoformat_or_none(revision.due_at),
             "earliest_start_at": _isoformat_or_none(revision.earliest_start_at),
             "start_at_earliest": revision.start_at_earliest,
             "delay_after_dependencies_business_days": (
@@ -1511,32 +1483,6 @@ class LadybugProjectRepository:
                 blocker.process_id,
             )
 
-    def _persist_due_history(self, repository: InMemoryProjectRepository) -> None:
-        for event in repository.due_history_events:
-            self._create_node(
-                "DueDateHistoryEvent",
-                {
-                    "event_id": event["event_id"],
-                    "project_id": event["project_id"],
-                    "process_id": event["process_id"],
-                    "mutation_action": event["mutation_action"],
-                    "edit_at": _isoformat_or_string(event["edit_at"]),
-                    "before_due_at": _isoformat_or_none(event["before_due_at"]),
-                    "after_due_at": _isoformat_or_none(event["after_due_at"]),
-                    "command_id": event["command_id"],
-                },
-            )
-            if event["process_id"] is not None:
-                self._create_relationship(
-                    "Process",
-                    "process_id",
-                    event["process_id"],
-                    "HAS_DUE_DATE_EVENT",
-                    "DueDateHistoryEvent",
-                    "event_id",
-                    event["event_id"],
-                )
-
     def _persist_schedule_snapshots(
         self,
         repository: InMemoryProjectRepository,
@@ -1551,7 +1497,6 @@ class LadybugProjectRepository:
                     "terminal_process_symbols": snapshot.terminal_process_symbols,
                     "schedule_basis": _value_or_enum_value(snapshot.schedule_basis),
                     "completion_at": _isoformat_or_none(snapshot.completion_at),
-                    "derived_due_at": _isoformat_or_none(snapshot.derived_due_at),
                     "horizon_starts_at": _isoformat_or_string(
                         snapshot.horizon_starts_at,
                     ),
@@ -1842,34 +1787,6 @@ class LadybugProjectRepository:
                 blocker.blocker_id,
             )
 
-    def _load_due_history(self, projection: InMemoryProjectRepository) -> None:
-        for row in self._rows(
-            """
-            MATCH (event:DueDateHistoryEvent)
-            RETURN event.event_id, event.project_id, event.process_id,
-                   event.mutation_action, event.edit_at, event.before_due_at,
-                   event.after_due_at, event.command_id
-            ORDER BY event.edit_at, event.event_id
-            """
-        ):
-            event = {
-                "event_id": row[0],
-                "project_id": row[1],
-                "process_id": row[2],
-                "mutation_action": row[3],
-                "edit_at": _datetime_from_storage(row[4]),
-                "before_due_at": _datetime_or_none(row[5]),
-                "after_due_at": _datetime_or_none(row[6]),
-                "command_id": row[7],
-            }
-            projection.due_history_events.append(event)
-            if (
-                event["process_id"] is None
-                and event["mutation_action"]
-                in {"set_project_due_at", "clear_project_due_at"}
-            ):
-                projection.project_due_at[event["project_id"]] = event["after_due_at"]
-
     def _load_schedule_snapshots(self, projection: InMemoryProjectRepository) -> None:
         if "ScheduleSnapshot" not in self.table_names():
             return
@@ -1878,8 +1795,8 @@ class LadybugProjectRepository:
             MATCH (snapshot:ScheduleSnapshot)
             RETURN snapshot.snapshot_id, snapshot.project_id, snapshot.committed_at,
                    snapshot.terminal_process_symbols, snapshot.schedule_basis,
-                   snapshot.completion_at, snapshot.derived_due_at,
-                   snapshot.horizon_starts_at, snapshot.horizon_ends_at,
+                   snapshot.completion_at, snapshot.horizon_starts_at,
+                   snapshot.horizon_ends_at,
                    snapshot.converged, snapshot.unallocated_count, snapshot.note
             ORDER BY snapshot.project_id, snapshot.committed_at, snapshot.snapshot_id
             """
@@ -1892,12 +1809,11 @@ class LadybugProjectRepository:
                     terminal_process_symbols=list(row[3] or []),
                     schedule_basis=row[4] or "resource_aware",
                     completion_at=_datetime_or_none(row[5]),
-                    derived_due_at=_datetime_or_none(row[6]),
-                    horizon_starts_at=_datetime_from_storage(row[7]),
-                    horizon_ends_at=_datetime_from_storage(row[8]),
-                    converged=row[9],
-                    unallocated_count=row[10] or 0,
-                    note=row[11],
+                    horizon_starts_at=_datetime_from_storage(row[6]),
+                    horizon_ends_at=_datetime_from_storage(row[7]),
+                    converged=row[8],
+                    unallocated_count=row[9] or 0,
+                    note=row[10],
                 )
             )
 

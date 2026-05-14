@@ -44,8 +44,8 @@ processes.
 - Non-empty terminal symbols use the induced ancestor subgraph, matching the UI's
   completion-target behavior.
 - Each snapshot stores `committed_at`, terminal symbols, schedule basis,
-  completion datetime, derived due datetime, convergence state, and the query
-  horizon used to compute resource-aware completion.
+  completion datetime, convergence state, and the query horizon used to compute
+  resource-aware completion.
 - Repeating a commit for the same project, `committed_at`, and terminal symbol set
   is idempotent and returns the original snapshot id.
 

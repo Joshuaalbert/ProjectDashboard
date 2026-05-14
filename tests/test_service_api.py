@@ -129,7 +129,6 @@ def test_service_creates_project_and_process_revision():
                 name="Define service API",
                 effective_at=_at(13),
                 duration_business_days=3,
-                due_at=_at(20, 17),
             )
         )
     )
@@ -1452,39 +1451,6 @@ def test_error_result_wrappers_use_single_structured_error():
             ),
         ),
         ApiCase(
-            "set_project_due_at",
-            _command_payload(
-                {
-                    "action": "set_project_due_at",
-                    "project_id": "project-alpha",
-                    "due_at": _at(30, 17).isoformat(),
-                    "edit_at": _at(13).isoformat(),
-                }
-            ),
-        ),
-        ApiCase(
-            "clear_project_due_at",
-            _command_payload(
-                {
-                    "action": "clear_project_due_at",
-                    "project_id": "project-alpha",
-                    "edit_at": _at(14).isoformat(),
-                }
-            ),
-        ),
-        ApiCase(
-            "set_process_due_at_clear",
-            _command_payload(
-                {
-                    "action": "set_process_due_at",
-                    "project_id": "project-alpha",
-                    "process_symbol": "build-api",
-                    "due_at": None,
-                    "edit_at": _at(14).isoformat(),
-                }
-            ),
-        ),
-        ApiCase(
             "add_blocker",
             _command_payload(
                 {
@@ -1588,58 +1554,14 @@ def test_lifecycle_due_blocker_and_alias_command_payloads_round_trip(case):
             ),
         ),
         ApiCase(
-            "set_project_due_at_naive_due_at",
+            "removed_target_action",
             _command_payload(
                 {
-                    "action": "set_project_due_at",
-                    "project_id": "project-alpha",
-                    "due_at": "2026-05-30T17:00:00",
-                    "edit_at": _at(13).isoformat(),
-                }
-            ),
-        ),
-        ApiCase(
-            "set_project_due_at_naive_edit_at",
-            _command_payload(
-                {
-                    "action": "set_project_due_at",
-                    "project_id": "project-alpha",
-                    "due_at": _at(30, 17).isoformat(),
-                    "edit_at": "2026-05-13T09:00:00",
-                }
-            ),
-        ),
-        ApiCase(
-            "set_process_due_at_naive_due_at",
-            _command_payload(
-                {
-                    "action": "set_process_due_at",
+                    "action": "set_process_target_at",
                     "project_id": "project-alpha",
                     "process_id": "process-api",
-                    "due_at": "2026-05-30T17:00:00",
+                    "target_at": _at(30, 17).isoformat(),
                     "edit_at": _at(13).isoformat(),
-                }
-            ),
-        ),
-        ApiCase(
-            "set_process_due_at_naive_edit_at",
-            _command_payload(
-                {
-                    "action": "set_process_due_at",
-                    "project_id": "project-alpha",
-                    "process_id": "process-api",
-                    "due_at": _at(30, 17).isoformat(),
-                    "edit_at": "2026-05-13T09:00:00",
-                }
-            ),
-        ),
-        ApiCase(
-            "clear_project_due_at_naive_edit_at",
-            _command_payload(
-                {
-                    "action": "clear_project_due_at",
-                    "project_id": "project-alpha",
-                    "edit_at": "2026-05-14T09:00:00",
                 }
             ),
         ),
@@ -1707,9 +1629,10 @@ def test_lifecycle_due_blocker_and_alias_command_payloads_round_trip(case):
             "new_command_extra_field",
             _command_payload(
                 {
-                    "action": "set_project_due_at",
+                    "action": "set_process_status",
                     "project_id": "project-alpha",
-                    "due_at": _at(30, 17).isoformat(),
+                    "process_id": "process-api",
+                    "status": "paused",
                     "edit_at": _at(13).isoformat(),
                     "unexpected": True,
                 }
@@ -1726,51 +1649,6 @@ def test_lifecycle_due_blocker_and_alias_commands_reject_invalid_inputs(case):
 @pytest.mark.parametrize(
     "field_name, payload",
     [
-        (
-            "edit_at",
-            _command_payload(
-                {
-                    "action": "set_process_due_at",
-                    "project_id": "project-alpha",
-                    "process_id": "process-api",
-                    "due_at": _at(30, 17).isoformat(),
-                    "edit_at": "2026-05-13T09:00:00",
-                }
-            ),
-        ),
-        (
-            "due_at",
-            _command_payload(
-                {
-                    "action": "set_process_due_at",
-                    "project_id": "project-alpha",
-                    "process_id": "process-api",
-                    "due_at": "2026-05-30T17:00:00",
-                    "edit_at": _at(13).isoformat(),
-                }
-            ),
-        ),
-        (
-            "edit_at",
-            _command_payload(
-                {
-                    "action": "set_project_due_at",
-                    "project_id": "project-alpha",
-                    "due_at": _at(30, 17).isoformat(),
-                    "edit_at": "2026-05-13T09:00:00",
-                }
-            ),
-        ),
-        (
-            "edit_at",
-            _command_payload(
-                {
-                    "action": "clear_project_due_at",
-                    "project_id": "project-alpha",
-                    "edit_at": "2026-05-14T09:00:00",
-                }
-            ),
-        ),
         (
             "created_at",
             _command_payload(
@@ -1804,19 +1682,6 @@ def test_new_command_moments_reject_naive_datetimes(field_name, payload):
                     "project_id": "project-alpha",
                     "process_id": "process-api",
                     "status": "paused",
-                    "edit_at": _at(13).isoformat(),
-                    "unexpected": True,
-                }
-            ),
-        ),
-        ApiCase(
-            "due_extra",
-            _command_payload(
-                {
-                    "action": "set_process_due_at",
-                    "project_id": "project-alpha",
-                    "process_id": "process-api",
-                    "due_at": _at(30, 17).isoformat(),
                     "edit_at": _at(13).isoformat(),
                     "unexpected": True,
                 }
@@ -1938,32 +1803,6 @@ def test_new_command_envelopes_reject_strict_extra_fields(case):
             ),
         ),
         ApiCase(
-            "query_due_date_history_project_total",
-            _query_payload(
-                {
-                    "action": "query_due_date_history",
-                    "project_id": "project-alpha",
-                    "as_of": _at(20).isoformat(),
-                    "include_project_total": True,
-                }
-            ),
-        ),
-        ApiCase(
-            "query_due_date_history_topology_scope",
-            _query_payload(
-                {
-                    "action": "query_due_date_history",
-                    "project_id": "project-alpha",
-                    "as_of": _at(20).isoformat(),
-                    "scope": {
-                        "type": "topo_filter",
-                        "root_process_symbols": ["build-api"],
-                        "direction": "ancestors_and_descendants",
-                    },
-                }
-            ),
-        ),
-        ApiCase(
             "query_process_graph_dependency_only",
             _query_payload(
                 {
@@ -2036,10 +1875,10 @@ def test_new_query_payloads_round_trip(case):
             ),
         ),
         ApiCase(
-            "query_due_history_naive_as_of",
+            "query_target_history_naive_as_of",
             _query_payload(
                 {
-                    "action": "query_due_date_history",
+                    "action": "query_target_history",
                     "project_id": "project-alpha",
                     "as_of": "2026-05-20T09:00:00",
                 }
@@ -2293,9 +2132,10 @@ def test_new_query_moments_reject_naive_datetimes(field_name, payload):
             "topology_scope_extra",
             _query_payload(
                 {
-                    "action": "query_due_date_history",
+                    "action": "query_process_graph",
                     "project_id": "project-alpha",
                     "as_of": _at(20).isoformat(),
+                    "now": _at(20).isoformat(),
                     "scope": {
                         "type": "topo_filter",
                         "root_process_symbols": ["build-api"],
@@ -2486,7 +2326,6 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                             "name": "Service API",
                             "duration_hours": 16,
                             "earliest_start_at": _at(15).isoformat(),
-                            "due_at": _at(30).isoformat(),
                             "status": "planned",
                             "aliases": ["api-v2"],
                             "role_requirements": [
@@ -2593,7 +2432,6 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                         "description": "Collapsed delivery scope",
                         "duration_hours": 24,
                         "earliest_start_at": None,
-                        "due_at": _at(30).isoformat(),
                         "status": "planned",
                         "aliases": ["api"],
                         "role_requirements": [

@@ -58,7 +58,6 @@ class CreatedIds(StrictModel):
     revision_ids: list[str] = Field(default_factory=list)
     calendar_ids: list[str] = Field(default_factory=list)
     blocker_ids: list[str] = Field(default_factory=list)
-    due_history_event_ids: list[str] = Field(default_factory=list)
     retirement_event_ids: list[str] = Field(default_factory=list)
 
 
@@ -208,20 +207,6 @@ class BlockerData(StrictModel):
     as_of: AwareDatetime
     blockers: list[dict[str, Any]] = Field(default_factory=list)
     blocked_process_ids: list[str] = Field(default_factory=list)
-
-
-class DueDateHistoryData(StrictModel):
-    """Due-date history query data."""
-
-    project_id: str
-    as_of: AwareDatetime
-    scope: dict[str, Any]
-    target_process_id: str | None = None
-    process_events: list[dict[str, Any]] = Field(default_factory=list)
-    project_total_events: list[dict[str, Any]] = Field(default_factory=list)
-    current_due_at: AwareDatetime | None = None
-    current_project_due_at: AwareDatetime | None = None
-    derived_project_due_at: AwareDatetime | None = None
 
 
 class ResourceScheduleData(StrictModel):

@@ -110,23 +110,6 @@ class DeleteProject(CommandModel):
         return self
 
 
-class SetProjectDueAt(CommandModel):
-    """Set the explicit project due datetime."""
-
-    action: Literal["set_project_due_at"] = "set_project_due_at"
-    project_id: str = Field(min_length=1)
-    due_at: AwareDatetime
-    edit_at: AwareDatetime
-
-
-class ClearProjectDueAt(CommandModel):
-    """Clear the explicit project due datetime."""
-
-    action: Literal["clear_project_due_at"] = "clear_project_due_at"
-    project_id: str = Field(min_length=1)
-    edit_at: AwareDatetime
-
-
 class UpsertProcessRevision(CommandModel):
     """Create a process if needed and append a planning revision."""
 
@@ -137,9 +120,8 @@ class UpsertProcessRevision(CommandModel):
     name: str = Field(min_length=1)
     description: str = ""
     effective_at: AwareDatetime
-    duration_business_days: int = Field(ge=0)
+    duration_business_days: int = Field(default=0, ge=0)
     dependencies: list[str] = Field(default_factory=list)
-    due_at: AwareDatetime | None = None
     earliest_start_at: AwareDatetime | None = None
     start_at_earliest: bool = False
     delay_after_dependencies_business_days: int = Field(default=0, ge=0)
@@ -183,15 +165,6 @@ class SetProcessStatus(CommandModel, ProcessIdentityMixin):
     def changed_at(self):
         """Backward-compatible timestamp name for the prototype service."""
         return self.edit_at
-
-
-class SetProcessDueAt(CommandModel, ProcessIdentityMixin):
-    """Set or clear a process due datetime."""
-
-    action: Literal["set_process_due_at"] = "set_process_due_at"
-    project_id: str = Field(min_length=1)
-    due_at: AwareDatetime | None = None
-    edit_at: AwareDatetime
 
 
 class AddBlocker(CommandModel, ProcessIdentityMixin):
@@ -521,7 +494,6 @@ class SubgraphProcessCommand(CommandModel):
     description: str = ""
     duration_hours: NonNegativeFloat | None = None
     earliest_start_at: AwareDatetime | None = None
-    due_at: AwareDatetime | None = None
     status: ProcessStatus = ProcessStatus.PLANNED
     finished_at: AwareDatetime | None = None
     aliases: list[str] = Field(default_factory=list)
@@ -557,11 +529,15 @@ class SubgraphDependencyCommand(CommandModel):
     edge_id: str | None = Field(default=None, min_length=1)
 
 
-class ReplaceProcessWithSubgraph(CommandModel, ProcessIdentityMixin):
-    """Replace one process with a supplied subgraph."""
+class ReplaceProcessWithSubgraph(CommandModel):
+    """Replace one or more processes with a supplied subgraph."""
 
     action: Literal["replace_process_with_subgraph"] = "replace_process_with_subgraph"
     project_id: str = Field(min_length=1)
+    process_symbols: list[str] | None = None
+    process_symbol: str | None = Field(default=None, min_length=1)
+    process_ids: list[str] | None = None
+    process_id: str | None = Field(default=None, min_length=1)
     edit_at: AwareDatetime
     processes: list[SubgraphProcessCommand] = Field(min_length=1)
     dependencies: list[SubgraphDependencyCommand]
@@ -582,6 +558,31 @@ class ReplaceProcessWithSubgraph(CommandModel, ProcessIdentityMixin):
 
     @model_validator(mode="after")
     def _validate_alias_target(self) -> ReplaceProcessWithSubgraph:
+        if self.process_symbols is None:
+            if self.process_symbol is not None:
+                self.process_symbols = [self.process_symbol]
+        if self.process_symbol is not None and self.process_symbols != [
+            self.process_symbol
+        ]:
+            raise ValueError("process_symbol and process_symbols disagree.")
+        if self.process_ids is None and self.process_id is not None:
+            self.process_ids = [self.process_id]
+        if self.process_id is not None and self.process_ids != [self.process_id]:
+            raise ValueError("process_id and process_ids disagree.")
+        has_symbols = self.process_symbols is not None
+        has_ids = self.process_ids is not None
+        if has_symbols == has_ids:
+            raise ValueError("Exactly one of process_symbols or process_ids is required.")
+        if self.process_symbols is not None:
+            self.process_symbols = validate_unique_non_empty(
+                self.process_symbols,
+                "process_symbols",
+            )
+        if self.process_ids is not None:
+            self.process_ids = validate_unique_non_empty(
+                self.process_ids,
+                "process_ids",
+            )
         for process in self.processes:
             _validate_topology_finished_at(process, self.edit_at)
         for field_name in ("root_symbols", "leaf_symbols"):
@@ -612,7 +613,6 @@ class CollapseNewProcessCommand(CommandModel):
     description: str = ""
     duration_hours: NonNegativeFloat | None = None
     earliest_start_at: AwareDatetime | None = None
-    due_at: AwareDatetime | None = None
     status: ProcessStatus = ProcessStatus.PLANNED
     finished_at: AwareDatetime | None = None
     aliases: list[str] = Field(default_factory=list)
@@ -656,12 +656,9 @@ Command = Annotated[
     | SetProjectDefaultCurrency
     | UpdateProject
     | DeleteProject
-    | SetProjectDueAt
-    | ClearProjectDueAt
     | UpsertProcessRevision
     | SetProcessStatus
     | CommitProjectState
-    | SetProcessDueAt
     | AddBlocker
     | ResolveBlocker
     | RenameProcess

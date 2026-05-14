@@ -7,8 +7,8 @@ service-first package that agents and humans can both use.
 
 - `projdash.service` owns Pydantic command/query models, validation, command
   dispatch, and persistence adapters.
-- `projdash.engine` owns pure calculations: business days, graph projection,
-  critical path, blocker/due-date followups, and resource analysis.
+- `projdash.engine` owns pure calculations: graph projection, critical path,
+  blocker followups, and resource analysis.
 - `projdash.ui` owns Streamlit rendering and calls the service for all reads and
   writes.
 - `old_code/` is reference material only.
@@ -38,8 +38,10 @@ Important relationships:
 Computed scheduling fields are query outputs, not authoritative facts.
 
 All service API and storage moments are timezone-aware datetimes. The API uses
-`*_at` names such as `start_at`, `effective_at`, `due_at`, `as_of`, and `now`.
-The LadybugDB adapter stores ISO datetime strings so offsets are preserved.
+`*_at` names such as `start_at`, `effective_at`, `as_of`, `now`, lifecycle
+anchors, calendar exceptions, holidays, allocation slices, and schedule
+snapshots. The LadybugDB adapter stores ISO datetime strings so offsets are
+preserved.
 
 ## API Direction
 

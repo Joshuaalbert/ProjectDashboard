@@ -40,7 +40,6 @@ def _project_with_processes() -> tuple[ProjectService, str, str, str, str]:
                 effective_at=_at(13),
                 duration_business_days=3,
                 dependencies=[design_id],
-                due_at=_at(18, 17),
             )
         )
     ).entity_ids["process_id"]
@@ -137,7 +136,7 @@ def test_critical_path_query_returns_ordered_process_ids():
     assert result.data["critical_path"] == [design_id, implementation_id, review_id]
 
 
-def test_due_datetime_elapsed_does_not_mark_process_done():
+def test_late_process_does_not_mark_process_done():
     service, project_id, _, implementation_id, _ = _project_with_processes()
 
     result = service.handle_query(

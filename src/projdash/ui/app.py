@@ -13,6 +13,7 @@ import streamlit as st
 from pydantic import ValidationError
 
 from projdash.ui.adapters import (
+    aggregate_process_properties,
     allowed_dependency_symbols,
     allowed_shared_dependency_symbols,
     allowed_successor_symbols,
@@ -25,7 +26,9 @@ from projdash.ui.adapters import (
     gantt_rows,
     process_symbol_maps,
     process_table_rows,
+    resource_priority_rows,
     resource_utilization_heatmap,
+    role_priority_rows,
     role_utilization_heatmap,
 )
 from projdash.ui.service_client import (
@@ -245,22 +248,36 @@ def _role_requirement_inputs(
     defaults: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     defaults = defaults or {}
+    role_key = f"{key_prefix}_roles"
+    selected_default = [role_id for role_id in defaults if role_id in role_ids]
+    multiselect_kwargs = {}
+    if role_key not in st.session_state:
+        multiselect_kwargs["default"] = selected_default
     selected_roles = st.multiselect(
         "Required roles",
         role_ids,
-        default=[role_id for role_id in defaults if role_id in role_ids],
-        key=f"{key_prefix}_roles",
+        key=role_key,
         help="Defined roles required by this process.",
+        **multiselect_kwargs,
     )
+    for role_id in role_ids:
+        if role_id not in selected_roles:
+            effort_key = f"{key_prefix}_{role_id}_effort"
+            if effort_key in st.session_state:
+                st.session_state[effort_key] = 0.0
     requirements = []
     for role_id in selected_roles:
+        effort_key = f"{key_prefix}_{role_id}_effort"
+        effort_kwargs = {}
+        if effort_key not in st.session_state:
+            effort_kwargs["value"] = float(defaults.get(role_id, 0.0))
         effort = st.number_input(
             f"{role_id} effort hours",
             0.0,
             10000.0,
-            float(defaults.get(role_id, 0.0)),
-            key=f"{key_prefix}_{role_id}_effort",
+            key=effort_key,
             help="Total effort required from this role.",
+            **effort_kwargs,
         )
         if effort > 0:
             requirements.append({"role_id": role_id, "effort_hours": effort})
@@ -301,20 +318,6 @@ def _render_first_run(service, controls: dict[str, Any]) -> None:
             dt.time(9, 0),
             help="Project start time in the selected sidebar timezone.",
         )
-        set_due = st.checkbox(
-            "Set project due date",
-            help="Optionally set an explicit whole-project due datetime.",
-        )
-        due_date = st.date_input(
-            "Due date",
-            controls["as_of"].date() + dt.timedelta(days=30),
-            help="Explicit project due date.",
-        )
-        due_time = st.time_input(
-            "Due time",
-            dt.time(17, 0),
-            help="Explicit project due time in the selected sidebar timezone.",
-        )
         submitted = st.form_submit_button("Create project")
 
     if not submitted:
@@ -322,25 +325,19 @@ def _render_first_run(service, controls: dict[str, Any]) -> None:
 
     try:
         start_at = combine_datetime(start_date, start_time, controls["timezone"])
-        commands = [
-            {
-                "action": "create_project",
-                "project_id": project_id,
-                "name": name,
-                "start_at": start_at,
-                "default_currency": currency,
-            }
-        ]
-        if set_due:
-            commands.append(
+        batch_results = _apply_batch(
+            service,
+            [
                 {
-                    "action": "set_project_due_at",
+                    "action": "create_project",
                     "project_id": project_id,
-                    "due_at": combine_datetime(due_date, due_time, controls["timezone"]),
-                    "edit_at": controls["as_of"],
+                    "name": name,
+                    "start_at": start_at,
+                    "default_currency": currency,
                 }
-            )
-        batch_results = _apply_batch(service, commands, rerun=False)
+            ],
+            rerun=False,
+        )
         if batch_results is None or not all(result.ok for result in batch_results):
             return
         st.session_state["project_id"] = project_id
@@ -360,7 +357,6 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         "graph": None,
         "full_graph": None,
         "blockers": None,
-        "history": None,
         "schedule_snapshots": None,
         "catalog": None,
         "resource_schedule": None,
@@ -433,16 +429,6 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "include_resolved": True,
         },
     )
-    base["history"] = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": controls["as_of"],
-            **scoped_query,
-            "include_project_total": True,
-        },
-    )
     base["schedule_snapshots"] = _query(
         service,
         {
@@ -493,7 +479,6 @@ def _render_dashboard(controls: dict[str, Any], context: dict[str, Any]) -> None
     project = context["project"]["project"]
     graph = context.get("graph") or {}
     blockers = context.get("blockers") or {}
-    history = context.get("history") or {}
     costs = context.get("costs") or {}
     nodes = graph.get("nodes", [])
     unresolved = [
@@ -511,16 +496,7 @@ def _render_dashboard(controls: dict[str, Any], context: dict[str, Any]) -> None
         use_container_width=True,
         hide_index=True,
     )
-    due_cols = st.columns(3)
-    due_cols[0].metric(
-        "Explicit due",
-        format_display_datetime(history.get("current_project_due_at"), controls["timezone"]),
-    )
-    due_cols[1].metric(
-        "Derived due",
-        format_display_datetime(history.get("derived_project_due_at"), controls["timezone"]),
-    )
-    due_cols[2].metric("Schedule basis", graph.get("schedule_basis", "-"))
+    st.metric("Schedule basis", graph.get("schedule_basis", "-"))
 
 
 def _render_project_settings(
@@ -566,52 +542,6 @@ def _render_project_settings(
                 "name": name,
                 "default_currency": currency,
                 "start_at": combine_datetime(start_date, start_time, controls["timezone"]),
-            },
-        )
-
-    st.subheader("Project due date")
-    history = context.get("history") or {}
-    current_due = to_display_timezone(
-        _parse_iso_datetime(
-            history.get("current_project_due_at"),
-            controls["as_of"] + dt.timedelta(days=30),
-        ),
-        controls["timezone"],
-    )
-    with st.form("project_due"):
-        clear_due = st.checkbox(
-            "Clear project due date",
-            help="Remove the explicit due datetime for the whole project.",
-        )
-        due_date = st.date_input(
-            "Due date",
-            current_due.date(),
-            help="Explicit whole-project due date.",
-        )
-        due_time = st.time_input(
-            "Due time",
-            current_due.timetz().replace(tzinfo=None),
-            help="Explicit whole-project due time in the selected sidebar timezone.",
-        )
-        save_due = st.form_submit_button("Save project due date")
-    if save_due:
-        _apply_command(
-            service,
-            {
-                "action": "clear_project_due_at" if clear_due else "set_project_due_at",
-                "project_id": controls["project_id"],
-                "edit_at": controls["as_of"],
-                **(
-                    {}
-                    if clear_due
-                    else {
-                        "due_at": combine_datetime(
-                            due_date,
-                            due_time,
-                            controls["timezone"],
-                        )
-                    }
-                ),
             },
         )
 
@@ -696,326 +626,382 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
         key="process_table",
         timezone_name=controls["timezone"],
     )
-
-    with st.expander("Create or revise process", expanded=True):
-        with st.form("process_revision"):
-            default_symbol = selected_symbols[0] if len(selected_symbols) == 1 else ""
-            symbol_options = [""] + catalog["process_symbols"]
-            selected_index = (
-                symbol_options.index(default_symbol)
-                if default_symbol in symbol_options
-                else 0
-            )
-            existing = st.selectbox(
-                "Existing process",
-                symbol_options,
-                index=selected_index,
-                help=(
-                    "Choose a defined process to revise, or leave blank to create a "
-                    "new process."
-                ),
-            )
-            selected_node = node_by_symbol.get(existing, {})
-            name = st.text_input(
-                "Name",
-                selected_node.get("name", ""),
-                help="Human-readable process name.",
-            )
-            description = st.text_area(
-                "Description",
-                selected_node.get("description", ""),
-                help="Definition of done, scope, and PM notes for this process.",
-            )
-            dependency_options = allowed_dependency_symbols(graph, existing)
-            dependency_defaults = [
-                symbol
-                for symbol in existing_dependency_symbols(graph, existing)
-                if symbol in dependency_options
-            ]
-            dependencies = st.multiselect(
-                "Dependencies",
-                dependency_options,
-                default=dependency_defaults,
-                help="Defined predecessor processes that must finish first.",
-            )
-            effective_date = st.date_input(
-                "Effective date",
-                controls["as_of"].date(),
-                help="Date this revision becomes active.",
-            )
-            effective_time = st.time_input(
-                "Effective time",
-                controls["as_of"].time(),
-                help="Time this revision becomes active.",
-            )
-            due_enabled = st.checkbox(
-                "Set process due date",
-                help="Enable an explicit process due datetime.",
-            )
-            due_date = st.date_input(
-                "Process due date",
-                controls["as_of"].date(),
-                help="Explicit due date for this process.",
-            )
-            due_time = st.time_input(
-                "Process due time",
-                dt.time(17, 0),
-                help="Explicit due time for this process.",
-            )
-            earliest_enabled = st.checkbox(
-                "Set earliest start",
-                help="Enable a not-before datetime for this process.",
-            )
-            earliest_date = st.date_input(
-                "Earliest start date",
-                controls["as_of"].date(),
-                help="Earliest allowed start date.",
-            )
-            earliest_time = st.time_input(
-                "Earliest start time",
-                dt.time(9, 0),
-                help="Earliest allowed start time.",
-            )
-            role_requirements = _role_requirement_inputs(
-                catalog["role_ids"],
-                key_prefix=f"process_revision_{existing or 'new'}",
-                defaults=_role_effort_defaults(selected_node),
-            )
-            submitted = st.form_submit_button("Save revision")
-        if submitted:
-            duration_days = int((selected_node.get("duration_hours") or 0) / 8)
-            payload = {
-                "action": "upsert_process_revision",
-                "project_id": controls["project_id"],
-                "name": name,
-                "description": description,
-                "effective_at": combine_datetime(
-                    effective_date,
-                    effective_time,
-                    controls["timezone"],
-                ),
-                "duration_business_days": duration_days,
-                "dependencies": [
-                    id_by_symbol[symbol]
-                    for symbol in dependencies
-                    if symbol in id_by_symbol
-                ],
-                "due_at": combine_datetime(due_date, due_time, controls["timezone"])
-                if due_enabled
-                else None,
-                "earliest_start_at": combine_datetime(
-                    earliest_date,
-                    earliest_time,
-                    controls["timezone"],
-                )
-                if earliest_enabled
-                else None,
-                "role_requirements": role_requirements,
-            }
-            if existing:
-                payload["process_symbol"] = existing
-            _apply_command(service, payload)
-
-    _render_batch_process_menu(service, controls, graph, catalog, selected_symbols)
-    _render_process_status_form(service, controls, catalog, selected_symbols)
-    _render_process_due_form(service, controls, catalog, selected_symbols)
-    _render_blocker_forms(service, controls, catalog, selected_symbols)
+    _render_create_process_menu(service, controls, graph, catalog, id_by_symbol)
+    _render_modify_process_menu(
+        service,
+        controls,
+        graph,
+        catalog,
+        id_by_symbol,
+        node_by_symbol,
+        selected_symbols,
+    )
 
 
-def _render_batch_process_menu(
+def _render_create_process_menu(
     service,
     controls: dict[str, Any],
     graph: dict[str, Any],
     catalog: dict[str, list[str]],
-    selected_symbols: list[str],
+    id_by_symbol: dict[str, str],
 ) -> None:
-    id_by_symbol, _symbol_by_id = process_symbol_maps(graph)
-    with st.expander("Batch update processes"):
-        default_symbols = [
-            symbol for symbol in selected_symbols if symbol in catalog["process_symbols"]
-        ]
-        target_symbols = st.multiselect(
-            "Selected process symbols",
-            catalog["process_symbols"],
-            default=default_symbols,
-            help="Processes affected by the batch operation.",
+    with st.expander("Create process", expanded=True):
+        name = st.text_input(
+            "Name",
+            key="process_create_name",
+            help="Human-readable process name. The process symbol is generated.",
         )
-        predecessor_options = allowed_shared_dependency_symbols(graph, target_symbols)
-        successor_options = allowed_successor_symbols(graph, target_symbols)
-
-        with st.form("batch_add_predecessors"):
-            predecessors = st.multiselect(
-                "Predecessors to add",
-                predecessor_options,
-                help="Only symbols that can precede every selected process are shown.",
+        description = st.text_area(
+            "Description",
+            key="process_create_description",
+            help="Definition of done, scope, and PM notes for this process.",
+        )
+        dependencies = st.multiselect(
+            "Predecessors",
+            allowed_dependency_symbols(graph, None),
+            key="process_create_dependencies",
+            help="Defined processes that must finish before this new process starts.",
+        )
+        earliest_enabled = st.checkbox(
+            "Set earliest start",
+            key="process_create_earliest_enabled",
+            help="Enable a not-before datetime constraint for this process.",
+        )
+        earliest_date = st.date_input(
+            "Earliest start date",
+            controls["as_of"].date(),
+            key="process_create_earliest_date",
+            help="Earliest allowed start date.",
+        )
+        earliest_time = st.time_input(
+            "Earliest start time",
+            dt.time(9, 0),
+            key="process_create_earliest_time",
+            help="Earliest allowed start time.",
+        )
+        role_requirements = _role_requirement_inputs(
+            catalog["role_ids"],
+            key_prefix="process_create",
+        )
+        create = st.button("Create process")
+    if not create or not name:
+        return
+    result = _apply_command(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": controls["project_id"],
+            "name": name,
+            "description": description,
+            "effective_at": controls["as_of"],
+            "duration_business_days": 0,
+            "dependencies": [
+                id_by_symbol[symbol]
+                for symbol in dependencies
+                if symbol in id_by_symbol
+            ],
+            "earliest_start_at": combine_datetime(
+                earliest_date,
+                earliest_time,
+                controls["timezone"],
             )
-            add_predecessors = st.form_submit_button("Add predecessors")
-        if add_predecessors and target_symbols and predecessors:
-            _apply_command(
-                service,
-                {
-                    "action": "batch_update_process_graph",
-                    "project_id": controls["project_id"],
-                    "edit_at": controls["as_of"],
-                    "operations": [
-                        {
-                            "action": "add_dependency",
-                            "operation_id": f"add-{predecessor}-{target}",
-                            "predecessor_process_symbol": predecessor,
-                            "successor_process_symbol": target,
-                        }
-                        for target in target_symbols
-                        for predecessor in predecessors
-                    ],
-                },
-            )
-
-        with st.form("batch_add_existing_children"):
-            children = st.multiselect(
-                "Existing children to add",
-                successor_options,
-                help="Only symbols that can follow every selected process are shown.",
-            )
-            add_children = st.form_submit_button("Add existing children")
-        if add_children and target_symbols and children:
-            _apply_command(
-                service,
-                {
-                    "action": "batch_update_process_graph",
-                    "project_id": controls["project_id"],
-                    "edit_at": controls["as_of"],
-                    "operations": [
-                        {
-                            "action": "add_dependency",
-                            "operation_id": f"add-{parent}-{child}",
-                            "predecessor_process_symbol": parent,
-                            "successor_process_symbol": child,
-                        }
-                        for parent in target_symbols
-                        for child in children
-                    ],
-                },
-            )
-
-        with st.form("batch_add_new_child"):
-            child_name = st.text_input(
-                "New child name",
-                help="Human-readable name for the new child process.",
-            )
-            child_description = st.text_area(
-                "New child description",
-                help="Definition of done, scope, and PM notes for the child process.",
-            )
-            role_requirements = _role_requirement_inputs(
-                catalog["role_ids"],
-                key_prefix="batch_child",
-            )
-            add_new_child = st.form_submit_button("Create child after selected")
-        if add_new_child and target_symbols and child_name:
-            payload = {
-                "action": "upsert_process_revision",
-                "project_id": controls["project_id"],
-                "name": child_name,
-                "description": child_description,
-                "effective_at": controls["as_of"],
-                "duration_business_days": 0,
-                "dependencies": [
-                    id_by_symbol[symbol]
-                    for symbol in target_symbols
-                    if symbol in id_by_symbol
-                ],
-                "role_requirements": role_requirements,
-            }
-            _apply_command(service, payload)
-
-        with st.form("batch_collapse_selected"):
-            new_name = st.text_input(
-                "Collapsed process name",
-                help="Human-readable name for the replacement process.",
-            )
-            new_description = st.text_area(
-                "Collapsed process description",
-                help="Definition of done, scope, and PM notes for the replacement.",
-            )
-            collapse = st.form_submit_button("Collapse selected")
-        if collapse and target_symbols:
-            _apply_command(
-                service,
-                {
-                    "action": "collapse_subgraph",
-                    "project_id": controls["project_id"],
-                    "edit_at": controls["as_of"],
-                    "process_symbols": target_symbols,
-                    "new_process": {
-                        "name": new_name,
-                        "description": new_description,
-                    },
-                },
-            )
+            if earliest_enabled
+            else None,
+            "role_requirements": role_requirements,
+        },
+        rerun=False,
+    )
+    if result is not None and result.ok:
+        _clear_widget_prefix("process_create")
+        st.rerun()
 
 
-def _render_process_status_form(
+def _render_modify_process_menu(
     service,
     controls: dict[str, Any],
+    graph: dict[str, Any],
     catalog: dict[str, list[str]],
+    id_by_symbol: dict[str, str],
+    node_by_symbol: dict[str, dict[str, Any]],
     selected_symbols: list[str],
-):
-    with st.expander("Set process status"):
-        with st.form("process_status"):
-            default_symbol = selected_symbols[0] if len(selected_symbols) == 1 else ""
-            symbol_options = [""] + catalog["process_symbols"]
-            process_symbol = st.selectbox(
-                "Process",
-                symbol_options,
-                index=(
-                    symbol_options.index(default_symbol)
-                    if default_symbol in symbol_options
-                    else 0
-                ),
-                help="Defined process to update.",
+) -> None:
+    with st.expander("Modify selected processes", expanded=True):
+        _sync_selected_process_widget(selected_symbols, catalog["process_symbols"])
+        target_symbols = st.multiselect(
+            "Processes",
+            catalog["process_symbols"],
+            key="process_modify_targets",
+            help="Processes affected by the revision commands.",
+        )
+        target_symbols = _valid_process_symbols(target_symbols, graph)
+        aggregate = aggregate_process_properties(graph, target_symbols)
+        _sync_process_revision_defaults(aggregate, controls, catalog["role_ids"])
+        if not target_symbols:
+            st.info("Select one or more process rows above, or choose symbols here.")
+            return
+
+        predecessor_options = allowed_shared_dependency_symbols(graph, target_symbols)
+        predecessor_defaults = [
+            symbol
+            for symbol in st.session_state.get("process_modify_predecessors", [])
+            if symbol in predecessor_options
+        ]
+        st.session_state["process_modify_predecessors"] = predecessor_defaults
+        predecessors = st.multiselect(
+            "Predecessors",
+            predecessor_options,
+            key="process_modify_predecessors",
+            help="External predecessors for every selected process.",
+        )
+        update_predecessors = st.checkbox(
+            "Update predecessors",
+            key="process_modify_update_predecessors",
+            help="Replace each selected process's external predecessor set.",
+        )
+
+        child_options = allowed_successor_symbols(graph, target_symbols)
+        child_defaults = [
+            symbol
+            for symbol in st.session_state.get("process_modify_children", [])
+            if symbol in child_options
+        ]
+        st.session_state["process_modify_children"] = child_defaults
+        children = st.multiselect(
+            "Children",
+            child_options,
+            key="process_modify_children",
+            help="External children for every selected process.",
+        )
+        update_children = st.checkbox(
+            "Update children",
+            key="process_modify_update_children",
+            help="Replace each selected process's external child set.",
+        )
+
+        update_roles = st.checkbox(
+            "Update role effort",
+            key="process_modify_update_roles",
+            help="Replace selected processes' role effort with the values below.",
+        )
+        role_requirements = _role_requirement_inputs(
+            catalog["role_ids"],
+            key_prefix="process_modify",
+            defaults=aggregate["role_efforts"],
+        )
+
+        update_timing = st.checkbox(
+            "Update earliest start",
+            key="process_modify_update_timing",
+            help="Replace the not-before constraint for selected processes.",
+        )
+        earliest_enabled = st.checkbox(
+            "Set earliest start",
+            key="process_modify_earliest_enabled",
+            help="Enable a not-before datetime constraint.",
+        )
+        earliest_date = st.date_input(
+            "Earliest start date",
+            key="process_modify_earliest_date",
+            help="Earliest allowed start date.",
+        )
+        earliest_time = st.time_input(
+            "Earliest start time",
+            key="process_modify_earliest_time",
+            help="Earliest allowed start time.",
+        )
+
+        update_metadata = False
+        name = ""
+        description = ""
+        if len(target_symbols) == 1:
+            node = node_by_symbol.get(target_symbols[0], {})
+            update_metadata = st.checkbox(
+                "Update name and description",
+                key="process_modify_update_metadata",
+                help="Save a process revision with updated human-readable metadata.",
             )
-            status = st.selectbox(
-                "Status",
-                ["planned", "in_progress", "paused", "done", "canceled"],
-                help="Lifecycle status for the selected process.",
+            name = st.text_input(
+                "Name",
+                key="process_modify_name",
+                help="Human-readable process name.",
             )
-            started_enabled = st.checkbox(
-                "Set started time",
-                help="Record the actual start datetime that pins ES and LS.",
+            description = st.text_area(
+                "Description",
+                key="process_modify_description",
+                help="Definition of done, scope, and PM notes for this process.",
             )
-            started_date = st.date_input(
-                "Started date",
-                controls["as_of"].date(),
-                help="Actual start date.",
+
+        update_status = st.checkbox(
+            "Update status",
+            key="process_modify_update_status",
+            help="Set lifecycle state for every selected process.",
+        )
+        status_options = ["planned", "in_progress", "paused", "done", "canceled"]
+        status = st.selectbox(
+            "Status",
+            status_options,
+            key="process_modify_status",
+            help="Lifecycle status for selected processes.",
+        )
+        started_enabled = st.checkbox(
+            "Set started time",
+            key="process_modify_started_enabled",
+            help="Record an actual start datetime that pins ES and LS.",
+        )
+        started_date = st.date_input(
+            "Started date",
+            key="process_modify_started_date",
+            help="Actual start date.",
+        )
+        started_time = st.time_input(
+            "Started time",
+            key="process_modify_started_time",
+            help="Actual start time.",
+        )
+        finished_enabled = st.checkbox(
+            "Set finished time",
+            key="process_modify_finished_enabled",
+            help="Record an actual completion datetime when status is done.",
+        )
+        finished_date = st.date_input(
+            "Finished date",
+            key="process_modify_finished_date",
+            help="Completion date.",
+        )
+        finished_time = st.time_input(
+            "Finished time",
+            key="process_modify_finished_time",
+            help="Completion time.",
+        )
+
+        st.caption("Open blockers: " + (", ".join(aggregate["blocker_ids"]) or "none"))
+        add_blocker = st.checkbox(
+            "Add blocker",
+            key="process_modify_add_blocker",
+            help="Create the same blocker on every selected process.",
+        )
+        blocker_summary = st.text_input(
+            "Blocker summary",
+            key="process_modify_blocker_summary",
+            help="Short blocker summary.",
+        )
+        blocker_details = st.text_area(
+            "Blocker details",
+            key="process_modify_blocker_details",
+            help="Optional blocker detail.",
+        )
+        blocker_severity = st.selectbox(
+            "Blocker severity",
+            ["blocking", "warning", "info"],
+            key="process_modify_blocker_severity",
+            help="Whether this blocker prevents work or is informational.",
+        )
+        blockers_to_resolve = st.multiselect(
+            "Resolve blockers",
+            aggregate["blocker_ids"],
+            key="process_modify_resolve_blockers",
+            help="Existing blockers to mark resolved.",
+        )
+        resolution = st.text_input(
+            "Resolution",
+            key="process_modify_resolution",
+            help="Optional resolution note.",
+        )
+        apply_changes = st.button("Apply modifications")
+
+    if not apply_changes:
+        return
+
+    commands = []
+    if update_predecessors or update_children:
+        operations = []
+        if update_predecessors:
+            operations.extend(
+                _dependency_set_operations(
+                    graph,
+                    target_symbols,
+                    predecessors,
+                    side="predecessors",
+                )
             )
-            started_time = st.time_input(
-                "Started time",
-                controls["as_of"].time(),
-                help="Actual start time.",
+        if update_children:
+            operations.extend(
+                _dependency_set_operations(
+                    graph,
+                    target_symbols,
+                    children,
+                    side="children",
+                )
             )
-            finished_enabled = st.checkbox(
-                "Set finished time",
-                help="Record a completion datetime when applicable.",
+        if operations:
+            commands.append(
+                {
+                    "action": "batch_update_process_graph",
+                    "project_id": controls["project_id"],
+                    "edit_at": controls["as_of"],
+                    "operations": operations,
+                }
             )
-            finished_date = st.date_input(
-                "Finished date",
-                controls["as_of"].date(),
-                help="Completion date.",
+
+    role_requirements_by_symbol = _batch_role_requirements_by_symbol(
+        graph,
+        target_symbols,
+        role_requirements,
+    )
+    if update_roles or update_timing or update_metadata:
+        for symbol in target_symbols:
+            node = node_by_symbol.get(symbol, {})
+            current_predecessors = existing_dependency_symbols(graph, symbol)
+            current_role_requirements = node.get("role_requirements") or []
+            earliest_start_at = node.get("earliest_start_at")
+            if update_timing:
+                earliest_start_at = (
+                    combine_datetime(
+                        earliest_date,
+                        earliest_time,
+                        controls["timezone"],
+                    )
+                    if earliest_enabled
+                    else None
+                )
+            commands.append(
+                {
+                    "action": "upsert_process_revision",
+                    "project_id": controls["project_id"],
+                    "process_symbol": symbol,
+                    "name": name if update_metadata and len(target_symbols) == 1 else (
+                        node.get("name") or symbol
+                    ),
+                    "description": (
+                        description
+                        if update_metadata and len(target_symbols) == 1
+                        else node.get("description", "")
+                    ),
+                    "effective_at": controls["as_of"],
+                    "duration_business_days": int(
+                        (float(node.get("duration_hours") or 0.0) + 7.9999) // 8
+                    ),
+                    "dependencies": [
+                        id_by_symbol[pred]
+                        for pred in current_predecessors
+                        if pred in id_by_symbol
+                    ],
+                    "earliest_start_at": earliest_start_at,
+                    "role_requirements": (
+                        role_requirements_by_symbol.get(symbol, [])
+                        if update_roles
+                        else current_role_requirements
+                    ),
+                }
             )
-            finished_time = st.time_input(
-                "Finished time",
-                controls["as_of"].time(),
-                help="Completion time.",
-            )
-            note = st.text_input("Note", help="Optional status note.")
-            submitted = st.form_submit_button("Set status")
-        if submitted and process_symbol:
-            _apply_command(
-                service,
+
+    if update_status:
+        for symbol in target_symbols:
+            commands.append(
                 {
                     "action": "set_process_status",
                     "project_id": controls["project_id"],
-                    "process_symbol": process_symbol,
+                    "process_symbol": symbol,
                     "status": status,
                     "edit_at": controls["as_of"],
                     "started_at": combine_datetime(
@@ -1032,125 +1018,250 @@ def _render_process_status_form(
                     )
                     if finished_enabled
                     else None,
-                    "note": note or None,
-                },
+                }
             )
-
-
-def _render_process_due_form(
-    service,
-    controls: dict[str, Any],
-    catalog: dict[str, list[str]],
-    selected_symbols: list[str],
-):
-    with st.expander("Set or clear due date"):
-        with st.form("process_due"):
-            default_symbol = selected_symbols[0] if len(selected_symbols) == 1 else ""
-            symbol_options = [""] + catalog["process_symbols"]
-            process_symbol = st.selectbox(
-                "Process",
-                symbol_options,
-                index=(
-                    symbol_options.index(default_symbol)
-                    if default_symbol in symbol_options
-                    else 0
-                ),
-                key="due_pid",
-                help="Defined process whose due datetime will change.",
-            )
-            clear_due = st.checkbox(
-                "Clear due date",
-                help="Remove the explicit due datetime.",
-            )
-            due_date = st.date_input(
-                "Due date",
-                controls["as_of"].date(),
-                key="due_d",
-                help="Explicit process due date.",
-            )
-            due_time = st.time_input(
-                "Due time",
-                dt.time(17, 0),
-                key="due_t",
-                help="Explicit process due time.",
-            )
-            submitted = st.form_submit_button("Save due date")
-        if submitted and process_symbol:
-            _apply_command(
-                service,
-                {
-                    "action": "set_process_due_at",
-                    "project_id": controls["project_id"],
-                    "process_symbol": process_symbol,
-                    "due_at": None
-                    if clear_due
-                    else combine_datetime(due_date, due_time, controls["timezone"]),
-                    "edit_at": controls["as_of"],
-                },
-            )
-
-
-def _render_blocker_forms(
-    service,
-    controls: dict[str, Any],
-    catalog: dict[str, list[str]],
-    selected_symbols: list[str],
-):
-    with st.expander("Blockers"):
-        with st.form("add_blocker"):
-            default_symbol = selected_symbols[0] if len(selected_symbols) == 1 else ""
-            symbol_options = [""] + catalog["process_symbols"]
-            process_symbol = st.selectbox(
-                "Process",
-                symbol_options,
-                index=(
-                    symbol_options.index(default_symbol)
-                    if default_symbol in symbol_options
-                    else 0
-                ),
-                key="blk_pid",
-                help="Defined process that is blocked.",
-            )
-            summary = st.text_input("Summary", help="Short blocker summary.")
-            details = st.text_area("Details", help="Optional blocker detail.")
-            severity = st.selectbox(
-                "Severity",
-                ["blocking", "warning", "info"],
-                help="Whether this blocker prevents work or is informational.",
-            )
-            add = st.form_submit_button("Add blocker")
-        if add and process_symbol:
-            _apply_command(
-                service,
+    if add_blocker and blocker_summary:
+        for symbol in target_symbols:
+            commands.append(
                 {
                     "action": "add_blocker",
                     "project_id": controls["project_id"],
-                    "process_symbol": process_symbol,
-                    "summary": summary,
-                    "details": details or None,
-                    "severity": severity,
+                    "process_symbol": symbol,
+                    "summary": blocker_summary,
+                    "details": blocker_details or None,
+                    "severity": blocker_severity,
                     "created_at": controls["as_of"],
-                },
+                }
             )
-        with st.form("resolve_blocker"):
-            blocker_id = st.selectbox(
-                "Blocker id",
-                [""] + catalog["blocker_ids"],
-                help="Defined blocker to resolve.",
-            )
-            resolution = st.text_input("Resolution", help="Optional resolution note.")
-            resolve = st.form_submit_button("Resolve blocker")
-        if resolve and blocker_id:
-            _apply_command(
-                service,
+    for blocker_id in blockers_to_resolve:
+        commands.append(
+            {
+                "action": "resolve_blocker",
+                "project_id": controls["project_id"],
+                "blocker_id": blocker_id,
+                "resolved_at": controls["as_of"],
+                "resolution": resolution or None,
+            }
+        )
+
+    if commands:
+        _apply_batch(service, commands)
+
+
+def _sync_selected_process_widget(
+    selected_symbols: list[str],
+    process_symbols: list[str],
+) -> None:
+    valid_selected = [symbol for symbol in selected_symbols if symbol in process_symbols]
+    signature = "\0".join(valid_selected)
+    if signature and st.session_state.get("process_table_selection_sig") != signature:
+        st.session_state["process_modify_targets"] = valid_selected
+        st.session_state["process_table_selection_sig"] = signature
+
+
+def _sync_process_revision_defaults(
+    aggregate: dict[str, Any],
+    controls: dict[str, Any],
+    role_ids: list[str],
+) -> None:
+    signature = _process_revision_defaults_signature(aggregate, controls)
+    if st.session_state.get("process_modify_defaults_sig") == signature:
+        return
+    st.session_state["process_modify_predecessors"] = aggregate["predecessors"]
+    st.session_state["process_modify_children"] = aggregate["children"]
+    st.session_state["process_modify_roles"] = [
+        role_id for role_id in aggregate["role_efforts"] if role_id in role_ids
+    ]
+    for role_id in role_ids:
+        st.session_state[f"process_modify_{role_id}_effort"] = float(
+            aggregate["role_efforts"].get(role_id, 0.0)
+        )
+    st.session_state["process_modify_status"] = aggregate.get("status") or "planned"
+    st.session_state["process_modify_name"] = aggregate.get("name", "")
+    st.session_state["process_modify_description"] = aggregate.get("description", "")
+    earliest_at = _common_datetime_or_default(
+        aggregate.get("earliest_start_at"),
+        controls["as_of"],
+        controls["timezone"],
+    )
+    started_at = _common_datetime_or_default(
+        aggregate.get("started_at"),
+        controls["as_of"],
+        controls["timezone"],
+    )
+    finished_at = _common_datetime_or_default(
+        aggregate.get("finished_at"),
+        controls["as_of"],
+        controls["timezone"],
+    )
+    st.session_state["process_modify_earliest_enabled"] = (
+        aggregate.get("earliest_start_at") is not None
+    )
+    st.session_state["process_modify_earliest_date"] = earliest_at.date()
+    st.session_state["process_modify_earliest_time"] = earliest_at.time()
+    st.session_state["process_modify_started_enabled"] = (
+        aggregate.get("started_at") is not None
+    )
+    st.session_state["process_modify_started_date"] = started_at.date()
+    st.session_state["process_modify_started_time"] = started_at.time()
+    st.session_state["process_modify_finished_enabled"] = (
+        aggregate.get("finished_at") is not None
+    )
+    st.session_state["process_modify_finished_date"] = finished_at.date()
+    st.session_state["process_modify_finished_time"] = finished_at.time()
+    st.session_state["process_modify_defaults_sig"] = signature
+
+
+def _process_revision_defaults_signature(
+    aggregate: dict[str, Any],
+    controls: dict[str, Any],
+) -> str:
+    """Return a stable form-state signature for selected process properties."""
+    role_efforts = tuple(
+        sorted(
+            (role_id, float(hours))
+            for role_id, hours in aggregate.get("role_efforts", {}).items()
+        )
+    )
+    parts = (
+        tuple(aggregate.get("process_symbols", [])),
+        tuple(aggregate.get("predecessors", [])),
+        tuple(aggregate.get("children", [])),
+        role_efforts,
+        aggregate.get("status") or "",
+        aggregate.get("name") or "",
+        aggregate.get("description") or "",
+        str(aggregate.get("earliest_start_at") or ""),
+        str(aggregate.get("started_at") or ""),
+        str(aggregate.get("finished_at") or ""),
+        tuple(aggregate.get("blocker_ids", [])),
+        controls["timezone"],
+        controls["as_of"].isoformat(),
+    )
+    return repr(parts)
+
+
+def _dependency_set_operations(
+    graph: dict[str, Any],
+    selected_symbols: list[str],
+    desired_symbols: list[str],
+    *,
+    side: str,
+) -> list[dict[str, Any]]:
+    desired = set(desired_symbols)
+    selected_set = set(selected_symbols)
+    operations = []
+    for selected in selected_symbols:
+        if side == "predecessors":
+            current = {
+                predecessor
+                for predecessor in existing_dependency_symbols(graph, selected)
+                if predecessor not in selected_set
+            }
+            for predecessor in sorted(desired - current):
+                operations.append(
+                    {
+                        "action": "add_dependency",
+                        "operation_id": f"add-{predecessor}-{selected}",
+                        "predecessor_process_symbol": predecessor,
+                        "successor_process_symbol": selected,
+                    }
+                )
+            for predecessor in sorted(current - desired):
+                operations.append(
+                    {
+                        "action": "remove_dependency",
+                        "operation_id": f"remove-{predecessor}-{selected}",
+                        "predecessor_process_symbol": predecessor,
+                        "successor_process_symbol": selected,
+                    }
+                )
+            continue
+        current = {
+            edge.get("successor_process_symbol")
+            for edge in graph.get("edges", [])
+            if edge.get("predecessor_process_symbol") == selected
+            and edge.get("successor_process_symbol") not in selected_set
+        }
+        for child in sorted(desired - current):
+            operations.append(
                 {
-                    "action": "resolve_blocker",
-                    "project_id": controls["project_id"],
-                    "blocker_id": blocker_id,
-                    "resolved_at": controls["as_of"],
-                    "resolution": resolution or None,
-                },
+                    "action": "add_dependency",
+                    "operation_id": f"add-{selected}-{child}",
+                    "predecessor_process_symbol": selected,
+                    "successor_process_symbol": child,
+                }
             )
+        for child in sorted(current - desired):
+            operations.append(
+                {
+                    "action": "remove_dependency",
+                    "operation_id": f"remove-{selected}-{child}",
+                    "predecessor_process_symbol": selected,
+                    "successor_process_symbol": child,
+                }
+            )
+    return operations
+
+
+def _batch_role_requirements_by_symbol(
+    graph: dict[str, Any],
+    selected_symbols: list[str],
+    aggregate_requirements: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Distribute aggregate role effort totals across selected processes."""
+    if len(selected_symbols) <= 1:
+        return {symbol: list(aggregate_requirements) for symbol in selected_symbols}
+
+    current_by_symbol: dict[str, dict[str, float]] = {}
+    for node in graph.get("nodes", []):
+        symbol = node.get("process_symbol")
+        if symbol not in selected_symbols:
+            continue
+        current_by_symbol[symbol] = _role_effort_defaults(node)
+    target_totals = {
+        requirement["role_id"]: float(requirement.get("effort_hours") or 0.0)
+        for requirement in aggregate_requirements
+        if requirement.get("role_id")
+    }
+    current_totals: dict[str, float] = {}
+    for role_efforts in current_by_symbol.values():
+        for role_id, effort_hours in role_efforts.items():
+            current_totals[role_id] = current_totals.get(role_id, 0.0) + effort_hours
+
+    output: dict[str, list[dict[str, Any]]] = {}
+    for symbol in selected_symbols:
+        output[symbol] = []
+        for role_id, target_total in sorted(target_totals.items()):
+            current_total = current_totals.get(role_id, 0.0)
+            if current_total > 0:
+                effort_hours = target_total * (
+                    current_by_symbol.get(symbol, {}).get(role_id, 0.0)
+                    / current_total
+                )
+            else:
+                effort_hours = target_total / len(selected_symbols)
+            if effort_hours > 0:
+                output[symbol].append(
+                    {"role_id": role_id, "effort_hours": effort_hours}
+                )
+    return output
+
+
+def _common_datetime_or_default(
+    value: Any,
+    default: dt.datetime,
+    timezone_name: str,
+) -> dt.datetime:
+    if value is None:
+        return to_display_timezone(default, timezone_name)
+    return to_display_timezone(value, timezone_name)
+
+
+def _clear_widget_prefix(prefix: str) -> None:
+    for key in list(st.session_state):
+        if str(key).startswith(prefix):
+            del st.session_state[key]
 
 
 def _render_graph(context: dict[str, Any]) -> None:
@@ -1756,6 +1867,33 @@ def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
         terminal_symbols=terminal_symbols,
         timezone_name=controls["timezone"],
     )
+    st.subheader("Role priorities")
+    st.dataframe(
+        format_display_datetimes(
+            role_priority_rows(
+                graph,
+                context.get("now") or controls["now"],
+                terminal_symbols=terminal_symbols,
+            ),
+            controls["timezone"],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.subheader("Resource priorities")
+    st.dataframe(
+        format_display_datetimes(
+            resource_priority_rows(
+                graph,
+                schedule,
+                context.get("now") or controls["now"],
+                terminal_symbols=terminal_symbols,
+            ),
+            controls["timezone"],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
     st.dataframe(
         format_display_datetimes(schedule.get("processes", []), controls["timezone"]),
         use_container_width=True,
@@ -1894,16 +2032,21 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         )
         commit = st.form_submit_button("Commit current state")
     if commit:
-        _apply_command(
+        committed_at = dt.datetime.now(dt.UTC)
+        result = _apply_command(
             service,
             {
                 "action": "commit_project_state",
                 "project_id": controls["project_id"],
-                "committed_at": controls["as_of"],
+                "committed_at": committed_at,
                 "terminal_process_symbols": terminal_symbols,
                 "note": note or None,
             },
+            rerun=False,
         )
+        if result is not None and result.ok:
+            st.session_state["as_of_override"] = committed_at.isoformat()
+            st.rerun()
 
     plotted_rows = [
         {
@@ -2009,23 +2152,7 @@ def _render_costs(controls: dict[str, Any], context: dict[str, Any]) -> None:
 
 
 def _render_history(controls: dict[str, Any], context: dict[str, Any]) -> None:
-    history = context.get("history") or {}
     blockers = context.get("blockers") or {}
-    st.subheader("Process due-date events")
-    st.dataframe(
-        format_display_datetimes(history.get("process_events", []), controls["timezone"]),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.subheader("Project due-date events")
-    st.dataframe(
-        format_display_datetimes(
-            history.get("project_total_events", []),
-            controls["timezone"],
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
     st.subheader("Blocker history")
     st.dataframe(
         format_display_datetimes(blockers.get("blockers", []), controls["timezone"]),
@@ -2054,12 +2181,16 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
         use_container_width=True,
     )
 
-    with st.expander("Replace process with subgraph"):
+    with st.expander("Replace subgraph with subgraph"):
         with st.form("replace_subgraph"):
-            target = st.selectbox(
-                "Parent process",
-                [""] + catalog["process_symbols"],
-                help="Defined process to replace with a detailed subgraph.",
+            targets = st.multiselect(
+                "Processes to replace",
+                catalog["process_symbols"],
+                help=(
+                    "Defined process symbols to replace. External predecessors "
+                    "will connect to new roots; new leaves will connect to "
+                    "external children."
+                ),
             )
             children = st.text_area(
                 "Children",
@@ -2070,7 +2201,7 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                 help=(
                     "Rows of new process symbol, name, role effort hours, and "
                     "optional description, for example "
-                    "`A | Name | role_eng:8,role_qa:2 | Definition`."
+                    "`A | Name | role_eng:8,*_qa:2 | Definition`."
                 ),
             )
             dependencies = st.text_area(
@@ -2078,23 +2209,18 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                 "A -> B",
                 help="Dependencies between child process symbols.",
             )
-            alias_target = st.text_input(
-                "Parent alias target symbol",
-                "",
-                help=(
-                    "Child symbol that should keep the parent process symbol as "
-                    "an alias. Leave blank to use the first inferred root."
-                ),
-            )
             preserve_alias = st.checkbox(
-                "Preserve parent symbol as alias",
-                True,
-                help="Keep the replaced process symbol as an alias for a child process.",
+                "Preserve replaced symbols as aliases",
+                False,
+                help="Point each replaced process symbol at the first new root.",
             )
             replace = st.form_submit_button("Replace")
-        if replace and target:
+        if replace and targets:
             try:
-                parsed_children = parse_subgraph_process_lines(children)
+                parsed_children = parse_subgraph_process_lines(
+                    children,
+                    catalog["role_ids"],
+                )
                 dependency_pairs = parse_dependency_lines(dependencies)
                 root_symbols, _leaf_symbols = infer_subgraph_roots_and_leaves(
                     parsed_children,
@@ -2116,13 +2242,13 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                     {
                         "action": "replace_process_with_subgraph",
                         "project_id": controls["project_id"],
-                        "process_symbol": target,
+                        "process_symbols": targets,
                         "edit_at": controls["as_of"],
                         "processes": parsed_children,
                         "dependencies": parsed_dependencies,
                         "preserve_parent_symbol_as_alias": preserve_alias,
                         "parent_alias_target_symbol": (
-                            (alias_target or inferred_alias_target)
+                            inferred_alias_target
                             if preserve_alias
                             else None
                         ),

@@ -3,6 +3,8 @@ import datetime as dt
 import uuid
 from collections.abc import Mapping
 
+import pytest
+
 from projdash.service.commands import CommandEnvelope, CreateProject
 from projdash.service.queries import QueryEnvelope
 from projdash.service.repository import InMemoryProjectRepository
@@ -645,13 +647,6 @@ def test_direct_process_mutations_reject_cross_project_process_without_writes():
             "project_id": first_project_id,
             "process_id": process_id,
             "status": "in_progress",
-            "edit_at": _iso(14),
-        },
-        {
-            "action": "set_process_due_at",
-            "project_id": first_project_id,
-            "process_id": process_id,
-            "due_at": _iso(20, 17),
             "edit_at": _iso(14),
         },
         {
@@ -2274,6 +2269,11 @@ def test_resource_schedule_query_returns_documented_output_contract():
         "ends_at",
         "dependency_only_starts_at",
         "dependency_only_ends_at",
+        "resource_es_at",
+        "resource_ef_at",
+        "resource_ls_at",
+        "resource_lf_at",
+        "resource_slack_hours",
         "resource_delay_hours",
         "allocation_state",
         "status",
@@ -2685,7 +2685,6 @@ def test_process_graph_query_returns_lifecycle_windows_and_process_only_edges():
         "name",
         "duration_hours",
         "earliest_start_at",
-        "due_at",
         "status",
         "finished_at",
         "computed_status",
@@ -2707,7 +2706,7 @@ def test_process_graph_query_returns_lifecycle_windows_and_process_only_edges():
     assert all("resource_id" not in edge for edge in data["edges"])
 
 
-def test_due_date_history_distinguishes_explicit_project_due_from_derived_due():
+def test_target_history_query_is_removed_from_resource_api_contract():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)
     _handle(
@@ -2719,40 +2718,27 @@ def test_due_date_history_distinguishes_explicit_project_due_from_derived_due():
             "name": "Build API",
             "effective_at": _iso(13),
             "duration_business_days": 1,
-            "due_at": _iso(18, 17),
-        },
-    )
-    _handle(
-        service,
-        {
-            "action": "set_project_due_at",
-            "project_id": project_id,
-            "due_at": _iso(20, 17),
-            "edit_at": _iso(13, 12),
         },
     )
 
-    data = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(21),
-            "include_project_total": True,
-        },
-    ).data
-
-    _assert_no_nested_warnings(data)
-    assert data["current_project_due_at"] == _iso(20, 17)
-    assert data["derived_project_due_at"] == _iso(18, 17)
-    assert data["current_project_due_at"] != data["derived_project_due_at"]
-    assert {event["mutation_action"] for event in data["project_total_events"]} >= {
-        "set_project_due_at",
-        "derived_project_due_at_changed",
-    }
-    for event in data["project_total_events"] + data["process_events"]:
-        assert event["edit_at"].endswith("+00:00")
-        if event["before_due_at"] is not None:
-            assert event["before_due_at"].endswith("+00:00")
-        if event["after_due_at"] is not None:
-            assert event["after_due_at"].endswith("+00:00")
+    with pytest.raises(ValueError):
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "set_project_target_at",
+                    "project_id": project_id,
+                    "target_at": _iso(20, 17),
+                    "edit_at": _iso(13, 12),
+                }
+            }
+        )
+    with pytest.raises(ValueError):
+        QueryEnvelope.model_validate(
+            {
+                "query": {
+                    "action": "query_target_history",
+                    "project_id": project_id,
+                    "as_of": _iso(21),
+                }
+            }
+        )

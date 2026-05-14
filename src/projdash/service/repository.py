@@ -112,7 +112,6 @@ class ProjectRepository(Protocol):
         effective_at: dt.datetime,
         duration_business_days: int,
         dependencies: list[str],
-        due_at: dt.datetime | None,
         earliest_start_at: dt.datetime | None,
         start_at_earliest: bool,
         delay_after_dependencies_business_days: int,
@@ -297,8 +296,6 @@ class InMemoryProjectRepository:
         self.resource_ids_by_project: dict[str, list[str]] = defaultdict(list)
         self.calendars: dict[str, dict[str, Any]] = {}
         self.calendar_ids_by_project: dict[str, list[str]] = defaultdict(list)
-        self.due_history_events: list[dict[str, Any]] = []
-        self.project_due_at: dict[str, dt.datetime | None] = {}
         self.retired_processes: dict[str, dict[str, Any]] = {}
         self.process_aliases: dict[str, dict[str, str]] = defaultdict(dict)
         self.process_alias_sources: dict[str, dict[str, str]] = defaultdict(dict)
@@ -389,14 +386,8 @@ class InMemoryProjectRepository:
         self.resource_ids_by_project.pop(project_id, None)
         self.calendar_ids_by_project.pop(project_id, None)
         self.blocker_ids_by_project.pop(project_id, None)
-        self.project_due_at.pop(project_id, None)
         self.process_aliases.pop(project_id, None)
         self.process_alias_sources.pop(project_id, None)
-        self.due_history_events = [
-            event
-            for event in self.due_history_events
-            if event["project_id"] != project_id
-        ]
         self.dependency_edge_ids = {
             key: edge_id
             for key, edge_id in self.dependency_edge_ids.items()
@@ -484,7 +475,6 @@ class InMemoryProjectRepository:
         effective_at: dt.datetime,
         duration_business_days: int,
         dependencies: list[str],
-        due_at: dt.datetime | None,
         earliest_start_at: dt.datetime | None,
         start_at_earliest: bool,
         delay_after_dependencies_business_days: int,
@@ -534,7 +524,6 @@ class InMemoryProjectRepository:
             description=description,
             duration_business_days=duration_business_days,
             dependencies=dependencies,
-            due_at=due_at,
             earliest_start_at=earliest_start_at,
             start_at_earliest=start_at_earliest,
             delay_after_dependencies_business_days=delay_after_dependencies_business_days,
@@ -547,16 +536,6 @@ class InMemoryProjectRepository:
         for requirement in role_requirements:
             if requirement.requirement_id is not None:
                 self.role_requirements[requirement.requirement_id] = requirement
-        if due_at is not None:
-            self._record_due_history_event(
-                project_id=project_id,
-                process_id=process.process_id,
-                mutation_action="upsert_process_revision",
-                edit_at=effective_at,
-                before_due_at=None,
-                after_due_at=due_at,
-                command_id="initial_revision",
-            )
         return process, revision
 
     def set_process_status(
@@ -1024,7 +1003,6 @@ class InMemoryProjectRepository:
                 and self._enum_value(blocker.severity) == "blocking"
                 and process.status.value not in {"done", "canceled"}
             ]
-            due_at = self.current_process_due_at(process_id, as_of)
             processes.append(
                 ProcessScheduleInput(
                     process_id=process_id,
@@ -1034,7 +1012,6 @@ class InMemoryProjectRepository:
                     duration_business_days=revision.duration_business_days,
                     explicit_status=process.status.value,
                     started_at=process.started_at,
-                    due_at=due_at,
                     earliest_start_at=revision.earliest_start_at,
                     start_at_earliest=revision.start_at_earliest,
                     delay_after_dependencies_business_days=(
@@ -1061,120 +1038,6 @@ class InMemoryProjectRepository:
             update={"default_currency": default_currency},
         )
         self._set_project_resource_currency(project_id, default_currency)
-
-    def set_project_due_at(
-        self,
-        project_id: str,
-        due_at: dt.datetime | None,
-        edit_at: dt.datetime,
-        command_id: str,
-        mutation_action: str,
-    ) -> str:
-        self.get_project(project_id)
-        before_due_at = self.current_project_due_at(project_id, edit_at)
-        self.project_due_at[project_id] = due_at
-        event_id = self._record_due_history_event(
-            project_id=project_id,
-            process_id=None,
-            mutation_action=mutation_action,
-            edit_at=edit_at,
-            before_due_at=before_due_at,
-            after_due_at=due_at,
-            command_id=command_id,
-        )
-        derived_due_at = self.derived_project_due_at(project_id, edit_at, None)
-        if derived_due_at is not None and mutation_action == "set_project_due_at":
-            self._record_due_history_event(
-                project_id=project_id,
-                process_id=None,
-                mutation_action="derived_project_due_at_changed",
-                edit_at=edit_at,
-                before_due_at=None,
-                after_due_at=derived_due_at,
-                command_id=command_id,
-            )
-        return event_id
-
-    def set_process_due_at(
-        self,
-        project_id: str,
-        process_id: str,
-        due_at: dt.datetime | None,
-        edit_at: dt.datetime,
-        command_id: str,
-    ) -> str:
-        self._get_process(project_id, process_id)
-        before_derived = self.derived_project_due_at(project_id, edit_at, None)
-        before_due_at = self.current_process_due_at(process_id, edit_at)
-        event_id = self._record_due_history_event(
-            project_id=project_id,
-            process_id=process_id,
-            mutation_action="set_process_due_at",
-            edit_at=edit_at,
-            before_due_at=before_due_at,
-            after_due_at=due_at,
-            command_id=command_id,
-        )
-        after_derived = self.derived_project_due_at(project_id, edit_at, None)
-        if before_derived != after_derived:
-            self._record_due_history_event(
-                project_id=project_id,
-                process_id=None,
-                mutation_action="derived_project_due_at_changed",
-                edit_at=edit_at,
-                before_due_at=before_derived,
-                after_due_at=after_derived,
-                command_id=command_id,
-            )
-        return event_id
-
-    def current_project_due_at(
-        self,
-        project_id: str,
-        as_of: dt.datetime,
-    ) -> dt.datetime | None:
-        self.get_project(project_id)
-        current = None
-        for event in self.due_history_events:
-            if (
-                event["project_id"] == project_id
-                and event["process_id"] is None
-                and event["mutation_action"]
-                in {"set_project_due_at", "clear_project_due_at"}
-                and event["edit_at"] <= as_of
-            ):
-                current = event["after_due_at"]
-        return current
-
-    def current_process_due_at(
-        self,
-        process_id: str,
-        as_of: dt.datetime,
-    ) -> dt.datetime | None:
-        current = None
-        revision = self._latest_revision_as_of(process_id, as_of)
-        if revision is not None:
-            current = revision.due_at
-        for event in self.due_history_events:
-            if (
-                event["process_id"] == process_id
-                and event["mutation_action"] == "set_process_due_at"
-                and event["edit_at"] <= as_of
-            ):
-                current = event["after_due_at"]
-        return current
-
-    def due_history_as_of(
-        self,
-        project_id: str,
-        as_of: dt.datetime,
-    ) -> list[dict[str, Any]]:
-        self.get_project(project_id)
-        return [
-            copy.deepcopy(event)
-            for event in self.due_history_events
-            if event["project_id"] == project_id and event["edit_at"] <= as_of
-        ]
 
     def list_blockers_as_of(
         self,
@@ -1216,22 +1079,6 @@ class InMemoryProjectRepository:
     ) -> ProcessRevisionRecord | None:
         self._get_process(project_id, process_id)
         return self._latest_revision_as_of(process_id, as_of)
-
-    def derived_project_due_at(
-        self,
-        project_id: str,
-        as_of: dt.datetime,
-        process_ids: set[str] | None,
-    ) -> dt.datetime | None:
-        due_values = []
-        selected_ids = process_ids or set(self.active_process_ids_as_of(project_id, as_of))
-        for process_id in selected_ids:
-            if not self._is_process_active_as_of(process_id, as_of):
-                continue
-            due_at = self.current_process_due_at(process_id, as_of)
-            if due_at is not None:
-                due_values.append(due_at)
-        return max(due_values, default=None)
 
     def record_schedule_snapshot(
         self,
@@ -1324,7 +1171,7 @@ class InMemoryProjectRepository:
     def replace_process_with_subgraph(
         self,
         project_id: str,
-        process_id: str,
+        process_ids: list[str],
         edit_at: dt.datetime,
         processes: list[Any],
         dependencies: list[Any],
@@ -1334,7 +1181,21 @@ class InMemoryProjectRepository:
         preserve_parent_symbol_as_alias: bool = True,
         parent_alias_target_symbol: str | None = None,
     ) -> dict[str, Any]:
-        parent = self._get_process(project_id, process_id)
+        ordered_process_ids = list(dict.fromkeys(process_ids))
+        selected_process_ids = set(ordered_process_ids)
+        active_graph = self._active_dependency_graph(project_id, edit_at)
+        if not selected_process_ids:
+            self._raise_validation(
+                ["command", "process_symbols"],
+                "At least one process is required.",
+                "empty_process_selection",
+            )
+        if not selected_process_ids.issubset(set(active_graph.nodes)):
+            self._raise_validation(
+                ["command", "process_symbols"],
+                "All selected processes must be active.",
+                "process_reference",
+            )
         root_symbols = list(root_symbols or [])
         leaf_symbols = list(leaf_symbols or [])
         child_symbols = [child.process_symbol for child in processes]
@@ -1440,7 +1301,11 @@ class InMemoryProjectRepository:
         else:
             leaf_symbols = inferred_leaf_symbols
         child_ids: dict[str, str] = {}
-        incoming, outgoing = self._external_edges(project_id, edit_at, {process_id})
+        incoming, outgoing = self._external_edges(
+            project_id,
+            edit_at,
+            selected_process_ids,
+        )
         for child in processes:
             duration_days = math.ceil(float(child.duration_hours) / 8)
             process, _revision = self.upsert_process_revision(
@@ -1451,7 +1316,6 @@ class InMemoryProjectRepository:
                 effective_at=edit_at,
                 duration_business_days=duration_days,
                 dependencies=[],
-                due_at=child.due_at,
                 earliest_start_at=child.earliest_start_at,
                 start_at_earliest=False,
                 delay_after_dependencies_business_days=0,
@@ -1499,7 +1363,7 @@ class InMemoryProjectRepository:
             if revision is None:
                 continue
             dependencies_for_successor = [
-                dep for dep in revision.dependencies if dep != process_id
+                dep for dep in revision.dependencies if dep not in selected_process_ids
             ]
             dependencies_for_successor.extend(child_ids[symbol] for symbol in leaf_symbols)
             self.revisions_by_process[successor_id].append(
@@ -1519,36 +1383,52 @@ class InMemoryProjectRepository:
                         successor_id,
                     )
                 )
-        retired_edge_ids = [
-            self._dependency_edge_id(project_id, predecessor_id, process_id)
-            for predecessor_id in incoming
-        ] + [
-            self._dependency_edge_id(project_id, process_id, successor_id)
-            for successor_id in outgoing
+        retired_edge_ids = []
+        for predecessor_id, successor_id in active_graph.edges:
+            if (
+                predecessor_id in selected_process_ids
+                or successor_id in selected_process_ids
+            ):
+                retired_edge_ids.append(
+                    self._dependency_edge_id(project_id, predecessor_id, successor_id)
+                )
+        retirement_event_ids = [
+            self._retire_process(
+                process_id,
+                edit_at,
+                command_id,
+                "replace_process_with_subgraph",
+                list(child_ids.values()),
+            )
+            for process_id in ordered_process_ids
         ]
-        retirement_event_id = self._retire_process(
-            process_id,
-            edit_at,
-            command_id,
-            "replace_process_with_subgraph",
-            list(child_ids.values()),
-        )
         alias_process_id = None
         if preserve_parent_symbol_as_alias:
             target_symbol = parent_alias_target_symbol or processes[0].process_symbol
             alias_process_id = child_ids[target_symbol]
-            self.process_aliases[project_id][parent.symbol] = alias_process_id
-            self.process_alias_sources[project_id][parent.symbol] = "retirement"
-            for alias, target_id in list(self.process_aliases[project_id].items()):
-                if target_id == process_id and (
-                    self.process_alias_sources[project_id].get(alias) == "rename"
-                ):
-                    self.process_aliases[project_id][alias] = alias_process_id
-                    self.process_alias_sources[project_id][alias] = "retirement"
+            for process_id in ordered_process_ids:
+                retired_process = self.processes[process_id]
+                self.process_aliases[project_id][retired_process.symbol] = (
+                    alias_process_id
+                )
+                self.process_alias_sources[project_id][retired_process.symbol] = (
+                    "retirement"
+                )
+                for alias, target_id in list(self.process_aliases[project_id].items()):
+                    if target_id == process_id and (
+                        self.process_alias_sources[project_id].get(alias) == "rename"
+                    ):
+                        self.process_aliases[project_id][alias] = alias_process_id
+                        self.process_alias_sources[project_id][alias] = "retirement"
+        self._validate_active_dependency_graph_acyclic(
+            project_id,
+            edit_at,
+            "process_symbols",
+        )
         return {
             "process_ids": list(child_ids.values()),
-            "retired_process_ids": [process_id],
-            "retirement_event_ids": [retirement_event_id],
+            "retired_process_ids": ordered_process_ids,
+            "retirement_event_ids": retirement_event_ids,
             "edge_ids": list(dict.fromkeys(edge_ids)),
             "retired_edge_ids": list(dict.fromkeys(retired_edge_ids)),
             **({"alias_process_id": alias_process_id} if alias_process_id else {}),
@@ -1666,7 +1546,6 @@ class InMemoryProjectRepository:
             effective_at=edit_at,
             duration_business_days=duration_days,
             dependencies=sorted(incoming),
-            due_at=new_process.due_at,
             earliest_start_at=new_process.earliest_start_at,
             start_at_earliest=False,
             delay_after_dependencies_business_days=0,
@@ -1732,6 +1611,11 @@ class InMemoryProjectRepository:
             )
             for process_id in ordered_process_ids
         ]
+        self._validate_active_dependency_graph_acyclic(
+            project_id,
+            edit_at,
+            "process_symbols",
+        )
         return {
             "process_id": replacement.process_id,
             "retired_process_ids": ordered_process_ids,
@@ -1800,41 +1684,11 @@ class InMemoryProjectRepository:
         self.resource_ids_by_project = other.resource_ids_by_project
         self.calendars = other.calendars
         self.calendar_ids_by_project = other.calendar_ids_by_project
-        self.due_history_events = other.due_history_events
-        self.project_due_at = other.project_due_at
         self.retired_processes = other.retired_processes
         self.process_aliases = other.process_aliases
         self.process_alias_sources = other.process_alias_sources
         self.dependency_edge_ids = other.dependency_edge_ids
         self.schedule_snapshots = other.schedule_snapshots
-
-    def _record_due_history_event(
-        self,
-        *,
-        project_id: str,
-        process_id: str | None,
-        mutation_action: str,
-        edit_at: dt.datetime,
-        before_due_at: dt.datetime | None,
-        after_due_at: dt.datetime | None,
-        command_id: str,
-    ) -> str:
-        event_id = (
-            f"due-{mutation_action}-{len(self.due_history_events) + 1}"
-        )
-        self.due_history_events.append(
-            {
-                "event_id": event_id,
-                "project_id": project_id,
-                "process_id": process_id,
-                "mutation_action": mutation_action,
-                "edit_at": edit_at,
-                "before_due_at": before_due_at,
-                "after_due_at": after_due_at,
-                "command_id": command_id,
-            }
-        )
-        return event_id
 
     def _is_process_active_as_of(
         self,
@@ -2501,3 +2355,23 @@ class InMemoryProjectRepository:
                 field_path="dependencies",
                 entity_id=candidate.process_id,
             )
+
+    def _validate_active_dependency_graph_acyclic(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        field_path: str,
+    ) -> None:
+        graph = self._active_dependency_graph(project_id, as_of)
+        if nx.is_directed_acyclic_graph(graph):
+            return
+        cycle = [
+            {"predecessor_process_id": predecessor, "successor_process_id": successor}
+            for predecessor, successor in nx.find_cycle(graph)
+        ]
+        raise ServiceValidationError(
+            code="dependency_cycle",
+            message="Graph rewrite would create a dependency cycle.",
+            field_path=field_path,
+            details={"cycle": cycle},
+        )

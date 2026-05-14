@@ -399,8 +399,13 @@ class ResourceAwareFields(StrictModel):
     ready_at: AwareDatetime | None = None
     starts_at: AwareDatetime | None = None
     ends_at: AwareDatetime | None = None
+    es_at: AwareDatetime | None = None
+    ef_at: AwareDatetime | None = None
+    ls_at: AwareDatetime | None = None
+    lf_at: AwareDatetime | None = None
     resource_delay_hours: float = 0
     slack_hours: float | None = None
+    criticality_label: str = "non_critical"
     allocation_state: AllocationState
 
 
@@ -414,7 +419,6 @@ class ProcessGraphNode(StrictModel):
     description: str = ""
     duration_hours: float = Field(ge=0)
     earliest_start_at: AwareDatetime | None = None
-    due_at: AwareDatetime | None = None
     status: ProcessStatus
     started_at: AwareDatetime | None = None
     finished_at: AwareDatetime | None = None
@@ -455,20 +459,6 @@ class Blocker(StrictModel):
     is_blocking_as_of: bool | None = None
 
 
-class DueDateHistoryEvent(StrictModel):
-    """Due-date history event projection."""
-
-    event_id: str
-    project_id: str
-    process_id: str | None = None
-    process_symbol: str | None = None
-    mutation_action: str
-    edit_at: AwareDatetime
-    before_due_at: AwareDatetime | None = None
-    after_due_at: AwareDatetime | None = None
-    command_id: str
-
-
 class AllocationSlice(StrictModel):
     """Computed resource allocation slice."""
 
@@ -504,6 +494,11 @@ class ResourceScheduleRow(StrictModel):
     ends_at: AwareDatetime | None = None
     dependency_only_starts_at: AwareDatetime
     dependency_only_ends_at: AwareDatetime
+    resource_es_at: AwareDatetime | None = None
+    resource_ef_at: AwareDatetime | None = None
+    resource_ls_at: AwareDatetime | None = None
+    resource_lf_at: AwareDatetime | None = None
+    resource_slack_hours: float | None = None
     resource_delay_hours: float = 0
     allocation_state: AllocationState
     status: ProcessStatus
@@ -689,7 +684,6 @@ class ScheduleSnapshotRecord(StrictModel):
     terminal_process_symbols: list[str] = Field(default_factory=list)
     schedule_basis: ScheduleBasis = ScheduleBasis.RESOURCE_AWARE
     completion_at: AwareDatetime | None = None
-    derived_due_at: AwareDatetime | None = None
     horizon_starts_at: AwareDatetime
     horizon_ends_at: AwareDatetime
     converged: bool | None = None
@@ -702,7 +696,6 @@ class ScheduleSnapshotRecord(StrictModel):
             for field in (
                 "committed_at",
                 "completion_at",
-                "derived_due_at",
                 "horizon_starts_at",
                 "horizon_ends_at",
             ):
@@ -722,7 +715,6 @@ class ProcessRevisionRecord(StrictModel):
     description: str = ""
     duration_business_days: int = Field(ge=0)
     dependencies: list[str] = Field(default_factory=list)
-    due_at: AwareDatetime | None = None
     earliest_start_at: AwareDatetime | None = None
     start_at_earliest: bool = False
     delay_after_dependencies_business_days: int = Field(default=0, ge=0)

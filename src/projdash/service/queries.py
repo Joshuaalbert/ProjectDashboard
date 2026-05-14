@@ -152,30 +152,6 @@ class QueryBlockers(QueryModel):
         return validate_unique_non_empty(value, "process filter")
 
 
-class QueryDueDateHistory(QueryModel):
-    """Fetch due-date history."""
-
-    action: Literal["query_due_date_history"] = "query_due_date_history"
-    project_id: str = Field(min_length=1)
-    as_of: AwareDatetime
-    scope: Scope | None = None
-    target_process_id: str | None = Field(default=None, min_length=1)
-    target_process_symbol: str | None = Field(default=None, min_length=1)
-    include_project_total: bool = True
-
-    @model_validator(mode="after")
-    def _validate_target_aliases(self) -> QueryDueDateHistory:
-        legacy_target_count = sum(
-            value is not None
-            for value in (self.target_process_id, self.target_process_symbol)
-        )
-        if self.scope is not None and legacy_target_count:
-            raise ValueError("target_process_* aliases are mutually exclusive with scope.")
-        if legacy_target_count > 1:
-            raise ValueError("Only one target_process_* alias may be supplied.")
-        return self
-
-
 class QueryScheduleSnapshots(QueryModel):
     """Fetch committed schedule snapshots for slippage history."""
 
@@ -307,7 +283,6 @@ Query = Annotated[
     | QueryCriticalPath
     | QueryProcessGraph
     | QueryBlockers
-    | QueryDueDateHistory
     | QueryScheduleSnapshots
     | QueryResourceSchedule
     | QueryUtilization
@@ -331,7 +306,6 @@ __all__ = [
     "QueryBlockers",
     "QueryCosts",
     "QueryCriticalPath",
-    "QueryDueDateHistory",
     "QueryScheduleSnapshots",
     "QueryEnvelope",
     "QueryProcessGraph",

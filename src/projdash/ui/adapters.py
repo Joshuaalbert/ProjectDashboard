@@ -36,7 +36,6 @@ def process_table_rows(graph_data: dict[str, Any]) -> list[dict[str, Any]]:
                 "status": node.get("status"),
                 "computed": node.get("computed_status"),
                 "duration_hours": node.get("duration_hours"),
-                "due_at": node.get("due_at"),
                 "started_at": node.get("started_at"),
                 "dep_start": dependency.get("es_at"),
                 "dep_finish": dependency.get("ef_at"),
@@ -285,6 +284,10 @@ def auto_horizon_from_graph(
             continue
         dependency = node.get("dependency_only") or {}
         resource = node.get("resource_aware") or {}
+        for key in ("ls_at",):
+            candidates.append(_parse_datetime(resource.get(key)))
+        for key in ("lf_at",):
+            finish_candidates.append(_parse_datetime(resource.get(key)))
         for key in ("es_at", "ls_at"):
             candidates.append(_parse_datetime(dependency.get(key)))
         for key in ("ready_at", "starts_at"):
@@ -293,7 +296,7 @@ def auto_horizon_from_graph(
             finish_candidates.append(_parse_datetime(dependency.get(key)))
         for key in ("ends_at",):
             finish_candidates.append(_parse_datetime(resource.get(key)))
-        for key in ("due_at", "finished_at", "earliest_start_at"):
+        for key in ("finished_at", "earliest_start_at"):
             value = _parse_datetime(node.get(key))
             candidates.append(value)
             finish_candidates.append(value)
@@ -327,19 +330,36 @@ def gantt_rows(
             continue
         dependency = node.get("dependency_only") or {}
         resource = node.get("resource_aware") or {}
+        es_at = _parse_datetime(resource.get("es_at") or resource.get("starts_at"))
+        ef_at = _parse_datetime(resource.get("ef_at") or resource.get("ends_at"))
+        ls_at = _parse_datetime(resource.get("ls_at"))
+        lf_at = _parse_datetime(resource.get("lf_at"))
+        if es_at is None:
+            es_at = _parse_datetime(dependency.get("es_at"))
+        if ef_at is None:
+            ef_at = _parse_datetime(dependency.get("ef_at"))
+        if ls_at is None:
+            ls_at = _parse_datetime(dependency.get("ls_at"))
+        if lf_at is None:
+            lf_at = _parse_datetime(dependency.get("lf_at"))
         rows.append(
             {
                 "process_id": node.get("process_id"),
                 "symbol": symbol,
                 "name": node.get("name"),
-                "es_at": _parse_datetime(dependency.get("es_at")),
-                "ef_at": _parse_datetime(dependency.get("ef_at")),
-                "ls_at": _parse_datetime(dependency.get("ls_at")),
-                "lf_at": _parse_datetime(dependency.get("lf_at")),
+                "es_at": es_at,
+                "ef_at": ef_at,
+                "ls_at": ls_at,
+                "lf_at": lf_at,
                 "resource_starts_at": _parse_datetime(resource.get("starts_at")),
                 "resource_ends_at": _parse_datetime(resource.get("ends_at")),
-                "slack_hours": dependency.get("slack_hours"),
+                "slack_hours": (
+                    resource.get("slack_hours")
+                    if resource.get("slack_hours") is not None
+                    else dependency.get("slack_hours")
+                ),
                 "critical": node.get("process_id") in critical_ids
+                or resource.get("criticality_label") == "critical"
                 or dependency.get("criticality_label") == "critical",
                 "allocation_state": resource.get("allocation_state"),
             }
@@ -442,6 +462,130 @@ def role_utilization_heatmap(
             row.append(value)
         matrix.append(row)
     return labels, times, matrix
+
+
+def aggregate_process_properties(
+    graph_data: dict[str, Any],
+    process_symbols: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    """Aggregate editable properties for a selected process set."""
+    selected = {symbol for symbol in process_symbols if symbol}
+    nodes = [
+        node
+        for node in graph_data.get("nodes", [])
+        if node.get("process_symbol") in selected
+    ]
+    role_efforts: dict[str, float] = {}
+    blocker_ids: set[str] = set()
+    statuses = set()
+    started_values = set()
+    finished_values = set()
+    earliest_values = set()
+    for node in nodes:
+        statuses.add(node.get("status"))
+        started_values.add(node.get("started_at"))
+        finished_values.add(node.get("finished_at"))
+        earliest_values.add(node.get("earliest_start_at"))
+        blocker_summary = node.get("blocker_summary") or {}
+        blocker_ids.update(blocker_summary.get("blocker_ids") or [])
+        for requirement in node.get("role_requirements") or []:
+            role_id = requirement.get("role_id")
+            if not role_id:
+                continue
+            role_efforts[role_id] = role_efforts.get(role_id, 0.0) + float(
+                requirement.get("effort_hours") or 0.0
+            )
+
+    predecessors = set()
+    children = set()
+    for edge in graph_data.get("edges", []):
+        predecessor = edge.get("predecessor_process_symbol")
+        successor = edge.get("successor_process_symbol")
+        if successor in selected and predecessor and predecessor not in selected:
+            predecessors.add(predecessor)
+        if predecessor in selected and successor and successor not in selected:
+            children.add(successor)
+
+    return {
+        "process_symbols": [symbol for symbol in process_symbols if symbol in selected],
+        "predecessors": sorted(predecessors),
+        "children": sorted(children),
+        "role_efforts": dict(sorted(role_efforts.items())),
+        "status": statuses.pop() if len(statuses) == 1 else "",
+        "name": nodes[0].get("name") if len(nodes) == 1 else "",
+        "description": nodes[0].get("description") if len(nodes) == 1 else "",
+        "earliest_start_at": earliest_values.pop() if len(earliest_values) == 1 else None,
+        "started_at": started_values.pop() if len(started_values) == 1 else None,
+        "finished_at": finished_values.pop() if len(finished_values) == 1 else None,
+        "blocker_ids": sorted(blocker_ids),
+    }
+
+
+def role_priority_rows(
+    graph_data: dict[str, Any],
+    now: dt.datetime,
+    *,
+    terminal_symbols: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Return role-scoped process priorities from ES/LS/LF schedule windows."""
+    rows = []
+    for node, priority in _priority_nodes(graph_data, now, terminal_symbols):
+        for requirement in node.get("role_requirements") or []:
+            role_id = requirement.get("role_id")
+            if not role_id:
+                continue
+            rows.append(
+                {
+                    **priority,
+                    "role_id": role_id,
+                    "effort_hours": float(requirement.get("effort_hours") or 0.0),
+                }
+            )
+    return _sort_priority_rows(rows)
+
+
+def resource_priority_rows(
+    graph_data: dict[str, Any],
+    schedule_data: dict[str, Any],
+    now: dt.datetime,
+    *,
+    terminal_symbols: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Return resource-scoped priorities when allocation slices assign work."""
+    priority_by_process = {
+        node.get("process_id"): priority
+        for node, priority in _priority_nodes(graph_data, now, terminal_symbols)
+    }
+    assignments: dict[tuple[str, str], dict[str, Any]] = {}
+    for slice_data in schedule_data.get("allocation_slices", []):
+        process_id = slice_data.get("process_id")
+        resource_id = slice_data.get("resource_id")
+        if process_id not in priority_by_process or not resource_id:
+            continue
+        key = (resource_id, process_id)
+        assignment = assignments.setdefault(
+            key,
+            {
+                **priority_by_process[process_id],
+                "resource_id": resource_id,
+                "allocated_hours": 0.0,
+                "role_ids": set(),
+            },
+        )
+        assignment["allocated_hours"] += float(slice_data.get("effort_hours") or 0.0)
+        role_id = slice_data.get("role_id")
+        if role_id:
+            assignment["role_ids"].add(role_id)
+
+    rows = []
+    for assignment in assignments.values():
+        rows.append(
+            {
+                **assignment,
+                "role_ids": ", ".join(sorted(assignment["role_ids"])),
+            }
+        )
+    return _sort_priority_rows(rows)
 
 
 def build_process_graph_dot(
@@ -593,3 +737,71 @@ def _overlap_hours(
     if earliest_end <= latest_start:
         return 0.0
     return (earliest_end - latest_start).total_seconds() / 3600
+
+
+def _priority_nodes(
+    graph_data: dict[str, Any],
+    now: dt.datetime,
+    terminal_symbols: list[str] | tuple[str, ...] | None,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    scoped_symbols = set(ancestor_scope_symbols(graph_data, terminal_symbols or ()))
+    rows = []
+    for node in graph_data.get("nodes", []):
+        symbol = node.get("process_symbol")
+        if scoped_symbols and symbol not in scoped_symbols:
+            continue
+        if node.get("status") in {"done", "canceled"}:
+            continue
+        dependency = node.get("dependency_only") or {}
+        resource = node.get("resource_aware") or {}
+        es_at = _parse_datetime(resource.get("es_at") or resource.get("starts_at"))
+        ls_at = _parse_datetime(resource.get("ls_at"))
+        lf_at = _parse_datetime(resource.get("lf_at"))
+        if es_at is None:
+            es_at = _parse_datetime(dependency.get("es_at"))
+        if ls_at is None:
+            ls_at = _parse_datetime(dependency.get("ls_at"))
+        if lf_at is None:
+            lf_at = _parse_datetime(dependency.get("lf_at"))
+        if es_at is None or ls_at is None or lf_at is None:
+            continue
+        if now >= lf_at:
+            priority = "P0"
+            priority_rank = 0
+        elif now >= ls_at:
+            priority = "P1"
+            priority_rank = 1
+        elif now >= es_at:
+            priority = "P2"
+            priority_rank = 2
+        else:
+            priority = "P3"
+            priority_rank = 3
+        rows.append(
+            (
+                node,
+                {
+                    "priority": priority,
+                    "priority_rank": priority_rank,
+                    "process_symbol": symbol,
+                    "process_name": node.get("name"),
+                    "es_at": es_at,
+                    "ls_at": ls_at,
+                    "lf_at": lf_at,
+                    "hours_until_lf": (lf_at - now).total_seconds() / 3600,
+                },
+            )
+        )
+    return rows
+
+
+def _sort_priority_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["priority_rank"],
+            row["hours_until_lf"],
+            str(row.get("role_id") or row.get("resource_id") or ""),
+            str(row.get("process_symbol") or ""),
+        ),
+    )

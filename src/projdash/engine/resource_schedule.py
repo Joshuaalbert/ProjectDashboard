@@ -205,6 +205,12 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     )
     output_slices = all_slices if include_slices else []
     processes_out = list(final_iteration["processes"])
+    _attach_resource_schedule_windows(
+        rows=processes_out,
+        processes=processes,
+        dependencies=dependencies,
+        topo_order=topo_order,
+    )
     critical_path = _resource_critical_path(
         processes=processes_out,
         dependencies=dependencies,
@@ -2160,6 +2166,68 @@ def _resource_critical_path(
         _, current = sorted(candidates)[0]
         path.append(current)
     return list(reversed(path))
+
+
+def _attach_resource_schedule_windows(
+    *,
+    rows: list[dict[str, object]],
+    processes: list[Mapping[str, object]],
+    dependencies: dict[str, tuple[str, ...]],
+    topo_order: tuple[str, ...],
+) -> None:
+    """Attach process-level resource-aware ES/EF/LS/LF windows to rows."""
+    row_by_id = {str(row["process_id"]): row for row in rows}
+    process_by_id = {str(process["process_id"]): process for process in processes}
+    complete_ids = [
+        process_id
+        for process_id, row in row_by_id.items()
+        if row.get("starts_at") is not None and row.get("ends_at") is not None
+    ]
+    for row in rows:
+        row["resource_es_at"] = row.get("starts_at")
+        row["resource_ef_at"] = row.get("ends_at")
+        row["resource_ls_at"] = None
+        row["resource_lf_at"] = None
+        row["resource_slack_hours"] = None
+    if not complete_ids:
+        return
+
+    successors: dict[str, list[str]] = {process_id: [] for process_id in row_by_id}
+    for successor_id, predecessor_ids in dependencies.items():
+        if successor_id not in row_by_id:
+            continue
+        for predecessor_id in predecessor_ids:
+            if predecessor_id in row_by_id:
+                successors.setdefault(predecessor_id, []).append(successor_id)
+
+    completion_at = max(_as_utc(row_by_id[process_id]["ends_at"]) for process_id in complete_ids)
+    latest_start: dict[str, dt.datetime] = {}
+    for process_id in reversed(topo_order):
+        row = row_by_id.get(process_id)
+        if row is None or process_id not in complete_ids:
+            continue
+        starts_at = _as_utc(row["starts_at"])
+        ends_at = _as_utc(row["ends_at"])
+        duration = max(ends_at - starts_at, dt.timedelta())
+        process = process_by_id.get(process_id, {})
+        if process.get("started_at") is not None:
+            ls_at = _as_utc(process["started_at"])
+            lf_at = ls_at + duration
+        else:
+            successor_starts = [
+                latest_start[successor_id]
+                for successor_id in successors.get(process_id, ())
+                if successor_id in latest_start
+            ]
+            lf_at = min(successor_starts, default=completion_at)
+            ls_at = lf_at - duration
+        latest_start[process_id] = ls_at
+        row["resource_ls_at"] = ls_at
+        row["resource_lf_at"] = lf_at
+        row["resource_slack_hours"] = round(
+            (ls_at - starts_at).total_seconds() / 3600,
+            6,
+        )
 
 
 def _rows_by_process(state: Mapping[str, object]) -> dict[str, dict[str, object]]:

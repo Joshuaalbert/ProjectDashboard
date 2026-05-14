@@ -20,10 +20,8 @@ class ComputedScheduleStatus(str, Enum):
     """Computed project-management state derived from schedule facts."""
 
     ON_TRACK = "on_track"
-    AT_RISK = "at_risk"
     LATE = "late"
     BLOCKED = "blocked"
-    DUE_ELAPSED_UNVERIFIED = "due_elapsed_unverified"
     VALIDATED_DONE = "validated_done"
 
 
@@ -47,7 +45,6 @@ class ProcessScheduleInput:
     duration_business_days: int
     explicit_status: str
     started_at: dt.datetime | None = None
-    due_at: dt.datetime | None = None
     earliest_start_at: dt.datetime | None = None
     start_at_earliest: bool = False
     delay_after_dependencies_business_days: int = 0
@@ -70,7 +67,6 @@ class ScheduleRow:
     latest_finish_at: dt.datetime
     total_float_business_days: int
     is_critical: bool
-    due_at: dt.datetime | None
 
     def to_json_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dictionary for agents and UI adapters."""
@@ -86,7 +82,6 @@ class ScheduleRow:
             "latest_finish_at": self.latest_finish_at.isoformat(),
             "total_float_business_days": self.total_float_business_days,
             "is_critical": self.is_critical,
-            "due_at": self.due_at.isoformat() if self.due_at else None,
         }
 
 
@@ -223,7 +218,6 @@ def compute_schedule(
                 latest_finish_at=latest_finish[process_id],
                 total_float_business_days=total_float[process_id],
                 is_critical=total_float[process_id] == 0,
-                due_at=process.due_at,
             )
         )
 
@@ -246,10 +240,6 @@ def _compute_status(
         return ComputedScheduleStatus.VALIDATED_DONE
     if process.explicit_status == "blocked" or process.unresolved_blocker_count > 0:
         return ComputedScheduleStatus.BLOCKED
-    if process.due_at is not None and process.due_at < now:
-        return ComputedScheduleStatus.DUE_ELAPSED_UNVERIFIED
     if latest_start_at < now:
         return ComputedScheduleStatus.LATE
-    if process.due_at is not None and latest_finish_at > process.due_at:
-        return ComputedScheduleStatus.AT_RISK
     return ComputedScheduleStatus.ON_TRACK

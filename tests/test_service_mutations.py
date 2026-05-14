@@ -3,6 +3,7 @@ import datetime as dt
 from collections.abc import Mapping
 
 import pytest
+from pydantic import ValidationError
 
 from projdash.service.commands import BatchCommandEnvelope, CommandEnvelope
 from projdash.service.queries import QueryEnvelope
@@ -79,19 +80,18 @@ def _create_process(
     *,
     name: str,
     dependencies: list[str] | None = None,
-    due_at: str | None = None,
 ) -> str:
-    command: dict[str, object] = {
-        "action": "upsert_process_revision",
-        "project_id": project_id,
-        "name": name,
-        "effective_at": _iso(13),
-        "duration_business_days": 1,
-        "dependencies": dependencies or [],
-    }
-    if due_at is not None:
-        command["due_at"] = due_at
-    return _handle(service, command).entity_ids["process_id"]
+    return _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "name": name,
+            "effective_at": _iso(13),
+            "duration_business_days": 1,
+            "dependencies": dependencies or [],
+        },
+    ).entity_ids["process_id"]
 
 
 def _create_legacy_process(
@@ -359,225 +359,58 @@ def test_failed_first_time_upsert_process_revision_is_atomic_and_replayable():
     )
 
 
-def test_project_due_history_distinguishes_explicit_and_derived_totals():
+def test_target_datetime_commands_queries_and_fields_are_not_part_of_contract():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)
     process_id = _create_process(service, project_id, name="Build API")
 
-    set_project_due = _handle(
-        service,
+    target_commands = [
         {
-            "action": "set_project_due_at",
+            "action": "set_project_target_at",
             "project_id": project_id,
-            "due_at": _iso(30, 17),
+            "target_at": _iso(30, 17),
             "edit_at": _iso(13, 10),
         },
-        command_id="00000000-0000-4000-8000-000000000101",
-    )
-    _handle(
-        service,
         {
-            "action": "set_process_due_at",
-            "project_id": project_id,
-            "process_id": process_id,
-            "due_at": _iso(24, 17),
-            "edit_at": _iso(13, 11),
-        },
-    )
-    clear_project_due = _handle(
-        service,
-        {
-            "action": "clear_project_due_at",
+            "action": "clear_project_target_at",
             "project_id": project_id,
             "edit_at": _iso(14, 10),
         },
-    )
-
-    history = _query(
-        service,
         {
-            "action": "query_due_date_history",
+            "action": "set_process_target_at",
             "project_id": project_id,
-            "as_of": _iso(14, 12),
-            "include_project_total": True,
+            "process_id": process_id,
+            "target_at": _iso(24, 17),
+            "edit_at": _iso(13, 11),
         },
-    ).data
-
-    assert set_project_due.entity_ids["due_history_event_id"]
-    assert clear_project_due.entity_ids["due_history_event_id"]
-    assert history["current_project_due_at"] is None
-    assert history["derived_project_due_at"] == _iso(24, 17)
-    assert [
-        event["mutation_action"] for event in history["project_total_events"]
-    ] == [
-        "set_project_due_at",
-        "derived_project_due_at_changed",
-        "clear_project_due_at",
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": process_id,
+            "name": "Build API",
+            "effective_at": _iso(14, 9),
+            "duration_business_days": 1,
+            "dependencies": [],
+            "target_at": _iso(24, 17),
+        },
     ]
-    assert history["project_total_events"][0]["before_due_at"] is None
-    assert history["project_total_events"][0]["after_due_at"] == _iso(30, 17)
-    assert history["project_total_events"][2]["after_due_at"] is None
-    assert all(
-        dt.datetime.fromisoformat(event["edit_at"]).tzinfo is not None
-        for event in history["project_total_events"]
-    )
 
+    for command in target_commands:
+        with pytest.raises(ValidationError):
+            CommandEnvelope.model_validate({"command": command})
+    with pytest.raises(ValidationError):
+        QueryEnvelope.model_validate(
+            {
+                "query": {
+                    "action": "query_target_history",
+                    "project_id": project_id,
+                    "as_of": _iso(13),
+                }
+            }
+        )
 
-def test_set_project_due_at_exact_command_replay_reuses_result_without_duplicate_events():
-    service = ProjectService(InMemoryProjectRepository())
-    project_id = _create_project(service)
-    command = {
-        "action": "set_project_due_at",
-        "project_id": project_id,
-        "due_at": _iso(30, 17),
-        "edit_at": _iso(13, 10),
-    }
-
-    first = _handle(
-        service,
-        command,
-        command_id="00000000-0000-4000-8000-000000000701",
-    )
-    history_after_first = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(13, 11),
-            "include_project_total": True,
-        },
-    ).data
-    replay = _handle(
-        service,
-        command,
-        command_id="00000000-0000-4000-8000-000000000701",
-    )
-    history_after_replay = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(13, 11),
-            "include_project_total": True,
-        },
-    ).data
-
-    assert replay.command_id == first.command_id
-    assert replay.entity_ids == first.entity_ids
-    assert history_after_replay == history_after_first
-    assert [
-        event["mutation_action"]
-        for event in history_after_replay["project_total_events"]
-    ] == ["set_project_due_at"]
-
-
-def test_clear_project_due_at_exact_command_replay_reuses_result_without_duplicate_events():
-    service = ProjectService(InMemoryProjectRepository())
-    project_id = _create_project(service)
-    _handle(
-        service,
-        {
-            "action": "set_project_due_at",
-            "project_id": project_id,
-            "due_at": _iso(30, 17),
-            "edit_at": _iso(13, 10),
-        },
-    )
-    command = {
-        "action": "clear_project_due_at",
-        "project_id": project_id,
-        "edit_at": _iso(14, 10),
-    }
-
-    first = _handle(
-        service,
-        command,
-        command_id="00000000-0000-4000-8000-000000000702",
-    )
-    history_after_first = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(14, 11),
-            "include_project_total": True,
-        },
-    ).data
-    replay = _handle(
-        service,
-        command,
-        command_id="00000000-0000-4000-8000-000000000702",
-    )
-    history_after_replay = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(14, 11),
-            "include_project_total": True,
-        },
-    ).data
-
-    assert replay.command_id == first.command_id
-    assert replay.entity_ids == first.entity_ids
-    assert history_after_replay == history_after_first
-    assert [
-        event["mutation_action"]
-        for event in history_after_replay["project_total_events"]
-    ] == ["set_project_due_at", "clear_project_due_at"]
-
-
-def test_set_process_due_at_exact_command_replay_reuses_result_without_duplicate_events():
-    service = ProjectService(InMemoryProjectRepository())
-    project_id = _create_project(service)
-    process_id = _create_process(service, project_id, name="Build API")
-    command = {
-        "action": "set_process_due_at",
-        "project_id": project_id,
-        "process_id": process_id,
-        "due_at": _iso(24, 17),
-        "edit_at": _iso(13, 11),
-    }
-
-    first = _handle(
-        service,
-        command,
-        command_id="00000000-0000-4000-8000-000000000703",
-    )
-    history_after_first = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(13, 12),
-            "include_project_total": True,
-        },
-    ).data
-    replay = _handle(
-        service,
-        command,
-        command_id="00000000-0000-4000-8000-000000000703",
-    )
-    history_after_replay = _query(
-        service,
-        {
-            "action": "query_due_date_history",
-            "project_id": project_id,
-            "as_of": _iso(13, 12),
-            "include_project_total": True,
-        },
-    ).data
-
-    assert replay.command_id == first.command_id
-    assert replay.entity_ids == first.entity_ids
-    assert history_after_replay == history_after_first
-    assert [event["process_id"] for event in history_after_replay["process_events"]] == [
-        process_id
-    ]
-    assert [
-        event["mutation_action"]
-        for event in history_after_replay["project_total_events"]
-    ] == ["derived_project_due_at_changed"]
+    graph = _process_graph(service, project_id, day=14)
+    assert "target_at" not in graph["nodes"][0]
 
 
 def test_process_lifecycle_status_transitions_and_finished_at_semantics():
@@ -1753,20 +1586,20 @@ def test_rename_process_alias_uniqueness_resolution_and_retired_alias_visibility
     active_resolution = _handle(
         service,
         {
-            "action": "set_process_due_at",
+            "action": "set_process_status",
             "project_id": project_id,
             "process_symbol": "design",
-            "due_at": _iso(20, 17),
+            "status": "paused",
             "edit_at": _iso(15, 10),
         },
     )
     retired_alias = _handle(
         service,
         {
-            "action": "set_process_due_at",
+            "action": "set_process_status",
             "project_id": project_id,
             "process_symbol": "arch",
-            "due_at": _iso(20, 17),
+            "status": "paused",
             "edit_at": _iso(15, 11),
         },
     )
@@ -2679,10 +2512,10 @@ def test_replace_process_with_subgraph_default_alias_and_edge_reconnects():
     alias_update = _handle(
         service,
         {
-            "action": "set_process_due_at",
+            "action": "set_process_status",
             "project_id": project_id,
             "process_symbol": "build",
-            "due_at": _iso(22, 17),
+            "status": "paused",
             "edit_at": _iso(15, 11),
         },
     )
@@ -3075,6 +2908,37 @@ def test_replace_process_with_subgraph_validation_errors_do_not_write(
     assert {
         node["process_symbol"] for node in after_rejection["nodes"]
     } == {"design", "build", "ship"}
+
+
+def test_replace_subgraph_rejects_reconnection_cycle_without_writes():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, design_id, build_id, ship_id = _seed_linear_graph(service)
+    baseline = _process_graph(service, project_id, day=16, hour=10)
+
+    result = _handle(
+        service,
+        {
+            "action": "replace_process_with_subgraph",
+            "project_id": project_id,
+            "process_symbols": ["design", "ship"],
+            "edit_at": _iso(16, 9),
+            "processes": [
+                {
+                    "process_symbol": "detail",
+                    "name": "Detail",
+                    "duration_hours": 8,
+                }
+            ],
+            "dependencies": [],
+        },
+    )
+    after_rejection = _process_graph(service, project_id, day=16, hour=10)
+
+    assert result.error.code == "dependency_cycle"
+    assert result.error.details["field_path"] == "process_symbols"
+    assert after_rejection == baseline
+    assert _node_ids(after_rejection) == {design_id, build_id, ship_id}
+    assert _edge_pairs(after_rejection) == {(design_id, build_id), (build_id, ship_id)}
 
 
 def test_collapse_subgraph_disconnected_selection_rejects_without_writes():
