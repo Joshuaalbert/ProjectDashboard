@@ -310,6 +310,7 @@ class ProjectService:
                 project_id=command.project_id,
                 process_id=process_id,
                 name=command.name,
+                description=command.description,
                 effective_at=command.effective_at,
                 duration_business_days=command.duration_business_days,
                 dependencies=command.dependencies,
@@ -436,6 +437,11 @@ class ProjectService:
                 role_ids=command.role_ids,
                 active=command.active,
             )
+            cost_currency = self._resource_project_currency(
+                self._repository,
+                command.project_id,
+                command.cost_currency,
+            )
             resource_id = self._repository.upsert_resource(
                 project_id=command.project_id,
                 resource_id=command.resource_id,
@@ -446,7 +452,7 @@ class ProjectService:
                 available_until_at=command.available_until_at,
                 cost_rate=command.cost_rate,
                 cost_unit=command.cost_unit,
-                cost_currency=command.cost_currency,
+                cost_currency=cost_currency,
                 holidays=command.holidays,
                 active=command.active,
             )
@@ -1207,6 +1213,7 @@ class ProjectService:
                 "process_symbol": process_symbol,
                 "aliases": sorted(aliases_by_process.get(row.process_id, [])),
                 "name": row.name,
+                "description": revision.description if revision else "",
                 "duration_hours": duration_hours,
                 "earliest_start_at": (
                     input_by_id[row.process_id].earliest_start_at.isoformat()
@@ -1674,6 +1681,7 @@ class ProjectService:
                 {
                     "process_id": process_id,
                     "name": revision.name,
+                    "description": revision.description,
                     "dependencies": dependencies,
                     "duration_business_days": revision.duration_business_days,
                     "explicit_status": (
@@ -1984,6 +1992,7 @@ class ProjectService:
                 {
                     "process_id": row.process_id,
                     "name": row.name,
+                    "description": revision.description if revision else "",
                     "ready_at": ready_at.isoformat() if ready_at else None,
                     "starts_at": starts_at.isoformat() if starts_at else None,
                     "ends_at": ends_at.isoformat() if ends_at else None,
@@ -2468,6 +2477,16 @@ class ProjectService:
         resources = getattr(self._repository, "resources", {})
         project = self._repository.get_project(query.project_id)
         currency = query.currency or project.default_currency
+        if currency != project.default_currency:
+            raise ServiceValidationError(
+                code="project_currency_mismatch",
+                message="Cost query currency must match the project default currency.",
+                field_path="currency",
+                details={
+                    "project_default_currency": project.default_currency,
+                    "requested_currency": currency,
+                },
+            )
         currency_resources = self._currency_relevant_resources(query, slices)
         resource_currencies = {
             resource_id: resources[resource_id]["cost_currency"]
@@ -3392,6 +3411,11 @@ class ProjectService:
                     role_ids=operation.resource.role_ids,
                     active=operation.resource.active,
                 )
+                cost_currency = self._resource_project_currency(
+                    staged,
+                    command.project_id,
+                    operation.resource.cost_currency,
+                )
                 self._validate_batch_resource_references(
                     staged,
                     command.project_id,
@@ -3421,7 +3445,7 @@ class ProjectService:
                         available_until_at=operation.resource.available_until_at,
                         cost_rate=operation.resource.cost_rate,
                         cost_unit=operation.resource.cost_unit,
-                        cost_currency=operation.resource.cost_currency,
+                        cost_currency=cost_currency,
                         holidays=operation.resource.holidays,
                         active=operation.resource.active,
                     )
@@ -3932,6 +3956,25 @@ class ProjectService:
             and existing.get("holidays", []) == holiday_records
             and existing.get("active") == resource.active
         )
+
+    def _resource_project_currency(
+        self,
+        repository: ProjectRepository,
+        project_id: str,
+        cost_currency: str | None,
+    ) -> str:
+        default_currency = repository.get_project(project_id).default_currency
+        if cost_currency is not None and cost_currency != default_currency:
+            raise ServiceValidationError(
+                code="resource_currency_mismatch",
+                message="Resource currency must match the project default currency.",
+                field_path="cost_currency",
+                details={
+                    "project_default_currency": default_currency,
+                    "resource_cost_currency": cost_currency,
+                },
+            )
+        return default_currency
 
     def _resource_roles_equal(
         self,

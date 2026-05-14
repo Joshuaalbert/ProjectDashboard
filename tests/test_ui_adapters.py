@@ -15,10 +15,14 @@ from projdash.ui.adapters import (
     existing_dependency_symbols,
     gantt_rows,
     process_symbol_maps,
+    process_table_rows,
     resource_utilization_heatmap,
     role_utilization_heatmap,
 )
-from projdash.ui.app import _datetime_axis_locator_and_formatter
+from projdash.ui.app import (
+    _datetime_axis_locator_and_formatter,
+    _role_effort_defaults,
+)
 from projdash.ui.service_client import (
     batch_payload_envelope,
     calendar_options,
@@ -67,7 +71,7 @@ def test_guided_form_parsers_accept_compact_rows():
     )
     dependencies = parse_dependency_lines("A -> B\nB, C")
     children = parse_subgraph_process_lines(
-        "A | First child | role_eng:6,role_review:2\n"
+        "A | First child | role_eng:6,role_review:2 | First definition\n"
         "B | Second child | role_eng:4,role_qa:2"
     )
     roots, leaves = infer_subgraph_roots_and_leaves(
@@ -90,17 +94,45 @@ def test_guided_form_parsers_accept_compact_rows():
     assert identified_holidays[0]["ends_at"].isoformat() == "2026-05-28T00:00:00+00:00"
     assert dependencies == [("A", "B"), ("B", "C")]
     assert children[0]["duration_hours"] == 8.0
+    assert children[0]["description"] == "First definition"
     assert children[0]["role_requirements"] == [
         {"role_id": "role_eng", "effort_hours": 6.0},
         {"role_id": "role_review", "effort_hours": 2.0},
     ]
     assert children[1]["duration_hours"] == 6.0
+    assert children[1]["description"] == ""
     assert children[1]["role_requirements"] == [
         {"role_id": "role_eng", "effort_hours": 4.0},
         {"role_id": "role_qa", "effort_hours": 2.0},
     ]
     assert roots == ["A", "C"]
     assert leaves == ["B", "C"]
+
+
+def test_process_table_rows_and_role_defaults_include_pm_description_and_effort():
+    graph = {
+        "nodes": [
+            {
+                "process_id": "p1",
+                "process_symbol": "A",
+                "name": "Design",
+                "description": "Definition of design completion",
+                "role_requirements": [
+                    {"role_id": "role_eng", "effort_hours": 2},
+                    {"role_id": "role_eng", "effort_hours": 3},
+                    {"role_id": "role_qa", "effort_hours": 1},
+                ],
+            }
+        ],
+    }
+
+    rows = process_table_rows(graph)
+
+    assert rows[0]["description"] == "Definition of design completion"
+    assert _role_effort_defaults(graph["nodes"][0]) == {
+        "role_eng": 5.0,
+        "role_qa": 1.0,
+    }
 
 
 def test_display_datetime_helpers_use_selected_timezone_and_visible_format():
@@ -135,9 +167,14 @@ def test_display_datetime_helpers_use_selected_timezone_and_visible_format():
 
 def test_chart_datetime_formatter_uses_selected_timezone_and_visible_format():
     _locator, formatter = _datetime_axis_locator_and_formatter("America/New_York")
-    timestamp = dt.datetime(2026, 1, 1, 18, tzinfo=dt.UTC)
+    timestamps = [
+        dt.datetime(2026, 1, 1, 18, tzinfo=dt.UTC),
+        dt.datetime(2026, 1, 1, 22, tzinfo=dt.UTC),
+    ]
+    values = mdates.date2num(timestamps)
 
-    assert formatter(mdates.date2num(timestamp)) == "Thu, 01 Jan 2026, 13:00"
+    formatter.set_locs(values)
+    assert formatter.format_ticks(values) == ["13:00", "17:00"]
 
 
 @pytest.mark.parametrize(

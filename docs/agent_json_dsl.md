@@ -61,7 +61,7 @@ Failed queries return:
 
 | Field | Type | Rules |
 | --- | --- | --- |
-| `code` | string | Stable machine code, for example `validation_error`, `dependency_cycle`, `idempotency_conflict`, `not_found`, `ambiguous_process_symbol`, or `mixed_currency`. |
+| `code` | string | Stable machine code, for example `validation_error`, `dependency_cycle`, `idempotency_conflict`, `not_found`, `ambiguous_process_symbol`, `resource_currency_mismatch`, `project_currency_mismatch`, or `mixed_currency`. |
 | `message` | string | Human-readable summary. |
 | `details` | object | Error-specific structured context; empty object when unused. |
 | `validation_errors` | list[ValidationError] | Present only for `code = "validation_error"`; omitted for other errors. |
@@ -137,6 +137,10 @@ stored status in v1; it is derived from unresolved blocker facts. Computed
 schedule status is returned separately and may be `not_ready`, `ready`,
 `work_now`, `late_risk`, `blocked`, `complete`, `canceled`, `partial`,
 `unallocated`, or `blocked_zero_capacity`, depending on the query shape.
+
+`upsert_process_revision.description` is optional text for the PM-facing
+definition of the process in that revision. It defaults to an empty string and
+is returned on process graph and resource schedule rows.
 
 All lifecycle, blocker, alias, topology, and due-date mutation commands require
 a timezone-aware `edit_at`, `created_at`, or `resolved_at` timestamp. Naive
@@ -480,6 +484,7 @@ Setting the same calendar is a no-op.
 | --- | --- | --- | --- |
 | `process_symbol` | string | yes | New active canonical symbol unique in the final project graph. |
 | `name` | string | yes | Non-empty display name. |
+| `description` | string | no | PM-facing definition of the child process; defaults to an empty string. |
 | `duration_hours` | number | conditional | Finite and `>= 0`; required when `role_requirements` are omitted. If omitted with `role_requirements`, the service derives it from total role effort hours. |
 | `earliest_start_at` | aware datetime or null | no | Nullable persisted constraint. |
 | `due_at` | aware datetime or null | no | Nullable process due datetime. |
@@ -508,8 +513,9 @@ disconnected child components are allowed when the internal graph is acyclic.
 
 | Field | Type | Required | Rules |
 | --- | --- | --- | --- |
-| `process_symbol` | string | yes | New active canonical symbol unique outside the collapsed set and unique after aliases are applied. |
+| `process_symbol` | string | no | Optional explicit canonical symbol. When omitted, the service generates one from `name` and makes it unique in the active graph. |
 | `name` | string | yes | Non-empty display name. |
+| `description` | string | no | PM-facing definition of the replacement process; defaults to an empty string. |
 | `duration_hours` | number | no | Optional explicit replacement; if omitted, inferred from the dependency-only critical path through the collapsed set. |
 | `earliest_start_at` | aware datetime or null | no | Defaults to earliest non-null selected constraint, or null if none. |
 | `due_at` | aware datetime or null | no | Defaults to latest selected due datetime, or null if none. |
@@ -671,6 +677,12 @@ operator or agent must define all of them explicitly. `update_project` accepts
 `set_project_default_currency` requires `project_id` and `default_currency`.
 Currencies are ISO 4217 codes.
 
+`upsert_resource.cost_currency` is optional but, when supplied, must match the
+project `default_currency`; mismatches fail with `resource_currency_mismatch`.
+The service stores omitted resource currencies as the project currency. Changing
+the project default currency updates existing project resources to that
+currency so the single-currency invariant is preserved.
+
 `set_calendar_active(active = false)` requires `force = true` when active
 resources use the calendar. Forced deactivation preserves the calendar fact and
 makes those resources unschedulable. `upsert_resource_calendar(active = false)`
@@ -826,6 +838,7 @@ Every node includes process `duration_hours`, `es_at`, `ef_at`, `ls_at`,
 | `process_symbol` | string | Canonical unique symbol. |
 | `aliases` | list[string] | Unique aliases for this process. |
 | `name` | string | Display name. |
+| `description` | string | PM-facing process definition from the selected revision. |
 | `duration_hours` | number | Dependency-only process duration. |
 | `earliest_start_at` | aware datetime string or null | Persisted constraint, when present. |
 | `due_at` | aware datetime string or null | Current due datetime. |
@@ -928,7 +941,7 @@ compute allocation slices internally, but they must reject
 | `target_process_symbol` | string | none | Deprecated alias for target-process scope after alias resolution; mutually exclusive with `scope` and `target_process_id`. |
 | `resource_ids` | list[string] | all resources | Non-empty when supplied. Filters contributing allocation slices to these resources. Unknown ids are `not_found`; inactive resources are allowed as filters and simply contribute no rows when they have no schedulable capacity. |
 | `role_ids` | list[string] | all roles | Non-empty when supplied. Filters contributing allocation slices to these roles. Unknown ids are `not_found`; inactive roles are allowed as filters for historical identity and may contribute no current demand. |
-| `currency` | ISO 4217 string | project `default_currency` | All contributing resource currencies must match. |
+| `currency` | ISO 4217 string | project `default_currency` | Must match the project currency used by all resources in v1. |
 | `group_by` | list[enum] | `["resource", "process", "role", "time"]` | Subset of `resource`, `process`, `role`, `time`; omitted groupings return empty lists. |
 
 Filtering is applied to final allocation slices after the resource schedule is
@@ -984,6 +997,7 @@ computed predecessor `ends_at`.
 | --- | --- | --- |
 | `process_id` | string | Required. |
 | `name` | string | Required. |
+| `description` | string | PM-facing process definition from the selected revision. |
 | `ready_at` | aware datetime string or null | Earliest resource-aware start candidate when dependency predecessors have feasible non-null finishes; null when no predecessor-feasible ready time exists. |
 | `starts_at` | aware datetime string or null | First allocated slice start; null when no capacity was allocated. |
 | `ends_at` | aware datetime string or null | Completed process finish; null for partial or fully unallocated rows. |
@@ -1240,13 +1254,14 @@ any allocation in the filtered query range and prorated across that resource's
 contributing buckets by allocated hours. Mixed-currency validation happens
 before grouping, so no `CostBucket` ever mixes currencies.
 
-Costs are not converted in v1. `query_costs.currency` defaults to the project
-`default_currency`. If allocated resources contributing to the cost query use
-more than one `cost_currency`, or any contributing resource currency differs
-from the requested currency, `query_costs` fails with `ok = false`,
-`error.code = "mixed_currency"`, and `details.resource_currencies` keyed by
-resource id; agents must query and aggregate each currency separately. Cost
-queries do not use `AllocationSlice.cost_amount`.
+Costs are not converted in v1. Resource `cost_currency` is always the owning
+project `default_currency`; omitted resource currencies are filled from the
+project and explicit mismatches fail with `resource_currency_mismatch`.
+`query_costs.currency` defaults to the same project currency. The query still
+guards inconsistent stored states with `mixed_currency`, but normal commands
+cannot create mixed-currency resources. Explicit non-project query currencies
+fail with `project_currency_mismatch`. Cost queries do not use
+`AllocationSlice.cost_amount`.
 
 `UnallocatedData`:
 

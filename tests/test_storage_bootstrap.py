@@ -128,6 +128,7 @@ def test_schema_statements_include_resource_graph_and_replay_contracts():
         "committed_at",
         "completion_at",
         "terminal_process_symbols",
+        "description",
     ]:
         assert expected_field in sql
 
@@ -275,6 +276,7 @@ def test_timezone_offsets_and_cost_fields_round_trip(tmp_path: Path):
             project_id: 'project-alpha',
             effective_at: $project_start,
             name: 'Build',
+            description: 'Build the first release',
             duration_business_days: 1,
             due_at: $due_before,
             earliest_start_at: NULL,
@@ -550,6 +552,7 @@ def test_role_requirements_belong_to_revisions_not_processes(tmp_path: Path):
                 project_id: 'project-alpha',
                 effective_at: '2026-05-13T09:00:00-04:00',
                 name: 'Build',
+                description: 'Build implementation work',
                 duration_business_days: 1,
                 due_at: NULL,
                 earliest_start_at: NULL,
@@ -1395,6 +1398,7 @@ def test_ladybug_snapshot_writes_are_safe_for_existing_schema_without_logical_id
             "project_id": project_id,
             "process_id": "process-old",
             "name": "Old Process",
+            "description": "Persisted process definition",
             "effective_at": _aware_iso(13, 10, UTC_MINUS_FOUR),
             "duration_business_days": 1,
             "role_requirements": [
@@ -1430,6 +1434,7 @@ def test_ladybug_snapshot_writes_are_safe_for_existing_schema_without_logical_id
         "holiday-old"
     )
     revision = reopened.revisions_by_process["process-old"][0]
+    assert revision.description == "Persisted process definition"
     assert revision.role_requirements[0].requirement_id == "req-old"
     _close(reopened)
 

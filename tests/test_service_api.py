@@ -1883,6 +1883,7 @@ def test_new_command_moments_reject_naive_datetimes(field_name, payload):
                         {
                             "process_symbol": "service-api",
                             "name": "Service API",
+                            "description": "Detailed service API work",
                             "duration_hours": 16,
                         }
                     ],
@@ -2516,6 +2517,7 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                         {
                             "process_symbol": "api-contract",
                             "name": "API Contract",
+                            "description": "Contract detail",
                             "duration_hours": 8,
                             "role_requirements": [
                                 {
@@ -2527,6 +2529,7 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                         {
                             "process_symbol": "api-implementation",
                             "name": "API Implementation",
+                            "description": "Implementation detail",
                             "duration_hours": 16,
                             "finished_at": None,
                         },
@@ -2557,11 +2560,13 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                         {
                             "process_symbol": "api-contract",
                             "name": "API Contract",
+                            "description": "Contract detail",
                             "duration_hours": 8,
                         },
                         {
                             "process_symbol": "api-implementation",
                             "name": "API Implementation",
+                            "description": "Implementation detail",
                             "duration_hours": 16,
                         },
                     ],
@@ -2584,8 +2589,8 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                     "edit_at": _at(14).isoformat(),
                     "process_symbols": ["api-contract", "api-implementation"],
                     "new_process": {
-                        "process_symbol": "api-delivery",
                         "name": "API Delivery",
+                        "description": "Collapsed delivery scope",
                         "duration_hours": 24,
                         "earliest_start_at": None,
                         "due_at": _at(30).isoformat(),

@@ -52,6 +52,7 @@ class ProcessScheduleInput:
     start_at_earliest: bool = False
     delay_after_dependencies_business_days: int = 0
     unresolved_blocker_count: int = 0
+    description: str = ""
 
 
 @dataclass(frozen=True, slots=True)

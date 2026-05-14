@@ -30,7 +30,6 @@ from projdash.ui.adapters import (
 )
 from projdash.ui.service_client import (
     DEFAULT_TIMEZONE,
-    DISPLAY_DATETIME_FORMAT,
     batch_payload_envelope,
     calendar_options,
     combine_datetime,
@@ -216,16 +215,61 @@ def _snapshot_label(
 def _datetime_axis_locator_and_formatter(timezone_name: str):
     """Return Matplotlib date locator/formatter for the selected UI timezone."""
     timezone = ZoneInfo(validate_timezone(timezone_name))
-    return (
-        mdates.AutoDateLocator(tz=timezone),
-        mdates.DateFormatter(DISPLAY_DATETIME_FORMAT, tz=timezone),
-    )
+    locator = mdates.AutoDateLocator(tz=timezone, minticks=3, maxticks=6)
+    return locator, mdates.ConciseDateFormatter(locator, tz=timezone)
 
 
 def _format_datetime_axis(axis: Any, timezone_name: str) -> None:
     locator, formatter = _datetime_axis_locator_and_formatter(timezone_name)
     axis.set_major_locator(locator)
     axis.set_major_formatter(formatter)
+    axis.set_tick_params(labelrotation=30, labelsize=8)
+
+
+def _role_effort_defaults(node: dict[str, Any]) -> dict[str, float]:
+    defaults: dict[str, float] = {}
+    for requirement in node.get("role_requirements") or []:
+        role_id = requirement.get("role_id")
+        if not role_id:
+            continue
+        defaults[role_id] = defaults.get(role_id, 0.0) + float(
+            requirement.get("effort_hours") or 0.0
+        )
+    return defaults
+
+
+def _role_requirement_inputs(
+    role_ids: list[str],
+    *,
+    key_prefix: str,
+    defaults: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    defaults = defaults or {}
+    selected_roles = st.multiselect(
+        "Required roles",
+        role_ids,
+        default=[role_id for role_id in defaults if role_id in role_ids],
+        key=f"{key_prefix}_roles",
+        help="Defined roles required by this process.",
+    )
+    requirements = []
+    for role_id in selected_roles:
+        effort = st.number_input(
+            f"{role_id} effort hours",
+            0.0,
+            10000.0,
+            float(defaults.get(role_id, 0.0)),
+            key=f"{key_prefix}_{role_id}_effort",
+            help="Total effort required from this role.",
+        )
+        if effort > 0:
+            requirements.append({"role_id": role_id, "effort_hours": effort})
+    return requirements
+
+
+def _project_currency(context: dict[str, Any]) -> str:
+    project = (context.get("project") or {}).get("project", {})
+    return str(project.get("default_currency") or "USD")
 
 
 def _render_first_run(service, controls: dict[str, Any]) -> None:
@@ -672,18 +716,15 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
                 ),
             )
             selected_node = node_by_symbol.get(existing, {})
-            process_symbol = st.text_input(
-                "New process symbol (optional)",
-                help=(
-                    "Leave blank to auto-generate a unique symbol from the name. "
-                    "Existing processes use the selector above."
-                ),
-                disabled=bool(existing),
-            )
             name = st.text_input(
                 "Name",
                 selected_node.get("name", ""),
                 help="Human-readable process name.",
+            )
+            description = st.text_area(
+                "Description",
+                selected_node.get("description", ""),
+                help="Definition of done, scope, and PM notes for this process.",
             )
             dependency_options = allowed_dependency_symbols(graph, existing)
             dependency_defaults = [
@@ -735,26 +776,19 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
                 dt.time(9, 0),
                 help="Earliest allowed start time.",
             )
-            role_id = st.selectbox(
-                "Required role id",
-                [""] + catalog["role_ids"],
-                help="Defined role required by this process revision.",
-            )
-            effort = st.number_input(
-                "Effort hours for role",
-                0.0,
-                10000.0,
-                0.0,
-                help="Total effort required from the selected role.",
+            role_requirements = _role_requirement_inputs(
+                catalog["role_ids"],
+                key_prefix=f"process_revision_{existing or 'new'}",
+                defaults=_role_effort_defaults(selected_node),
             )
             submitted = st.form_submit_button("Save revision")
         if submitted:
-            active_symbol = existing or process_symbol.strip()
             duration_days = int((selected_node.get("duration_hours") or 0) / 8)
             payload = {
                 "action": "upsert_process_revision",
                 "project_id": controls["project_id"],
                 "name": name,
+                "description": description,
                 "effective_at": combine_datetime(
                     effective_date,
                     effective_time,
@@ -776,17 +810,10 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
                 )
                 if earliest_enabled
                 else None,
-                "role_requirements": [
-                    {
-                        "role_id": role_id,
-                        "effort_hours": effort,
-                    }
-                ]
-                if role_id and effort > 0
-                else [],
+                "role_requirements": role_requirements,
             }
-            if active_symbol:
-                payload["process_symbol"] = active_symbol
+            if existing:
+                payload["process_symbol"] = existing
             _apply_command(service, payload)
 
     _render_batch_process_menu(service, controls, graph, catalog, selected_symbols)
@@ -871,27 +898,17 @@ def _render_batch_process_menu(
             )
 
         with st.form("batch_add_new_child"):
-            child_symbol = st.text_input(
-                "New child symbol (optional)",
-                help="Leave blank to auto-generate a unique symbol from the child name.",
-            )
             child_name = st.text_input(
                 "New child name",
                 help="Human-readable name for the new child process.",
             )
-            role_id = st.selectbox(
-                "Required role",
-                [""] + catalog["role_ids"],
-                key="batch_child_role",
-                help="Defined role required by the new child process.",
+            child_description = st.text_area(
+                "New child description",
+                help="Definition of done, scope, and PM notes for the child process.",
             )
-            effort = st.number_input(
-                "Effort hours",
-                0.0,
-                10000.0,
-                0.0,
-                key="batch_child_effort",
-                help="Total role effort used by resource-aware scheduling.",
+            role_requirements = _role_requirement_inputs(
+                catalog["role_ids"],
+                key_prefix="batch_child",
             )
             add_new_child = st.form_submit_button("Create child after selected")
         if add_new_child and target_symbols and child_name:
@@ -899,6 +916,7 @@ def _render_batch_process_menu(
                 "action": "upsert_process_revision",
                 "project_id": controls["project_id"],
                 "name": child_name,
+                "description": child_description,
                 "effective_at": controls["as_of"],
                 "duration_business_days": 0,
                 "dependencies": [
@@ -906,27 +924,18 @@ def _render_batch_process_menu(
                     for symbol in target_symbols
                     if symbol in id_by_symbol
                 ],
-                "role_requirements": [
-                    {
-                        "role_id": role_id,
-                        "effort_hours": effort,
-                    }
-                ]
-                if role_id and effort > 0
-                else [],
+                "role_requirements": role_requirements,
             }
-            if child_symbol.strip():
-                payload["process_symbol"] = child_symbol.strip()
             _apply_command(service, payload)
 
         with st.form("batch_collapse_selected"):
-            new_symbol = st.text_input(
-                "Collapsed process symbol",
-                help="Canonical symbol for the replacement process.",
-            )
             new_name = st.text_input(
                 "Collapsed process name",
                 help="Human-readable name for the replacement process.",
+            )
+            new_description = st.text_area(
+                "Collapsed process description",
+                help="Definition of done, scope, and PM notes for the replacement.",
             )
             collapse = st.form_submit_button("Collapse selected")
         if collapse and target_symbols:
@@ -938,8 +947,8 @@ def _render_batch_process_menu(
                     "edit_at": controls["as_of"],
                     "process_symbols": target_symbols,
                     "new_process": {
-                        "process_symbol": new_symbol,
                         "name": new_name,
+                        "description": new_description,
                     },
                 },
             )
@@ -1287,6 +1296,14 @@ def _render_calendar_forms(
                     "from this name and the project id."
                 ),
             )
+            calendar_timezone = st.text_input(
+                "Calendar timezone",
+                selected_calendar.get("timezone", controls["timezone"]),
+                help=(
+                    "IANA timezone for this calendar's local working windows, "
+                    "such as UTC or Europe/Paris."
+                ),
+            ).strip()
             weekdays = st.multiselect(
                 "Weekdays",
                 [0, 1, 2, 3, 4, 5, 6],
@@ -1329,7 +1346,7 @@ def _render_calendar_forms(
                     "project_id": controls["project_id"],
                     "calendar_id": calendar_id,
                     "name": name,
-                    "timezone": controls["timezone"],
+                    "timezone": calendar_timezone,
                     "weekly_windows": _weekly_windows(
                         weekdays,
                         start_time,
@@ -1346,9 +1363,17 @@ def _render_calendar_forms(
                 key="exc_cal",
                 help="Defined calendar receiving this one-off capacity exception.",
             )
+            exception_timezone = calendars_by_id.get(calendar, {}).get(
+                "timezone",
+                controls["timezone"],
+            )
+            exception_default = to_display_timezone(
+                controls["as_of"],
+                exception_timezone,
+            )
             starts_date = st.date_input(
                 "Starts",
-                controls["as_of"].date(),
+                exception_default.date(),
                 help="Exception start date.",
             )
             starts_time = st.time_input(
@@ -1358,7 +1383,7 @@ def _render_calendar_forms(
             )
             ends_date = st.date_input(
                 "Ends",
-                controls["as_of"].date(),
+                exception_default.date(),
                 help="Exception end date.",
             )
             ends_time = st.time_input(
@@ -1385,9 +1410,13 @@ def _render_calendar_forms(
                     "starts_at": combine_datetime(
                         starts_date,
                         starts_time,
-                        controls["timezone"],
+                        exception_timezone,
                     ),
-                    "ends_at": combine_datetime(ends_date, ends_time, controls["timezone"]),
+                    "ends_at": combine_datetime(
+                        ends_date,
+                        ends_time,
+                        exception_timezone,
+                    ),
                     "capacity_hours": exc_capacity,
                     "reason": reason or None,
                 },
@@ -1405,6 +1434,11 @@ def _render_resource_forms(
         resource["resource_id"]: resource
         for resource in catalog_data.get("resources", [])
     }
+    calendars_by_id = {
+        calendar["calendar_id"]: calendar
+        for calendar in catalog_data.get("calendars", [])
+    }
+    project_currency = _project_currency(context)
     with st.expander("Resource commands", expanded=True):
         selected_resource_id = st.selectbox(
             "Existing resource",
@@ -1449,13 +1483,17 @@ def _render_resource_forms(
                 key=f"resource_calendar_{form_key}",
                 help="Defined calendar controlling this resource's working hours.",
             )
+            resource_timezone = calendars_by_id.get(calendar_id, {}).get(
+                "timezone",
+                controls["timezone"],
+            )
             available_from = _parse_iso_datetime(
                 selected_resource.get("available_from_at"),
                 controls["as_of"],
             )
             available_from = to_display_timezone(
                 available_from,
-                controls["timezone"],
+                resource_timezone,
             )
             available_date = st.date_input(
                 "Available from",
@@ -1475,12 +1513,13 @@ def _render_resource_forms(
                 key=f"resource_cost_rate_{form_key}",
                 help="Cost amount for this resource in the selected cost unit.",
             )
-            cost_currency = st.text_input(
+            st.text_input(
                 "Cost currency",
-                selected_resource.get("cost_currency", "USD"),
+                project_currency,
                 max_chars=3,
                 key=f"resource_cost_currency_{form_key}",
-                help="ISO 4217 currency for this resource cost rate.",
+                disabled=True,
+                help="Resources use the project's default currency.",
             )
             cost_units = ["hour", "day", "week", "fixed"]
             selected_unit = selected_resource.get("cost_unit", "hour")
@@ -1516,11 +1555,11 @@ def _render_resource_forms(
                     "available_from_at": combine_datetime(
                         available_date,
                         available_time,
-                        controls["timezone"],
+                        resource_timezone,
                     ),
                     "cost_rate": cost_rate,
                     "cost_unit": cost_unit,
-                    "cost_currency": cost_currency or None,
+                    "cost_currency": project_currency,
                     "holidays": selected_resource.get("holidays", []),
                     "active": active,
                 },
@@ -1548,13 +1587,20 @@ def _render_resource_forms(
                     "active": active_state,
                 },
             )
-        _render_resource_holiday_forms(service, controls, resources_by_id, catalog)
+        _render_resource_holiday_forms(
+            service,
+            controls,
+            resources_by_id,
+            calendars_by_id,
+            catalog,
+        )
 
 
 def _render_resource_holiday_forms(
     service,
     controls: dict[str, Any],
     resources_by_id: dict[str, dict[str, Any]],
+    calendars_by_id: dict[str, dict[str, Any]],
     catalog: dict[str, list[str]],
 ) -> None:
     if not catalog["resource_ids"]:
@@ -1569,11 +1615,16 @@ def _render_resource_holiday_forms(
     if not resource:
         return
 
+    holiday_timezone = calendars_by_id.get(resource.get("calendar_id"), {}).get(
+        "timezone",
+        controls["timezone"],
+    )
+    holiday_default = to_display_timezone(controls["as_of"], holiday_timezone)
     holidays = resource.get("holidays", [])
     with st.form("add_resource_holiday"):
         starts_date = st.date_input(
             "Holiday starts",
-            controls["as_of"].date(),
+            holiday_default.date(),
             help="Holiday start date.",
         )
         starts_time = st.time_input(
@@ -1583,7 +1634,7 @@ def _render_resource_holiday_forms(
         )
         ends_date = st.date_input(
             "Holiday ends",
-            controls["as_of"].date(),
+            holiday_default.date(),
             help="Holiday end date.",
         )
         ends_time = st.time_input(
@@ -1594,8 +1645,8 @@ def _render_resource_holiday_forms(
         reason = st.text_input("Holiday reason", help="Optional holiday note.")
         add = st.form_submit_button("Add resource holiday")
     if add:
-        starts_at = combine_datetime(starts_date, starts_time, controls["timezone"])
-        ends_at = combine_datetime(ends_date, ends_time, controls["timezone"])
+        starts_at = combine_datetime(starts_date, starts_time, holiday_timezone)
+        ends_at = combine_datetime(ends_date, ends_time, holiday_timezone)
         holiday_id = scoped_id(
             resource_id,
             "holiday",
@@ -1746,27 +1797,45 @@ def _render_gantt_chart(
     fig, ax = plt.subplots(figsize=(12, fig_height))
     for index, row in enumerate(rows):
         color = "#dc2626" if row["critical"] else "#2563eb"
+        finish_color = "#dc2626" if row["critical"] else "#d97706"
         y = len(rows) - index - 1
         _barh_datetime(
             ax,
             row["es_at"],
-            row["ef_at"],
-            y - 0.24,
-            0.32,
+            row["lf_at"],
+            y - 0.30,
+            0.60,
             facecolor=color,
             edgecolor=color,
-            alpha=0.85,
+            linewidth=1.0,
+            alpha=0.16,
         )
         _barh_datetime(
             ax,
+            row["es_at"],
             row["ls_at"],
+            y - 0.30,
+            0.60,
+            facecolor=color,
+            edgecolor="none",
+            alpha=0.42,
+        )
+        _barh_datetime(
+            ax,
+            row["ef_at"],
             row["lf_at"],
-            y + 0.12,
-            0.20,
-            facecolor="none",
-            edgecolor=color,
-            alpha=1.0,
-            linestyle="--",
+            y - 0.30,
+            0.60,
+            facecolor=finish_color,
+            edgecolor="none",
+            alpha=0.32,
+        )
+        ax.plot(
+            [mdates.date2num(row["es_at"]), mdates.date2num(row["lf_at"])],
+            [y, y],
+            color=color,
+            linewidth=1.0,
+            alpha=0.9,
         )
     if controls_now is not None:
         ax.axvline(mdates.date2num(controls_now), color="#111827", linewidth=1.2)
@@ -1776,6 +1845,7 @@ def _render_gantt_chart(
     _format_datetime_axis(ax.xaxis, timezone_name)
     ax.grid(axis="x", color="#e5e7eb", linewidth=0.8)
     fig.tight_layout()
+    fig.autofmt_xdate(rotation=30, ha="right")
     st.pyplot(fig)
 
 
@@ -1993,10 +2063,14 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
             )
             children = st.text_area(
                 "Children",
-                "A | First child | role_eng:8\nB | Second child | role_eng:8",
+                (
+                    "A | First child | role_eng:8 | Define first child\n"
+                    "B | Second child | role_eng:8 | Define second child"
+                ),
                 help=(
-                    "Rows of new process symbol, name, and role effort hours, "
-                    "for example `A | Name | role_eng:8,role_qa:2`."
+                    "Rows of new process symbol, name, role effort hours, and "
+                    "optional description, for example "
+                    "`A | Name | role_eng:8,role_qa:2 | Definition`."
                 ),
             )
             dependencies = st.text_area(
@@ -2062,13 +2136,13 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                 catalog["process_symbols"],
                 help="Defined process symbols to summarize into one process.",
             )
-            new_symbol = st.text_input(
-                "New process symbol",
-                help="Canonical symbol for the replacement process.",
-            )
             new_name = st.text_input(
                 "New process name",
                 help="Human-readable name for the replacement process.",
+            )
+            new_description = st.text_area(
+                "New process description",
+                help="Definition of done, scope, and PM notes for the replacement.",
             )
             collapse = st.form_submit_button("Collapse")
         if collapse and symbols:
@@ -2080,8 +2154,8 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                     "edit_at": controls["as_of"],
                     "process_symbols": symbols,
                     "new_process": {
-                        "process_symbol": new_symbol,
                         "name": new_name,
+                        "description": new_description,
                     },
                 },
             )

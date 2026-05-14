@@ -1779,6 +1779,66 @@ def test_rename_process_alias_uniqueness_resolution_and_retired_alias_visibility
     assert retired_alias.error.code in {"not_found", "ambiguous_process_symbol"}
 
 
+def test_auto_generated_process_symbols_skip_active_aliases():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    design_id = _create_process(service, project_id, name="Design")
+    build_id = _create_process(service, project_id, name="Build", dependencies=[design_id])
+    _create_process(service, project_id, name="Owner")
+    _handle(
+        service,
+        {
+            "action": "add_process_aliases",
+            "project_id": project_id,
+            "process_symbol": "owner",
+            "aliases": ["implementation"],
+            "edit_at": _iso(14, 9),
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "rename_process",
+            "project_id": project_id,
+            "process_id": design_id,
+            "new_symbol": "architecture",
+            "edit_at": _iso(14, 10),
+            "keep_old_symbol_as_alias": True,
+        },
+    )
+
+    created = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "name": "Design",
+            "effective_at": _iso(14, 11),
+            "duration_business_days": 1,
+        },
+    )
+    collapsed = _handle(
+        service,
+        {
+            "action": "collapse_subgraph",
+            "project_id": project_id,
+            "edit_at": _iso(15, 9),
+            "process_symbols": ["architecture", "build"],
+            "new_process": {"name": "Implementation"},
+        },
+    )
+    graph = _process_graph(service, project_id, day=15, hour=10)
+    symbols_by_id = {
+        node["process_id"]: node["process_symbol"]
+        for node in graph["nodes"]
+    }
+
+    assert created.entity_ids["process_id"] in symbols_by_id
+    assert symbols_by_id[created.entity_ids["process_id"]] == "design1"
+    assert symbols_by_id[collapsed.entity_ids["process_id"]] == "implementation1"
+    assert build_id in collapsed.entity_ids["retired_process_ids"]
+
+
 def test_batch_role_requirement_coalescing_noops_replay_and_operation_results():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)
@@ -2588,6 +2648,7 @@ def test_replace_process_with_subgraph_default_alias_and_edge_reconnects():
                 {
                     "process_symbol": "backend",
                     "name": "Backend",
+                    "description": "Implement backend API surface",
                     "duration_hours": 8,
                 }
             ],
@@ -2646,6 +2707,9 @@ def test_replace_process_with_subgraph_default_alias_and_edge_reconnects():
         build_id,
         ship_id,
     }
+    assert next(node for node in active["nodes"] if node["process_id"] == child_id)[
+        "description"
+    ] == "Implement backend API surface"
     assert historical_parent["status"] == "done"
     assert historical_parent["finished_at"] == _iso(15, 7)
     assert retired_parent_projection["is_active"] is False
@@ -2767,6 +2831,7 @@ def test_replace_process_with_subgraph_infers_roots_and_leaves_from_topology():
                 {
                     "process_symbol": "api",
                     "name": "API",
+                    "description": "Expose user-facing API endpoints",
                     "role_requirements": [
                         {"role_id": "role-engineer", "effort_hours": 4}
                     ],
@@ -2774,6 +2839,7 @@ def test_replace_process_with_subgraph_infers_roots_and_leaves_from_topology():
                 {
                     "process_symbol": "worker",
                     "name": "Worker",
+                    "description": "Run background processing",
                     "role_requirements": [
                         {"role_id": "role-engineer", "effort_hours": 6}
                     ],
@@ -2781,6 +2847,7 @@ def test_replace_process_with_subgraph_infers_roots_and_leaves_from_topology():
                 {
                     "process_symbol": "docs",
                     "name": "Docs",
+                    "description": "Publish operator documentation",
                     "role_requirements": [
                         {"role_id": "role-docs", "effort_hours": 2}
                     ],
@@ -2825,6 +2892,14 @@ def test_replace_process_with_subgraph_infers_roots_and_leaves_from_topology():
         "api": {"role-engineer": 4},
         "worker": {"role-engineer": 6},
         "docs": {"role-docs": 2},
+    }
+    assert {
+        symbol: nodes_by_symbol[symbol]["description"]
+        for symbol in ("api", "worker", "docs")
+    } == {
+        "api": "Expose user-facing API endpoints",
+        "worker": "Run background processing",
+        "docs": "Publish operator documentation",
     }
 
 
@@ -3105,8 +3180,8 @@ def test_collapse_subgraph_soft_retires_unions_edges_and_merges_requirements():
             "edit_at": _iso(16, 9),
             "process_symbols": ["design", "build"],
             "new_process": {
-                "process_symbol": "implementation",
                 "name": "Implementation",
+                "description": "Combined implementation scope",
             },
         },
     )
@@ -3156,6 +3231,8 @@ def test_collapse_subgraph_soft_retires_unions_edges_and_merges_requirements():
             "dependency_type": "finish_to_start",
         }
     ]
+    assert replacement_node["process_symbol"] == "implementation"
+    assert replacement_node["description"] == "Combined implementation scope"
     assert replacement_node["role_requirements"] == [
         {
             "requirement_id": collapse.entity_ids["requirement_ids"][0],

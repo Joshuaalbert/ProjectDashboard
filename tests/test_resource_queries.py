@@ -71,6 +71,7 @@ def test_upsert_process_revision_respects_process_symbol_identity():
             "project_id": project_id,
             "process_symbol": "design",
             "name": "Design updated",
+            "description": "Updated definition of design completion",
             "effective_at": _iso(13, 10),
             "duration_business_days": 0,
         },
@@ -89,6 +90,7 @@ def test_upsert_process_revision_respects_process_symbol_identity():
     assert updated["process_id"] == "design"
     assert graph["nodes"][0]["process_symbol"] == "design"
     assert graph["nodes"][0]["name"] == "Design updated"
+    assert graph["nodes"][0]["description"] == "Updated definition of design completion"
 
 
 def test_upsert_process_revision_auto_generates_unique_symbol_from_name():
@@ -532,6 +534,7 @@ def test_process_graph_dependency_only_contract_includes_cpm_status_and_blockers
         "process_symbol",
         "aliases",
         "name",
+        "description",
         "duration_hours",
         "earliest_start_at",
         "due_at",
@@ -546,6 +549,7 @@ def test_process_graph_dependency_only_contract_includes_cpm_status_and_blockers
         "late_risk_window",
     }
     assert build["status"] == "planned"
+    assert build["description"] == ""
     assert build["computed_status"] == "blocked"
     assert build["blocker_summary"] == {
         "unresolved_count": 1,
@@ -672,6 +676,7 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
     assert set(row) == {
         "process_id",
         "name",
+        "description",
         "ready_at",
         "starts_at",
         "ends_at",
@@ -685,6 +690,7 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
         "requirement_ids",
     }
     assert row["allocation_state"] == "complete"
+    assert row["description"] == ""
     assert row["finished_at"] is None
 
     capacity = _query(
@@ -1839,24 +1845,40 @@ def test_utilization_does_not_multiply_multi_role_resource_capacity():
         assert bucket["allocated_hours"] <= bucket["capacity_hours"] + 0.0001
 
 
-def test_cost_query_rejects_mixed_currencies_before_grouping():
+def test_resource_upsert_rejects_currency_outside_project_default():
     service = ProjectService(InMemoryProjectRepository())
     ids = _seed_resource_project(service)
-    _handle(
-        service,
-        {
-            "action": "upsert_resource",
-            "project_id": ids["project_id"],
-            "resource_id": "resource-eu-vendor",
-            "name": "EU Vendor",
-            "role_ids": [ids["engineer_id"]],
-            "calendar_id": ids["calendar_id"],
-            "available_from_at": _iso(13, 13),
-            "cost_rate": "90.00",
-            "cost_unit": "hour",
-            "cost_currency": "EUR",
-        },
+    result = service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "upsert_resource",
+                    "project_id": ids["project_id"],
+                    "resource_id": "resource-eu-vendor",
+                    "name": "EU Vendor",
+                    "role_ids": [ids["engineer_id"]],
+                    "calendar_id": ids["calendar_id"],
+                    "available_from_at": _iso(13, 13),
+                    "cost_rate": "90.00",
+                    "cost_unit": "hour",
+                    "cost_currency": "EUR",
+                },
+            }
+        )
     )
+
+    assert result.ok is False
+    assert result.error.code == "resource_currency_mismatch"
+    assert result.error.details == {
+        "field_path": "cost_currency",
+        "project_default_currency": "USD",
+        "resource_cost_currency": "EUR",
+    }
+
+
+def test_cost_query_keeps_project_currency_for_grouped_costs():
+    service = ProjectService(InMemoryProjectRepository())
+    ids = _seed_resource_project(service)
 
     result = _query_result(
         service,
@@ -1869,14 +1891,70 @@ def test_cost_query_rejects_mixed_currencies_before_grouping():
         },
     )
 
-    assert result.ok is False
-    assert result.error.code == "mixed_currency"
-    assert result.error.details == {
-        "requested_currency": "USD",
-        "resource_currencies": {
-            ids["engineer_resource_id"]: "USD",
-            "resource-eu-vendor": "EUR",
+    assert result.ok is True
+    assert result.data["currency"] == "USD"
+
+
+def test_project_currency_changes_reprice_resources_to_project_currency():
+    service = ProjectService(InMemoryProjectRepository())
+    ids = _seed_resource_project(service)
+
+    changed = _handle(
+        service,
+        {
+            "action": "set_project_default_currency",
+            "project_id": ids["project_id"],
+            "default_currency": "EUR",
         },
+    )
+    query = _query_result(
+        service,
+        {
+            "action": "query_costs",
+            "project_id": ids["project_id"],
+            **_resource_horizon(),
+            "currency": "EUR",
+            "group_by": ["resource"],
+        },
+    )
+    wrong_currency = _query_result(
+        service,
+        {
+            "action": "query_costs",
+            "project_id": ids["project_id"],
+            **_resource_horizon(),
+            "currency": "USD",
+            "group_by": ["resource"],
+        },
+    )
+
+    assert changed["project_id"] == ids["project_id"]
+    assert query.ok is True
+    assert query.data["currency"] == "EUR"
+    assert {
+        row["currency"] for row in query.data["by_resource"]
+    } == {"EUR"}
+    assert service._repository.resources[
+        ids["engineer_resource_id"]
+    ]["cost_currency"] == "EUR"
+    updated = _handle(
+        service,
+        {
+            "action": "update_project",
+            "project_id": ids["project_id"],
+            "default_currency": "GBP",
+        },
+    )
+    assert updated["project_id"] == ids["project_id"]
+    assert service._repository.resources[
+        ids["engineer_resource_id"]
+    ]["cost_currency"] == "GBP"
+    assert wrong_currency.ok is False
+    assert wrong_currency.error.code == "project_currency_mismatch"
+    assert wrong_currency.error.details == {
+        "field_path": "currency",
+        "project_default_currency": "EUR",
+        "requested_currency": "USD",
     }
 
 

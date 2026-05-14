@@ -160,7 +160,10 @@ Resource planning adds one project-level setting:
 | `default_currency` | string | yes | ISO 4217 code; defaults to `USD` on `create_project` when omitted. |
 
 Resource commands default omitted `cost_currency` values from the owning
-project. `query_costs.currency` also defaults to `default_currency`.
+project and reject explicit currencies that differ from the project default.
+Changing the project default currency updates existing resources to the new
+project currency. `query_costs.currency` also defaults to `default_currency`
+and rejects explicit non-project currencies.
 
 ### Resource Calendar
 
@@ -257,7 +260,7 @@ Resource fields:
 | `available_until_at` | aware datetime | no | Exclusive and after `available_from_at`. |
 | `cost_rate` | decimal string or number | yes | Finite, `>= 0`. |
 | `cost_unit` | enum | yes | `hour`, `day`, `week`, or `fixed`. |
-| `cost_currency` | string | yes | ISO 4217 code, default project currency if omitted by command. |
+| `cost_currency` | string | yes | ISO 4217 code; must equal the project default currency and is defaulted when omitted. |
 | `holidays` | list | no | Resource-local zero-capacity intervals. |
 | `active` | bool | yes | Inactive resources have no schedulable capacity. |
 
@@ -278,11 +281,11 @@ Cost accounting:
 
 - Engine cost output uses decimal arithmetic and serializes amounts as strings
   with two decimal places unless the project later defines a currency exponent.
-- ProjectDashboard does not convert currencies in v1. `query_costs` must use one
-  requested currency. If allocated resources contributing to a cost query use
-  more than one `cost_currency`, or any contributing resource currency differs
-  from the requested currency, the query fails validation with a structured
-  error; agents must run separate cost queries per currency.
+- ProjectDashboard does not convert currencies in v1. Each resource must use
+  the project default currency. Explicit resource currency mismatches fail with
+  `resource_currency_mismatch`; explicit non-project query currencies fail with
+  `project_currency_mismatch`; cost queries still reject inconsistent stored
+  states with `mixed_currency`.
 - `hour`: `allocated_hours * cost_rate`.
 - `day`: charge `cost_rate` once for each local calendar date with any
   allocation for that resource.
@@ -393,6 +396,8 @@ Idempotency:
   fields; omitted optional ids are generated and returned in `entity_ids`.
 - `upsert_process_revision` always appends a new process revision unless the
   command id is replayed exactly.
+- `upsert_process_revision.description` is revision-level PM text defining the
+  process scope and definition of done.
 
 Lifecycle:
 
@@ -1079,11 +1084,11 @@ Command field tables:
 | `set_calendar_active` | `project_id`, `calendar_id`, `active` | `force` default `false` | `calendar_id` |
 | `add_calendar_exception` | `project_id`, `calendar_id`, `starts_at`, `ends_at`, `capacity_hours` | `exception_id`, `reason` | `exception_id` |
 | `remove_calendar_exception` | `project_id`, `calendar_id`, `exception_id` | none | `exception_id` |
-| `upsert_resource` | `project_id`, `name`, `role_ids`, `calendar_id`, `available_from_at`, `cost_rate`, `cost_unit` | `resource_id`, `available_until_at`, `cost_currency`, `holidays`, `active` | `resource_id` |
+| `upsert_resource` | `project_id`, `name`, `role_ids`, `calendar_id`, `available_from_at`, `cost_rate`, `cost_unit` | `resource_id`, `available_until_at`, `cost_currency` matching project default, `holidays`, `active` | `resource_id` |
 | `set_resource_active` | `project_id`, `resource_id`, `active` | none | `resource_id` |
 | `set_resource_roles` | `project_id`, `resource_id`, `role_ids` | none | `resource_id` |
 | `set_resource_calendar` | `project_id`, `resource_id`, `calendar_id` | none | `resource_id` |
-| `upsert_process_revision` | existing required fields | `role_requirements`; mutually exclusive with `required_roles` after transition | `process_id`, `revision_id` |
+| `upsert_process_revision` | existing required fields | `description`, `role_requirements`; mutually exclusive with `required_roles` after transition | `process_id`, `revision_id` |
 
 `role_requirements` command item:
 
@@ -1183,6 +1188,7 @@ section mirrors that contract.
 | --- | --- | --- |
 | `process_id` | string | Required. |
 | `name` | string | Required. |
+| `description` | string | PM-facing process definition from the selected revision. |
 | `ready_at` | aware datetime string or null | Earliest resource-aware start candidate when dependency predecessors have feasible non-null finishes; null when no predecessor-feasible ready time exists. |
 | `starts_at` | aware datetime string or null | First allocated slice start; null when no capacity was allocated. |
 | `ends_at` | aware datetime string or null | Completed process finish; null for partial or fully unallocated rows. |
@@ -1417,11 +1423,10 @@ buckets for the resource local date by allocated hours on that date. Weekly
 costs use the documented weekly denominator and are split across buckets by
 allocated hours in the clipped local week. Fixed costs are charged once per
 resource with any allocation in the filtered query range and prorated across
-that resource's contributing buckets by allocated hours. If allocated resources
-contributing to the query use more than one `cost_currency`, or any
-contributing resource currency differs from the requested `currency`, the query
-fails validation with a structured error `mixed_currency` before grouping. v1
-does not convert currencies and does not downgrade this to a warning.
+that resource's contributing buckets by allocated hours. Commands enforce one
+project currency for all resources; if storage is nevertheless inconsistent,
+cost queries fail with `mixed_currency` before grouping. v1 does not convert
+currencies and does not downgrade this to a warning.
 
 `query_unallocated_requirements.data` contains `project_id`, `as_of`,
 `horizon_starts_at`, `horizon_ends_at`, `planning_granularity`, and
@@ -1465,6 +1470,8 @@ Node tables:
 - Existing `Process` projections include topology retirement fields
   `is_active`, `retired_at`, `retired_by_command_id`, and
   `retirement_reason`; lifecycle `status` remains separate.
+- Existing `ProcessRevision` projections include revision-level `name`,
+  `description`, timing constraints, dependencies, and role requirements.
 - `ProcessRetirementEvent(retirement_event_id, project_id, process_id,
   retired_at, retired_by_command_id, retirement_reason,
   replacement_process_ids)`

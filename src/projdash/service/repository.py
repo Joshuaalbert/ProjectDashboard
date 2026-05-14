@@ -108,6 +108,7 @@ class ProjectRepository(Protocol):
         project_id: str,
         process_id: str | None,
         name: str,
+        description: str,
         effective_at: dt.datetime,
         duration_business_days: int,
         dependencies: list[str],
@@ -353,6 +354,8 @@ class InMemoryProjectRepository:
             updates["default_currency"] = default_currency
         updated = project.model_copy(update=updates)
         self.projects[project_id] = updated
+        if default_currency is not None:
+            self._set_project_resource_currency(project_id, default_currency)
         return updated
 
     def delete_project(self, project_id: str) -> None:
@@ -477,6 +480,7 @@ class InMemoryProjectRepository:
         project_id: str,
         process_id: str | None,
         name: str,
+        description: str,
         effective_at: dt.datetime,
         duration_business_days: int,
         dependencies: list[str],
@@ -527,6 +531,7 @@ class InMemoryProjectRepository:
             project_id=project_id,
             effective_at=effective_at,
             name=name,
+            description=description,
             duration_business_days=duration_business_days,
             dependencies=dependencies,
             due_at=due_at,
@@ -1024,6 +1029,7 @@ class InMemoryProjectRepository:
                 ProcessScheduleInput(
                     process_id=process_id,
                     name=revision.name,
+                    description=revision.description,
                     dependencies=tuple(revision.dependencies),
                     duration_business_days=revision.duration_business_days,
                     explicit_status=process.status.value,
@@ -1054,6 +1060,7 @@ class InMemoryProjectRepository:
         self.projects[project_id] = project.model_copy(
             update={"default_currency": default_currency},
         )
+        self._set_project_resource_currency(project_id, default_currency)
 
     def set_project_due_at(
         self,
@@ -1440,6 +1447,7 @@ class InMemoryProjectRepository:
                 project_id=project_id,
                 process_id=f"process-{child.process_symbol}",
                 name=child.name,
+                description=child.description,
                 effective_at=edit_at,
                 duration_business_days=duration_days,
                 dependencies=[],
@@ -1557,6 +1565,10 @@ class InMemoryProjectRepository:
         ordered_process_ids = list(dict.fromkeys(process_ids))
         selected_process_ids = set(ordered_process_ids)
         active_graph = self._active_dependency_graph(project_id, edit_at)
+        process_symbol = new_process.process_symbol or self._unique_symbol(
+            project_id,
+            self._symbol_from_name(new_process.name),
+        )
         if not selected_process_ids:
             self._raise_validation(
                 ["command", "process_symbols"],
@@ -1579,7 +1591,7 @@ class InMemoryProjectRepository:
                 )
         self._validate_active_process_identity_available(
             project_id,
-            new_process.process_symbol,
+            process_symbol,
             owning_process_id=None,
         )
         incoming, outgoing = self._external_edges(
@@ -1648,8 +1660,9 @@ class InMemoryProjectRepository:
             duration_days = math.ceil(float(new_process.duration_hours) / 8)
         replacement, _revision = self.upsert_process_revision(
             project_id=project_id,
-            process_id=f"process-{new_process.process_symbol}",
+            process_id=f"process-{process_symbol}",
             name=new_process.name,
+            description=new_process.description,
             effective_at=edit_at,
             duration_business_days=duration_days,
             dependencies=sorted(incoming),
@@ -1663,7 +1676,7 @@ class InMemoryProjectRepository:
         )
         replacement = replacement.model_copy(
             update={
-                "symbol": new_process.process_symbol,
+                "symbol": process_symbol,
                 "status": new_process.status,
                 "finished_at": new_process.finished_at,
             }
@@ -2417,6 +2430,12 @@ class InMemoryProjectRepository:
             self.processes[process_id].symbol
             for process_id in self.process_ids_by_project[project_id]
         }
+        active_as_of = dt.datetime.max.replace(tzinfo=dt.UTC)
+        existing.update(
+            alias
+            for alias, process_id in self.process_aliases.get(project_id, {}).items()
+            if self._is_process_active_as_of(process_id, active_as_of)
+        )
         if base_symbol not in existing:
             return base_symbol
 
@@ -2424,6 +2443,15 @@ class InMemoryProjectRepository:
         while f"{base_symbol}{suffix}" in existing:
             suffix += 1
         return f"{base_symbol}{suffix}"
+
+    def _set_project_resource_currency(
+        self,
+        project_id: str,
+        default_currency: str,
+    ) -> None:
+        for resource_id in self.resource_ids_by_project.get(project_id, []):
+            if resource_id in self.resources:
+                self.resources[resource_id]["cost_currency"] = default_currency
 
     def _symbol_from_name(self, name: str) -> str:
         slug = "".join(

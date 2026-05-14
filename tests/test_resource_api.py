@@ -2268,6 +2268,7 @@ def test_resource_schedule_query_returns_documented_output_contract():
     assert set(row) == {
         "process_id",
         "name",
+        "description",
         "ready_at",
         "starts_at",
         "ends_at",
@@ -2281,6 +2282,7 @@ def test_resource_schedule_query_returns_documented_output_contract():
         "requirement_ids",
     }
     assert row["process_id"] == process_id
+    assert row["description"] == ""
     assert row["allocation_state"] == "complete"
     assert row["starts_at"] is not None
     assert row["ends_at"] is not None

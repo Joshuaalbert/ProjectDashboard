@@ -135,6 +135,7 @@ class UpsertProcessRevision(CommandModel):
     process_id: str | None = Field(default=None, min_length=1)
     process_symbol: str | None = Field(default=None, min_length=1)
     name: str = Field(min_length=1)
+    description: str = ""
     effective_at: AwareDatetime
     duration_business_days: int = Field(ge=0)
     dependencies: list[str] = Field(default_factory=list)
@@ -517,6 +518,7 @@ class SubgraphProcessCommand(CommandModel):
 
     process_symbol: str = Field(min_length=1)
     name: str = Field(min_length=1)
+    description: str = ""
     duration_hours: NonNegativeFloat | None = None
     earliest_start_at: AwareDatetime | None = None
     due_at: AwareDatetime | None = None
@@ -605,8 +607,9 @@ class ReplaceProcessWithSubgraph(CommandModel, ProcessIdentityMixin):
 class CollapseNewProcessCommand(CommandModel):
     """Replacement process payload for collapse_subgraph."""
 
-    process_symbol: str = Field(min_length=1)
+    process_symbol: str | None = Field(default=None, min_length=1)
     name: str = Field(min_length=1)
+    description: str = ""
     duration_hours: NonNegativeFloat | None = None
     earliest_start_at: AwareDatetime | None = None
     due_at: AwareDatetime | None = None

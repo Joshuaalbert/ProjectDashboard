@@ -32,6 +32,7 @@ def process_table_rows(graph_data: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "symbol": node.get("process_symbol"),
                 "name": node.get("name"),
+                "description": node.get("description"),
                 "status": node.get("status"),
                 "computed": node.get("computed_status"),
                 "duration_hours": node.get("duration_hours"),

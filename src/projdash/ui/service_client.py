@@ -367,21 +367,24 @@ def parse_dependency_lines(value: str) -> list[tuple[str, str]]:
 
 
 def parse_subgraph_process_lines(value: str) -> list[dict[str, Any]]:
-    """Parse child rows as `SYMBOL | Name | role_id:hours,...`.
+    """Parse child rows as `SYMBOL | Name | role_id:hours,... | Description`.
 
     The service still accepts a diagnostic ``duration_hours`` field for
     topology rewrites. The UI derives it from total role effort so operators do
-    not maintain two duration-like inputs for the same child process.
+    not maintain two duration-like inputs for the same child process. The
+    description column is optional for compact input.
     """
     processes = []
     seen: set[str] = set()
     for line in split_lines(value):
         parts = [part.strip() for part in line.split("|")]
-        if len(parts) != 3:
+        if len(parts) not in {3, 4}:
             raise ValueError(
-                "Subgraph process lines must use `SYMBOL | Name | role_id:hours,...`."
+                "Subgraph process lines must use "
+                "`SYMBOL | Name | role_id:hours,... | Description`."
             )
-        symbol, name, effort_text = parts
+        symbol, name, effort_text = parts[:3]
+        description = parts[3] if len(parts) == 4 else ""
         if not symbol or not name:
             raise ValueError("Subgraph process symbols and names must be non-empty.")
         if symbol in seen:
@@ -390,6 +393,7 @@ def parse_subgraph_process_lines(value: str) -> list[dict[str, Any]]:
         process = {
             "process_symbol": symbol,
             "name": name,
+            "description": description,
         }
         role_requirements = _parse_role_effort_tokens(effort_text)
         process["role_requirements"] = role_requirements

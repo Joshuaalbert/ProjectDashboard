@@ -411,6 +411,7 @@ class ProcessGraphNode(StrictModel):
     process_symbol: str
     aliases: list[str] = Field(default_factory=list)
     name: str
+    description: str = ""
     duration_hours: float = Field(ge=0)
     earliest_start_at: AwareDatetime | None = None
     due_at: AwareDatetime | None = None
@@ -497,6 +498,7 @@ class ResourceScheduleRow(StrictModel):
 
     process_id: str
     name: str
+    description: str = ""
     ready_at: AwareDatetime | None = None
     starts_at: AwareDatetime | None = None
     ends_at: AwareDatetime | None = None
@@ -717,6 +719,7 @@ class ProcessRevisionRecord(StrictModel):
     project_id: str
     effective_at: AwareDatetime
     name: str
+    description: str = ""
     duration_business_days: int = Field(ge=0)
     dependencies: list[str] = Field(default_factory=list)
     due_at: AwareDatetime | None = None

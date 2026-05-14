@@ -30,6 +30,7 @@ EPSILON = 0.0001
 class _ProcessCpm:
     process_id: str
     name: str
+    description: str
     dependencies: tuple[str, ...]
     topo_index: int
     earliest_start_at: dt.datetime
@@ -1590,6 +1591,7 @@ def _compute_cpm(
         process_id: _ProcessCpm(
             process_id=process_id,
             name=str(process_by_id[process_id].get("name", process_id)),
+            description=str(process_by_id[process_id].get("description", "")),
             dependencies=dependencies.get(process_id, ()),
             topo_index=index,
             earliest_start_at=earliest_start[process_id],
@@ -1978,6 +1980,7 @@ def _process_row(
     return {
         "process_id": cpm.process_id,
         "name": cpm.name,
+        "description": cpm.description,
         "ready_at": ready_at,
         "starts_at": starts_at,
         "ends_at": ends_at,
