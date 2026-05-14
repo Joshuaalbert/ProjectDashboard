@@ -621,10 +621,10 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
             )
             selected_node = node_by_symbol.get(existing, {})
             process_symbol = st.text_input(
-                "New process symbol",
+                "New process symbol (optional)",
                 help=(
-                    "Canonical symbol for a new process. Existing processes use "
-                    "the selector above."
+                    "Leave blank to auto-generate a unique symbol from the name. "
+                    "Existing processes use the selector above."
                 ),
                 disabled=bool(existing),
             )
@@ -698,14 +698,10 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
             submitted = st.form_submit_button("Save revision")
         if submitted:
             active_symbol = existing or process_symbol.strip()
-            if not active_symbol:
-                st.error("Process symbol is required for new processes.")
-                return
             duration_days = int((selected_node.get("duration_hours") or 0) / 8)
             payload = {
                 "action": "upsert_process_revision",
                 "project_id": controls["project_id"],
-                "process_symbol": active_symbol,
                 "name": name,
                 "effective_at": combine_datetime(
                     effective_date,
@@ -737,6 +733,8 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
                 if role_id and effort > 0
                 else [],
             }
+            if active_symbol:
+                payload["process_symbol"] = active_symbol
             _apply_command(service, payload)
 
     _render_batch_process_menu(service, controls, graph, catalog, selected_symbols)
@@ -822,8 +820,8 @@ def _render_batch_process_menu(
 
         with st.form("batch_add_new_child"):
             child_symbol = st.text_input(
-                "New child symbol",
-                help="Canonical symbol for the new child process.",
+                "New child symbol (optional)",
+                help="Leave blank to auto-generate a unique symbol from the child name.",
             )
             child_name = st.text_input(
                 "New child name",
@@ -844,31 +842,30 @@ def _render_batch_process_menu(
                 help="Total role effort used by resource-aware scheduling.",
             )
             add_new_child = st.form_submit_button("Create child after selected")
-        if add_new_child and target_symbols and child_symbol:
-            _apply_command(
-                service,
-                {
-                    "action": "upsert_process_revision",
-                    "project_id": controls["project_id"],
-                    "process_symbol": child_symbol,
-                    "name": child_name,
-                    "effective_at": controls["as_of"],
-                    "duration_business_days": 0,
-                    "dependencies": [
-                        id_by_symbol[symbol]
-                        for symbol in target_symbols
-                        if symbol in id_by_symbol
-                    ],
-                    "role_requirements": [
-                        {
-                            "role_id": role_id,
-                            "effort_hours": effort,
-                        }
-                    ]
-                    if role_id and effort > 0
-                    else [],
-                },
-            )
+        if add_new_child and target_symbols and child_name:
+            payload = {
+                "action": "upsert_process_revision",
+                "project_id": controls["project_id"],
+                "name": child_name,
+                "effective_at": controls["as_of"],
+                "duration_business_days": 0,
+                "dependencies": [
+                    id_by_symbol[symbol]
+                    for symbol in target_symbols
+                    if symbol in id_by_symbol
+                ],
+                "role_requirements": [
+                    {
+                        "role_id": role_id,
+                        "effort_hours": effort,
+                    }
+                ]
+                if role_id and effort > 0
+                else [],
+            }
+            if child_symbol.strip():
+                payload["process_symbol"] = child_symbol.strip()
+            _apply_command(service, payload)
 
         with st.form("batch_collapse_selected"):
             new_symbol = st.text_input(

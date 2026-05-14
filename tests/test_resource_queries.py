@@ -91,6 +91,48 @@ def test_upsert_process_revision_respects_process_symbol_identity():
     assert graph["nodes"][0]["name"] == "Design updated"
 
 
+def test_upsert_process_revision_auto_generates_unique_symbol_from_name():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+
+    first = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "name": "Design API",
+            "effective_at": _iso(13, 9),
+            "duration_business_days": 0,
+        },
+    )
+    second = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "name": "Design API",
+            "effective_at": _iso(13, 10),
+            "duration_business_days": 0,
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 12),
+        },
+    )
+
+    symbols_by_process = {
+        node["process_id"]: node["process_symbol"]
+        for node in graph["nodes"]
+    }
+    assert symbols_by_process[first["process_id"]] == "design-api"
+    assert symbols_by_process[second["process_id"]] == "design-api1"
+
+
 def _weekday_windows() -> list[dict[str, object]]:
     return [
         {
