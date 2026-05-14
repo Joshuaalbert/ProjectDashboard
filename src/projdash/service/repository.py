@@ -24,6 +24,7 @@ from projdash.service.models import (
     ProjectRecord,
     ResourceHolidayCommand,
     RoleRequirementCommand,
+    ScheduleSnapshotRecord,
 )
 
 
@@ -36,7 +37,7 @@ class RetiredProcessRecord(ProcessRecord):
     def model_dump(self, *args, **kwargs):
         data = super().model_dump(*args, **kwargs)
         if kwargs.get("mode") == "json":
-            for field in ("retired_at", "finished_at"):
+            for field in ("retired_at", "started_at", "finished_at"):
                 if isinstance(data.get(field), str) and data[field].endswith("Z"):
                     data[field] = f"{data[field][:-1]}+00:00"
         return data
@@ -47,6 +48,12 @@ class RecordDict(dict):
 
     def model_dump(self, mode: str = "python") -> dict[str, Any]:
         return copy.deepcopy(dict(self))
+
+
+def _scope_get(scope: Any, field_name: str, default: Any = None) -> Any:
+    if isinstance(scope, dict):
+        return scope.get(field_name, default)
+    return getattr(scope, field_name, default)
 
 
 class ProjectRepository(Protocol):
@@ -120,6 +127,7 @@ class ProjectRepository(Protocol):
         process_id: str,
         status: ProcessStatus,
         edit_at: dt.datetime,
+        started_at: dt.datetime | None = None,
         finished_at: dt.datetime | None = None,
     ) -> tuple[ProcessRecord, str]:
         """Set explicit process status."""
@@ -250,6 +258,20 @@ class ProjectRepository(Protocol):
     ) -> ProjectScheduleInput:
         """Return the scheduling read model for a project."""
 
+    def record_schedule_snapshot(
+        self,
+        snapshot: ScheduleSnapshotRecord,
+    ) -> ScheduleSnapshotRecord:
+        """Persist a committed schedule snapshot."""
+
+    def schedule_snapshots_as_of(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        terminal_process_symbols: list[str] | None = None,
+    ) -> list[ScheduleSnapshotRecord]:
+        """Return committed schedule snapshots visible at a time."""
+
     def clone(self) -> ProjectRepository:
         """Return a deep copy for transactional batch application."""
 
@@ -280,6 +302,7 @@ class InMemoryProjectRepository:
         self.process_aliases: dict[str, dict[str, str]] = defaultdict(dict)
         self.process_alias_sources: dict[str, dict[str, str]] = defaultdict(dict)
         self.dependency_edge_ids: dict[tuple[str, str, str], str] = {}
+        self.schedule_snapshots: list[ScheduleSnapshotRecord] = []
 
     def create_project(
         self,
@@ -537,9 +560,17 @@ class InMemoryProjectRepository:
         process_id: str,
         status: ProcessStatus,
         edit_at: dt.datetime,
+        started_at: dt.datetime | None = None,
         finished_at: dt.datetime | None = None,
     ) -> tuple[ProcessRecord, str]:
         process = self._get_process(project_id, process_id)
+        lifecycle_started_at = self._resolve_lifecycle_started_at(
+            process=process,
+            status=status,
+            edit_at=edit_at,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
         lifecycle_finished_at = self._resolve_lifecycle_finished_at(
             process=process,
             status=status,
@@ -547,7 +578,11 @@ class InMemoryProjectRepository:
             finished_at=finished_at,
         )
         updated = process.model_copy(
-            update={"status": status, "finished_at": lifecycle_finished_at}
+            update={
+                "status": status,
+                "started_at": lifecycle_started_at,
+                "finished_at": lifecycle_finished_at,
+            }
         )
         self.processes[process_id] = updated
         return updated, new_id()
@@ -992,6 +1027,7 @@ class InMemoryProjectRepository:
                     dependencies=tuple(revision.dependencies),
                     duration_business_days=revision.duration_business_days,
                     explicit_status=process.status.value,
+                    started_at=process.started_at,
                     due_at=due_at,
                     earliest_start_at=revision.earliest_start_at,
                     start_at_earliest=revision.start_at_earliest,
@@ -1190,22 +1226,64 @@ class InMemoryProjectRepository:
                 due_values.append(due_at)
         return max(due_values, default=None)
 
+    def record_schedule_snapshot(
+        self,
+        snapshot: ScheduleSnapshotRecord,
+    ) -> ScheduleSnapshotRecord:
+        self.get_project(snapshot.project_id)
+        for existing in self.schedule_snapshots:
+            if existing.snapshot_id == snapshot.snapshot_id:
+                return existing
+        self.schedule_snapshots.append(snapshot)
+        self.schedule_snapshots.sort(
+            key=lambda item: (
+                item.project_id,
+                item.committed_at,
+                tuple(item.terminal_process_symbols),
+                item.snapshot_id,
+            )
+        )
+        return snapshot
+
+    def schedule_snapshots_as_of(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        terminal_process_symbols: list[str] | None = None,
+    ) -> list[ScheduleSnapshotRecord]:
+        self.get_project(project_id)
+        terminal_filter = tuple(sorted(terminal_process_symbols or []))
+        rows = []
+        for snapshot in self.schedule_snapshots:
+            if snapshot.project_id != project_id:
+                continue
+            if snapshot.committed_at > as_of:
+                continue
+            if tuple(snapshot.terminal_process_symbols) != terminal_filter:
+                continue
+            rows.append(snapshot)
+        return rows
+
     def process_ids_for_scope(
         self,
         project_id: str,
         as_of: dt.datetime,
         scope: Any,
     ) -> tuple[set[str], dict[str, Any], str | None]:
-        if scope is None or getattr(scope, "type", "project") == "project":
+        scope_type = _scope_get(scope, "type", "project")
+        if scope is None or scope_type == "project":
             return (
                 set(self.active_process_ids_as_of(project_id, as_of)),
                 {"type": "project"},
                 None,
             )
-        if getattr(scope, "type", None) == "target_process":
-            process_id = getattr(scope, "process_id", None)
+        if scope_type == "target_process":
+            process_id = _scope_get(scope, "process_id")
             if process_id is None:
-                process_id = self.resolve_process_id(project_id, scope.process_symbol)
+                process_id = self.resolve_process_id(
+                    project_id,
+                    _scope_get(scope, "process_symbol"),
+                )
             else:
                 self._get_process(project_id, process_id)
             return (
@@ -1213,11 +1291,12 @@ class InMemoryProjectRepository:
                 {"type": "target_process", "process_id": process_id},
                 process_id,
             )
-        root_symbols = scope.root_process_symbols
+        root_symbols = _scope_get(scope, "root_process_symbols")
         roots = [self.resolve_process_id(project_id, symbol) for symbol in root_symbols]
         graph = self._active_dependency_graph(project_id, as_of)
         selected: set[str] = set()
-        direction = getattr(scope.direction, "value", scope.direction)
+        raw_direction = _scope_get(scope, "direction")
+        direction = getattr(raw_direction, "value", raw_direction)
         for root_id in roots:
             if direction in {"descendants", "ancestors_and_descendants"}:
                 selected.add(root_id)
@@ -1655,6 +1734,7 @@ class InMemoryProjectRepository:
         self.process_aliases = other.process_aliases
         self.process_alias_sources = other.process_alias_sources
         self.dependency_edge_ids = other.dependency_edge_ids
+        self.schedule_snapshots = other.schedule_snapshots
 
     def _record_due_history_event(
         self,
@@ -1753,6 +1833,7 @@ class InMemoryProjectRepository:
             project_id=process.project_id,
             symbol=process.symbol,
             status=process.status,
+            started_at=process.started_at,
             finished_at=process.finished_at,
             retired_at=retired_at,
         )
@@ -2156,6 +2237,31 @@ class InMemoryProjectRepository:
                 field_path="finished_at",
             )
         return None
+
+    def _resolve_lifecycle_started_at(
+        self,
+        *,
+        process: ProcessRecord,
+        status: ProcessStatus,
+        edit_at: dt.datetime,
+        started_at: dt.datetime | None,
+        finished_at: dt.datetime | None,
+    ) -> dt.datetime | None:
+        if started_at is not None and started_at > edit_at:
+            raise ServiceValidationError(
+                code="validation_error",
+                message="started_at must be no later than edit_at.",
+                field_path="started_at",
+            )
+        if status == ProcessStatus.PLANNED:
+            return None
+        if status in {ProcessStatus.IN_PROGRESS, ProcessStatus.PAUSED}:
+            return process.started_at or started_at or edit_at
+        if status == ProcessStatus.DONE:
+            return process.started_at or started_at or finished_at or edit_at
+        if status == ProcessStatus.CANCELED:
+            return process.started_at or started_at
+        return process.started_at
 
     def _validated_weekly_windows(
         self,

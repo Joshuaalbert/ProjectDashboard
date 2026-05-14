@@ -2276,6 +2276,7 @@ def test_resource_schedule_query_returns_documented_output_contract():
         "resource_delay_hours",
         "allocation_state",
         "status",
+        "started_at",
         "finished_at",
         "requirement_ids",
     }

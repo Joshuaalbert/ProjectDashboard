@@ -302,10 +302,8 @@ Required tests:
   validation when both fields are supplied.
 - `bucket_size` fails validation on resource queries; `planning_granularity` is
   the accepted field.
-- `required_roles_transition_mode` is covered:
-  `allow_legacy` accepts either legacy or new role requirements but not both,
-  `dual_write_warn` returns a wrapper warning for legacy input, and
-  `require_role_requirements` rejects legacy `required_roles`.
+- Resource-aware process revisions require `role_requirements`; `required_roles`
+  is outside the target DSL.
 - Generated/default fields match the design defaults:
   `required_resource_count = 1`, `allocation_policy = split_allowed`,
   `blocked_policy = exclude`, and `planning_granularity = hour`.
@@ -494,9 +492,8 @@ Required tests:
   `as_of >= retired_at` omit the parent and retired edges; historical queries at
   `as_of < retired_at` still show the parent and original edges.
 - `collapse_subgraph` unions external inputs/outputs into one replacement
-  process, removes internal edges, preserves summed effort-hour requirements,
-  and applies legacy attention weighted-sum conservation when legacy
-  requirements are present.
+  process, removes internal edges, and preserves summed effort-hour
+  requirements.
 - `collapse_subgraph` persists soft-retirement fields for selected processes and
   retired edges, returns `retired_process_ids`, `retirement_event_ids`, and
   `retired_edge_ids`, and does not change lifecycle statuses.
@@ -607,7 +604,7 @@ Owned files:
 
 - `src/projdash/engine/schedule.py`
 - new `src/projdash/engine/resources.py` if the allocation code is large enough
-- `tests/test_schedule.py`
+- `tests/test_resource_schedule.py`
 
 Public API changes:
 
@@ -633,12 +630,16 @@ Public API changes:
   not key capacity by role or multiply capacity by `role_ids`.
 - Implement ready queue ordering and eligible resource tie breakers exactly as
   specified in the design.
+- Allocate breadth-first by project-time bucket across all ready requirements;
+  do not let one ready requirement reserve future buckets ahead of peer
+  requirements that are ready in the current bucket.
 - Implement deterministic water-filling for `split_allowed` allocation,
   including `0.0001` hour comparison tolerance, redistribution after caps or
   unavailable buckets, and documented adjacent-slice coalescing.
 - Recompute process resource duration every iteration from assigned slice
   utilization to 100%, including partial availability, multiple roles, and
-  multiple resources per role.
+  multiple resources per role. Processes with role effort use allocated bucket
+  effort rather than dependency-business-day duration.
 - Implement iterative convergence using normalized readiness/start/finish maps,
   allocation states, unallocated reason maps, and allocation-slice fingerprint
   stability, with explicit handling for null values.
@@ -646,6 +647,9 @@ Public API changes:
 Required tests:
 
 - A shared resource delays lower-priority work through the contention ledger.
+- Ready requirements allocate breadth-first by project-time bucket, so short
+  peer work that is ready in the current bucket is not pushed behind one long
+  requirement's full future allocation.
 - A shared resource delay propagates to downstream dependencies.
 - A predecessor with null `ends_at`, including blocked predecessors under
   `exclude` or `include_as_zero_capacity`, prevents successors from allocating
@@ -690,12 +694,16 @@ Required tests:
   tests do not treat it as the source of truth for cost.
 - Adjacent same-resource fragments are coalesced when allowed by the design.
 - Multi-role resources share one bucket ledger across role requirements; total
-  allocation across roles cannot exceed the resource bucket.
+  allocation across roles cannot exceed the resource bucket, and same-process
+  multi-role requirements participate in the same breadth-first bucket sweep as
+  other ready requirements.
 - Scheduler-produced buckets never exceed 100% utilization:
   `allocated_hours <= capacity_hours + 0.0001`.
 - Resource scheduling integration uses multiple IANA timezones with
   non-identical weekly schedules and proves deterministic allocation across the
   resulting UTC buckets.
+- Resource scheduling integration covers timezone-aware resource holidays that
+  close only the affected resource's matching capacity buckets.
 - Iteration cap returns `converged = false`, final iteration output, and a
   `max_iterations_reached` warning in `QueryResult.warnings`.
 - Convergence tests cover complete null-to-non-null and non-null-to-null finish
@@ -714,7 +722,9 @@ Required tests:
   `iteration_not_converged` reasons only for still-unstable requirements.
 - Resource-aware critical path returns one canonical process-level path ordered
   from earliest gating process to project finish, applies documented tie
-  breakers, and does not emit contention or allocation graph edges.
+  breakers, uses hour-bucket/resource-utilization-derived starts and finishes
+  instead of business-day arithmetic for processes with role effort, and does
+  not emit contention or allocation graph edges.
 - Dependency-only `query_critical_path` expectations remain unchanged.
 - Dependency-only graph output labels critical and non-critical nodes from CPM
   slack, while resource-aware output keeps converged fields separate.

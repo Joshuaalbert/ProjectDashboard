@@ -415,6 +415,7 @@ class ProcessGraphNode(StrictModel):
     earliest_start_at: AwareDatetime | None = None
     due_at: AwareDatetime | None = None
     status: ProcessStatus
+    started_at: AwareDatetime | None = None
     finished_at: AwareDatetime | None = None
     computed_status: ComputedStatus
     blocker_summary: BlockerSummary
@@ -673,7 +674,39 @@ class ProcessRecord(StrictModel):
     project_id: str
     symbol: str
     status: ProcessStatus = ProcessStatus.PLANNED
+    started_at: AwareDatetime | None = None
     finished_at: AwareDatetime | None = None
+
+
+class ScheduleSnapshotRecord(StrictModel):
+    """Committed schedule completion snapshot for slippage history."""
+
+    snapshot_id: str
+    project_id: str
+    committed_at: AwareDatetime
+    terminal_process_symbols: list[str] = Field(default_factory=list)
+    schedule_basis: ScheduleBasis = ScheduleBasis.RESOURCE_AWARE
+    completion_at: AwareDatetime | None = None
+    derived_due_at: AwareDatetime | None = None
+    horizon_starts_at: AwareDatetime
+    horizon_ends_at: AwareDatetime
+    converged: bool | None = None
+    unallocated_count: int = Field(ge=0, default=0)
+    note: str | None = None
+
+    def model_dump(self, *args, **kwargs):
+        data = super().model_dump(*args, **kwargs)
+        if kwargs.get("mode") == "json":
+            for field in (
+                "committed_at",
+                "completion_at",
+                "derived_due_at",
+                "horizon_starts_at",
+                "horizon_ends_at",
+            ):
+                if isinstance(data.get(field), str) and data[field].endswith("Z"):
+                    data[field] = f"{data[field][:-1]}+00:00"
+        return data
 
 
 class ProcessRevisionRecord(StrictModel):

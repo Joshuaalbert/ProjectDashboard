@@ -83,6 +83,44 @@ def test_schedule_projection_computes_critical_path_datetimes():
     assert nodes[review_id]["dependency_only"]["slack_hours"] == 0
 
 
+def test_schedule_roots_at_project_start_even_on_non_business_day():
+    service = ProjectService(InMemoryProjectRepository())
+    saturday_start = dt.datetime(2026, 5, 16, 9, tzinfo=UTC)
+    project_id = service.handle_command(
+        CommandEnvelope(
+            command=CreateProject(
+                name="Weekend Root",
+                start_at=saturday_start,
+            )
+        )
+    ).entity_ids["project_id"]
+    process_id = service.handle_command(
+        CommandEnvelope(
+            command=UpsertProcessRevision(
+                project_id=project_id,
+                name="Zero Duration",
+                effective_at=saturday_start,
+                duration_business_days=0,
+            )
+        )
+    ).entity_ids["process_id"]
+
+    result = service.handle_query(
+        QueryEnvelope(
+            query=QueryProcessGraph(
+                project_id=project_id,
+                as_of=saturday_start,
+                now=saturday_start,
+            )
+        )
+    )
+    node = result.data["nodes"][0]
+
+    assert node["process_id"] == process_id
+    assert node["dependency_only"]["es_at"] == saturday_start.isoformat()
+    assert node["dependency_only"]["ef_at"] == saturday_start.isoformat()
+
+
 def test_critical_path_query_returns_ordered_process_ids():
     service, project_id, design_id, implementation_id, review_id = _project_with_processes()
 

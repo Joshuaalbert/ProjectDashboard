@@ -36,6 +36,7 @@ def process_table_rows(graph_data: dict[str, Any]) -> list[dict[str, Any]]:
                 "computed": node.get("computed_status"),
                 "duration_hours": node.get("duration_hours"),
                 "due_at": node.get("due_at"),
+                "started_at": node.get("started_at"),
                 "dep_start": dependency.get("es_at"),
                 "dep_finish": dependency.get("ef_at"),
                 "slack_hours": dependency.get("slack_hours"),

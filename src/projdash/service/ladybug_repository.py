@@ -24,6 +24,7 @@ from projdash.service.models import (
     ProcessRevisionRecord,
     ProjectRecord,
     RoleRequirementCommand,
+    ScheduleSnapshotRecord,
 )
 from projdash.service.repository import (
     InMemoryProjectRepository,
@@ -47,6 +48,7 @@ SCHEMA_STATEMENTS = (
         project_id STRING,
         symbol STRING,
         status STRING,
+        started_at STRING,
         finished_at STRING,
         is_active BOOL,
         retired_at STRING,
@@ -200,6 +202,22 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE NODE TABLE IF NOT EXISTS ScheduleSnapshot(
+        snapshot_id STRING PRIMARY KEY,
+        project_id STRING,
+        committed_at STRING,
+        terminal_process_symbols STRING[],
+        schedule_basis STRING,
+        completion_at STRING,
+        derived_due_at STRING,
+        horizon_starts_at STRING,
+        horizon_ends_at STRING,
+        converged BOOL,
+        unallocated_count INT64,
+        note STRING
+    )
+    """,
+    """
     CREATE NODE TABLE IF NOT EXISTS CommandReplay(
         command_id STRING PRIMARY KEY,
         payload_hash STRING,
@@ -278,6 +296,7 @@ SCHEMA_STATEMENTS = (
 )
 
 SNAPSHOT_NODE_TABLES = (
+    "ScheduleSnapshot",
     "DueDateHistoryEvent",
     "Blocker",
     "ProcessAlias",
@@ -935,19 +954,21 @@ class LadybugProjectRepository:
             """
             MATCH (process:Process)
             RETURN process.process_id, process.project_id, process.symbol,
-                   process.status, process.finished_at, process.is_active,
-                   process.retired_at
+                   process.status, process.started_at, process.finished_at,
+                   process.is_active, process.retired_at
             ORDER BY process.project_id, process.process_id
             """
         ):
-            retired_at = _datetime_or_none(row[6])
-            finished_at = _datetime_or_none(row[4])
+            retired_at = _datetime_or_none(row[7])
+            started_at = _datetime_or_none(row[4])
+            finished_at = _datetime_or_none(row[5])
             if retired_at is not None:
                 process = RetiredProcessRecord(
                     process_id=row[0],
                     project_id=row[1],
                     symbol=row[2],
                     status=row[3] or "planned",
+                    started_at=started_at,
                     finished_at=finished_at,
                     retired_at=retired_at,
                 )
@@ -957,6 +978,7 @@ class LadybugProjectRepository:
                     project_id=row[1],
                     symbol=row[2],
                     status=row[3] or "planned",
+                    started_at=started_at,
                     finished_at=finished_at,
                 )
             projection.processes[process.process_id] = process
@@ -1002,6 +1024,7 @@ class LadybugProjectRepository:
         self._load_resources(projection)
         self._load_blockers(projection)
         self._load_due_history(projection)
+        self._load_schedule_snapshots(projection)
         self._load_aliases(projection)
         self._load_retirements(projection)
         return projection
@@ -1035,19 +1058,23 @@ class LadybugProjectRepository:
         for process in repository.processes.values():
             retirement = repository.retired_processes.get(process.process_id, {})
             retired_at = retirement.get("retired_at", getattr(process, "retired_at", None))
+            process_properties = {
+                "process_id": process.process_id,
+                "project_id": process.project_id,
+                "symbol": process.symbol,
+                "status": _value_or_enum_value(process.status),
+                "finished_at": _isoformat_or_none(process.finished_at),
+                "is_active": retired_at is None,
+                "retired_at": _isoformat_or_none(retired_at),
+                "retired_by_command_id": retirement.get("retired_by_command_id"),
+                "retirement_reason": retirement.get("retirement_reason"),
+            }
+            process_properties["started_at"] = _isoformat_or_none(
+                process.started_at,
+            )
             self._create_node(
                 "Process",
-                {
-                    "process_id": process.process_id,
-                    "project_id": process.project_id,
-                    "symbol": process.symbol,
-                    "status": _value_or_enum_value(process.status),
-                    "finished_at": _isoformat_or_none(process.finished_at),
-                    "is_active": retired_at is None,
-                    "retired_at": _isoformat_or_none(retired_at),
-                    "retired_by_command_id": retirement.get("retired_by_command_id"),
-                    "retirement_reason": retirement.get("retirement_reason"),
-                },
+                process_properties,
             )
             self._create_relationship(
                 "Project",
@@ -1100,6 +1127,7 @@ class LadybugProjectRepository:
         self._persist_aliases(repository)
         self._persist_blockers(repository)
         self._persist_due_history(repository)
+        self._persist_schedule_snapshots(repository)
 
     def _validate_snapshot_storage_keys(
         self,
@@ -1138,6 +1166,9 @@ class LadybugProjectRepository:
             ],
             "DueDateHistoryEvent.event_id": [
                 event["event_id"] for event in repository.due_history_events
+            ],
+            "ScheduleSnapshot.snapshot_id": [
+                snapshot.snapshot_id for snapshot in repository.schedule_snapshots
             ],
             "ProcessRetirementEvent.retirement_event_id": [
                 retirement["retirement_event_id"]
@@ -1502,6 +1533,31 @@ class LadybugProjectRepository:
                     event["event_id"],
                 )
 
+    def _persist_schedule_snapshots(
+        self,
+        repository: InMemoryProjectRepository,
+    ) -> None:
+        for snapshot in repository.schedule_snapshots:
+            self._create_node(
+                "ScheduleSnapshot",
+                {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "project_id": snapshot.project_id,
+                    "committed_at": _isoformat_or_string(snapshot.committed_at),
+                    "terminal_process_symbols": snapshot.terminal_process_symbols,
+                    "schedule_basis": _value_or_enum_value(snapshot.schedule_basis),
+                    "completion_at": _isoformat_or_none(snapshot.completion_at),
+                    "derived_due_at": _isoformat_or_none(snapshot.derived_due_at),
+                    "horizon_starts_at": _isoformat_or_string(
+                        snapshot.horizon_starts_at,
+                    ),
+                    "horizon_ends_at": _isoformat_or_string(snapshot.horizon_ends_at),
+                    "converged": snapshot.converged,
+                    "unallocated_count": snapshot.unallocated_count,
+                    "note": snapshot.note,
+                },
+            )
+
     def _persist_retirements(self, repository: InMemoryProjectRepository) -> None:
         for process_id, retirement in repository.retired_processes.items():
             self._create_node(
@@ -1809,6 +1865,37 @@ class LadybugProjectRepository:
                 in {"set_project_due_at", "clear_project_due_at"}
             ):
                 projection.project_due_at[event["project_id"]] = event["after_due_at"]
+
+    def _load_schedule_snapshots(self, projection: InMemoryProjectRepository) -> None:
+        if "ScheduleSnapshot" not in self.table_names():
+            return
+        for row in self._rows(
+            """
+            MATCH (snapshot:ScheduleSnapshot)
+            RETURN snapshot.snapshot_id, snapshot.project_id, snapshot.committed_at,
+                   snapshot.terminal_process_symbols, snapshot.schedule_basis,
+                   snapshot.completion_at, snapshot.derived_due_at,
+                   snapshot.horizon_starts_at, snapshot.horizon_ends_at,
+                   snapshot.converged, snapshot.unallocated_count, snapshot.note
+            ORDER BY snapshot.project_id, snapshot.committed_at, snapshot.snapshot_id
+            """
+        ):
+            projection.schedule_snapshots.append(
+                ScheduleSnapshotRecord(
+                    snapshot_id=row[0],
+                    project_id=row[1],
+                    committed_at=_datetime_from_storage(row[2]),
+                    terminal_process_symbols=list(row[3] or []),
+                    schedule_basis=row[4] or "resource_aware",
+                    completion_at=_datetime_or_none(row[5]),
+                    derived_due_at=_datetime_or_none(row[6]),
+                    horizon_starts_at=_datetime_from_storage(row[7]),
+                    horizon_ends_at=_datetime_from_storage(row[8]),
+                    converged=row[9],
+                    unallocated_count=row[10] or 0,
+                    note=row[11],
+                )
+            )
 
     def _load_aliases(self, projection: InMemoryProjectRepository) -> None:
         source_clause = ", alias.source" if self._has_column("ProcessAlias", "source") else ""

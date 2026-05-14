@@ -83,6 +83,7 @@ def main() -> None:
             "Graph",
             "Resources",
             "Schedule",
+            "Slippage",
             "Costs",
             "History",
             "Topology",
@@ -101,15 +102,21 @@ def main() -> None:
     with tabs[5]:
         _render_schedule(context)
     with tabs[6]:
-        _render_costs(context)
+        _render_slippage(service, controls, context)
     with tabs[7]:
-        _render_history(context)
+        _render_costs(context)
     with tabs[8]:
+        _render_history(context)
+    with tabs[9]:
         _render_topology(service, controls, context)
 
 
 def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, Any]:
     now_utc = dt.datetime.now(dt.UTC)
+    override_as_of = st.session_state.pop("as_of_override", None)
+    if isinstance(override_as_of, str):
+        override_as_of = _parse_iso_datetime(override_as_of, now_utc)
+    default_as_of = override_as_of if isinstance(override_as_of, dt.datetime) else now_utc
     st.sidebar.text_input(
         "Service database",
         db_path,
@@ -149,12 +156,12 @@ def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, A
         st.stop()
     as_of_date = st.sidebar.date_input(
         "As of date",
-        now_utc.date(),
+        default_as_of.date(),
         help="Planning snapshot date for schedule and history queries.",
     )
     as_of_time = st.sidebar.time_input(
         "As of time",
-        now_utc.time().replace(microsecond=0),
+        default_as_of.time().replace(microsecond=0),
         help="Planning snapshot time for schedule and history queries.",
     )
     now_at = combine_datetime(as_of_date, as_of_time, timezone_name)
@@ -178,6 +185,17 @@ def _calendar_label(calendar_id: str, options: list[Any]) -> str:
         return "Create a new calendar"
     labels = {option.calendar_id: option.label for option in options}
     return labels.get(calendar_id, calendar_id)
+
+
+def _snapshot_label(snapshot_id: str, snapshots: list[dict[str, Any]]) -> str:
+    if not snapshot_id:
+        return "Select a committed timestamp"
+    rows = {snapshot["snapshot_id"]: snapshot for snapshot in snapshots}
+    snapshot = rows.get(snapshot_id)
+    if snapshot is None:
+        return snapshot_id
+    completion = snapshot.get("completion_at") or "unresolved"
+    return f"{snapshot.get('committed_at')} -> {completion}"
 
 
 def _render_first_run(service, controls: dict[str, Any]) -> None:
@@ -269,6 +287,7 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         "full_graph": None,
         "blockers": None,
         "history": None,
+        "schedule_snapshots": None,
         "catalog": None,
         "resource_schedule": None,
         "capacity": None,
@@ -348,6 +367,15 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "as_of": controls["as_of"],
             **scoped_query,
             "include_project_total": True,
+        },
+    )
+    base["schedule_snapshots"] = _query(
+        service,
+        {
+            "action": "query_schedule_snapshots",
+            "project_id": project_id,
+            "as_of": controls["as_of"],
+            "terminal_process_symbols": terminal_symbols,
         },
     )
     resource_query = {
@@ -893,6 +921,20 @@ def _render_process_status_form(
                 ["planned", "in_progress", "paused", "done", "canceled"],
                 help="Lifecycle status for the selected process.",
             )
+            started_enabled = st.checkbox(
+                "Set started time",
+                help="Record the actual start datetime that pins ES and LS.",
+            )
+            started_date = st.date_input(
+                "Started date",
+                controls["as_of"].date(),
+                help="Actual start date.",
+            )
+            started_time = st.time_input(
+                "Started time",
+                controls["as_of"].time(),
+                help="Actual start time.",
+            )
             finished_enabled = st.checkbox(
                 "Set finished time",
                 help="Record a completion datetime when applicable.",
@@ -918,6 +960,13 @@ def _render_process_status_form(
                     "process_symbol": process_symbol,
                     "status": status,
                     "edit_at": controls["as_of"],
+                    "started_at": combine_datetime(
+                        started_date,
+                        started_time,
+                        controls["timezone"],
+                    )
+                    if started_enabled
+                    else None,
                     "finished_at": combine_datetime(
                         finished_date,
                         finished_time,
@@ -1695,6 +1744,82 @@ def _render_heatmap(
     fig.colorbar(image, ax=ax, label="Utilization")
     fig.tight_layout()
     st.pyplot(fig)
+
+
+def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    terminal_symbols = context.get("terminal_symbols") or []
+    snapshots = (context.get("schedule_snapshots") or {}).get("snapshots", [])
+    st.subheader("Committed schedule snapshots")
+    with st.form("commit_project_state"):
+        note = st.text_input(
+            "Commit note",
+            help="Optional note stored with this committed schedule snapshot.",
+        )
+        commit = st.form_submit_button("Commit current state")
+    if commit:
+        _apply_command(
+            service,
+            {
+                "action": "commit_project_state",
+                "project_id": controls["project_id"],
+                "committed_at": controls["as_of"],
+                "terminal_process_symbols": terminal_symbols,
+                "note": note or None,
+            },
+        )
+
+    plotted_rows = [
+        {
+            **snapshot,
+            "committed_at_dt": _parse_iso_datetime(
+                snapshot.get("committed_at"),
+                controls["as_of"],
+            ),
+            "completion_at_dt": _parse_iso_datetime(
+                snapshot.get("completion_at"),
+                controls["as_of"],
+            )
+            if snapshot.get("completion_at")
+            else None,
+        }
+        for snapshot in snapshots
+    ]
+    chart_rows = [row for row in plotted_rows if row["completion_at_dt"] is not None]
+    if chart_rows:
+        fig, ax = plt.subplots(figsize=(12, 3.5))
+        ax.plot(
+            [row["committed_at_dt"] for row in chart_rows],
+            [row["completion_at_dt"] for row in chart_rows],
+            marker="o",
+        )
+        ax.set_xlabel("Commit time")
+        ax.set_ylabel("Calculated completion")
+        locator = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.yaxis.set_major_locator(locator)
+        ax.yaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        fig.tight_layout()
+        st.pyplot(fig)
+    st.dataframe(snapshots, use_container_width=True, hide_index=True)
+
+    if not snapshots:
+        return
+    snapshot_options = [snapshot["snapshot_id"] for snapshot in snapshots]
+    selected_snapshot_id = st.selectbox(
+        "Historical commit",
+        [""] + snapshot_options,
+        format_func=lambda value: _snapshot_label(value, snapshots),
+        help="Choose a committed schedule timestamp to load into the as-of controls.",
+    )
+    if st.button("Load commit timestamp") and selected_snapshot_id:
+        selected = next(
+            snapshot
+            for snapshot in snapshots
+            if snapshot["snapshot_id"] == selected_snapshot_id
+        )
+        st.session_state["as_of_override"] = selected["committed_at"]
+        st.rerun()
 
 
 def _render_costs(context: dict[str, Any]) -> None:

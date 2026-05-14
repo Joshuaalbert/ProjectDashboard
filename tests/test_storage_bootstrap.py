@@ -77,6 +77,7 @@ def test_schema_statements_include_resource_graph_and_replay_contracts():
         "rolerequirement",
         "processalias",
         "duedatehistoryevent",
+        "schedulesnapshot",
         "commandreplay",
         "has_role",
         "has_resource",
@@ -111,6 +112,7 @@ def test_schema_statements_include_resource_graph_and_replay_contracts():
         "before_due_at",
         "after_due_at",
         "is_active",
+        "started_at",
         "retired_at",
         "retired_by_command_id",
         "retirement_reason",
@@ -123,6 +125,9 @@ def test_schema_statements_include_resource_graph_and_replay_contracts():
         "payload_hash",
         "result_json",
         "holiday_id",
+        "committed_at",
+        "completion_at",
+        "terminal_process_symbols",
     ]:
         assert expected_field in sql
 
@@ -148,6 +153,7 @@ def test_bootstrap_creates_reopenable_schema_metadata(tmp_path: Path):
         "ProcessAlias",
         "Blocker",
         "DueDateHistoryEvent",
+        "ScheduleSnapshot",
         "CommandReplay",
     }
     expected_relationship_tables = {
@@ -183,11 +189,19 @@ def test_bootstrap_creates_reopenable_schema_metadata(tmp_path: Path):
         "symbol",
         "status",
         "finished_at",
+        "started_at",
         "is_active",
         "retired_at",
         "retired_by_command_id",
         "retirement_reason",
     } <= _columns(repository._conn, "Process")
+    assert {
+        "snapshot_id",
+        "project_id",
+        "committed_at",
+        "completion_at",
+        "terminal_process_symbols",
+    } <= _columns(repository._conn, "ScheduleSnapshot")
     assert {
         "resource_id",
         "project_id",
@@ -1514,6 +1528,89 @@ def test_ladybug_command_replay_survives_reopen(tmp_path: Path):
         RETURN count(project.project_id)
         """
     ).get_all() == [[1]]
+    _close(reopened)
+
+
+def test_ladybug_started_at_and_schedule_snapshots_survive_reopen(tmp_path: Path):
+    pytest.importorskip("real_ladybug")
+    db_path = tmp_path / "schedule-snapshot.lbug"
+    repository = LadybugProjectRepository(db_path)
+    service = ProjectService(repository)
+    _handle_ok(
+        service,
+        {
+            "action": "create_project",
+            "project_id": "project-snapshot",
+            "name": "Snapshot",
+            "start_at": _aware_iso(13, 9, UTC_MINUS_FOUR),
+        },
+    )
+    _handle_ok(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": "project-snapshot",
+            "process_symbol": "build",
+            "name": "Build",
+            "effective_at": _aware_iso(13, 9, UTC_MINUS_FOUR),
+            "duration_business_days": 1,
+        },
+    )
+    _handle_ok(
+        service,
+        {
+            "action": "set_process_status",
+            "project_id": "project-snapshot",
+            "process_symbol": "build",
+            "status": "in_progress",
+            "edit_at": _aware_iso(14, 12, UTC_MINUS_FOUR),
+            "started_at": _aware_iso(14, 11, UTC_MINUS_FOUR),
+        },
+    )
+    _handle_ok(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": "project-snapshot",
+            "committed_at": _aware_iso(14, 12, UTC_MINUS_FOUR),
+            "note": "Started build",
+        },
+    )
+    _close(repository)
+
+    reopened = LadybugProjectRepository(db_path)
+    reopened_service = ProjectService(reopened)
+    graph = reopened_service.handle_query(
+        QueryEnvelope.model_validate(
+            {
+                "query": {
+                    "action": "query_process_graph",
+                    "project_id": "project-snapshot",
+                    "as_of": _aware_iso(14, 13, UTC_MINUS_FOUR),
+                    "now": _aware_iso(14, 13, UTC_MINUS_FOUR),
+                }
+            }
+        ),
+    )
+    snapshots = reopened_service.handle_query(
+        QueryEnvelope.model_validate(
+            {
+                "query": {
+                    "action": "query_schedule_snapshots",
+                    "project_id": "project-snapshot",
+                    "as_of": _aware_iso(14, 13, UTC_MINUS_FOUR),
+                }
+            }
+        ),
+    )
+
+    assert graph.ok is True
+    node = graph.data["nodes"][0]
+    assert node["started_at"] == _aware_iso(14, 11, UTC_MINUS_FOUR)
+    assert node["dependency_only"]["es_at"] == _aware_iso(14, 11, UTC_MINUS_FOUR)
+    assert snapshots.ok is True
+    assert len(snapshots.data["snapshots"]) == 1
+    assert snapshots.data["snapshots"][0]["note"] == "Started build"
     _close(reopened)
 
 

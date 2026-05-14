@@ -331,9 +331,8 @@ Effort-hour semantics:
 
 - `effort_hours` is total work required for the role. It is not FTE and is not
   automatically multiplied by process duration.
-- Process duration still matters for dependency-only CPM and for the fallback
-  migration from `required_roles`; resource schedule finish is driven by
-  allocated effort.
+- Process duration still matters for dependency-only CPM diagnostics; resource
+  schedule finish is driven by allocated effort and consumed capacity buckets.
 - A requirement is complete when fulfilled slice effort equals `effort_hours`
   within `0.0001` hours.
 - `required_resource_count` is a concurrency ceiling, not a staffing minimum.
@@ -354,19 +353,11 @@ Effort-hour semantics:
 - `split_allowed` permits allocation across buckets, days, and eligible
   resources.
 
-Compatibility:
+Required payload:
 
-- During a transition, legacy `required_roles` may be mapped to requirements as
-  `effort_hours = duration_business_days * 8 * value`.
-- New commands should prefer `role_requirements`. A command must not set both
-  `required_roles` and `role_requirements`.
-- The service configuration flag `required_roles_transition_mode` controls
-  legacy behavior:
-  - `allow_legacy`: accept either `required_roles` or `role_requirements`.
-  - `dual_write_warn`: accept either shape and return a wrapper warning when
-    `required_roles` is used.
-  - `require_role_requirements`: reject `required_roles` for resource-aware
-    process revisions.
+- Resource-aware scheduling uses `role_requirements`.
+- `required_roles` is outside the target resource-aware DSL and must not be used
+  for new project-management workflows.
 
 ## Identity, Lifecycle, And Idempotency
 
@@ -581,14 +572,6 @@ Topology rewrite operations:
   counts, daily bounds, or allocation policy reject the command with
   `validation_error` / `collapse_role_requirement_conflict` unless explicit
   replacement role requirements are supplied.
-- Legacy attention/FTE values are conserved with
-  `sum(attention_i * duration_i) / subgraph_cp_duration`; zero inferred duration
-  with non-zero attention is rejected unless explicit replacement role
-  requirements are supplied. Legacy attention/FTE values do not derive
-  `required_resource_count`; once converted to effort-hour requirements, the
-  same count/bounds/policy compatibility rule applies. Mixed legacy
-  attention/FTE and effort-hour requirements for the same role require explicit
-  replacement requirements.
 - Rewrites reject empty selections, duplicate symbols, roots/leaves outside the
   child set, active external alias collisions, references to retired processes
   outside the command, and any candidate graph cycle.
@@ -769,19 +752,22 @@ same `remaining_hours`. A correct scheduler result never has
 `allocated_hours > capacity_hours + 0.0001` for any bucket; tiny residuals below
 `0.0001` hours are rounded to zero in comparisons and output clamping.
 
-### Ready Queue Ordering
+### Ready Demand
 
 The scheduler maintains a ready queue of requirements whose process dependency
 predecessors are complete in the current iteration and whose process is allowed
-by `blocked_policy`.
+by `blocked_policy`. Ready demand is evaluated inside each project-time bucket.
+The scheduler must not let one ready requirement reserve future buckets while
+other requirements that are ready for the current bucket have not had their
+bucket turn.
 
-Queue sort key:
+Requirement identity sort key, used only for deterministic output and residual
+rounding:
 
 1. earliest dependency/resource-constrained start,
-2. smaller dependency-only latest finish from CPM,
-3. dependency topological index,
-4. process id,
-5. requirement id.
+2. dependency topological index,
+3. process id,
+4. requirement id.
 
 Eligible resources for a requirement are sorted by:
 
@@ -790,26 +776,48 @@ Eligible resources for a requirement are sorted by:
 2. lower projected cost for the next bucket,
 3. resource id.
 
+### Global Bucket Sweep
+
+Allocation proceeds breadth-first by project-time bucket:
+
+1. Visit bucket intervals in UTC order at the requested `planning_granularity`.
+2. For the current bucket, build the ready queue from all requirements whose
+   process predecessors have feasible resource-aware finishes and whose
+   `ready_at` is before the bucket end.
+3. For each resource bucket in the current project-time interval, water-fill
+   that resource's remaining capacity across all ready requirements that can
+   consume the resource's roles, daily caps, concurrency ceiling, and
+   allocation policy.
+4. Refresh completed processes and successor readiness after the current bucket,
+   then advance to the next bucket.
+5. A requirement with remaining effort waits for later buckets; it does not
+   monopolize all future capacity ahead of peer requirements that are already
+   ready in the current bucket.
+
+This breadth-first sweep is separate from dependency-only CPM. Resource-aware
+starts, finishes, delay, and criticality are derived from allocation slices and
+consumed bucket capacity. Business-day arithmetic is not used for
+resource-aware starts, finishes, delay, slack, or criticality.
+
 ### Deterministic Fair Allocation
 
-`split_allowed` uses deterministic water-filling within each bucket instead of
-fixed percentage increments.
+`split_allowed` uses deterministic water-filling within each resource bucket
+instead of fixed percentage increments or serial requirement draining.
 
-For one ready requirement and one bucket interval:
+For one resource bucket and current project-time interval:
 
-1. Build candidate resource buckets that can fill the requirement role, overlap
-   the current bucket interval, have ledger `remaining_hours > 0.0001`, have
-   daily cap residual above `0.0001`, and are at or after the requirement
-   `ready_at`.
-2. Sort candidates by the eligible resource sort key above, then by bucket
-   `starts_at`, bucket `ends_at`, and `resource_id`. Select at most
-   `required_resource_count` candidates.
-3. For each selected candidate, compute headroom as the minimum of ledger
+1. Build candidate requirements that can consume the resource's role in the
+   current bucket, have remaining effort, have daily cap residual above
+   `0.0001`, have `ready_at` before the bucket end, and overlap the current
+   project-time bucket.
+2. Exclude candidates that have already reached their
+   `required_resource_count` concurrency ceiling for the bucket interval.
+3. For each candidate, compute headroom as the minimum of ledger
    `remaining_hours`, requirement daily cap residual for that resource local
-   date, candidate bucket `capacity_hours`, and remaining requirement effort.
-   Partial availability is already reflected by fractional `capacity_hours`.
-4. Let bucket demand be the smaller of remaining requirement effort and total
-   selected headroom. Raise all unfrozen selected candidates by the same
+   date, resource bucket capacity available after the requirement `ready_at`,
+   and remaining requirement effort.
+4. Let bucket demand be the smaller of resource bucket remaining capacity and
+   total candidate headroom. Raise all unfrozen candidates by the same
    allocation amount until either bucket demand is exhausted or one or more
    candidates hit their headroom. Freeze capped candidates, subtract their
    assigned effort, and redistribute the remaining demand evenly across the
@@ -820,10 +828,10 @@ For one ready requirement and one bucket interval:
    bucket's final `remaining_hours` to zero when its absolute value is below
    `0.0001`.
 
-This means identical eligible resources receive uniform allocations for the
-same requirement and bucket. When one candidate is unavailable or capped, its
-unused share is deterministically redistributed across the remaining candidates
-without exceeding any candidate headroom.
+This means identical ready requirements receive uniform allocations from the
+same resource bucket. When one candidate is complete, unavailable, or capped,
+its unused share is deterministically redistributed across the remaining
+candidates without exceeding any candidate headroom.
 
 `contiguous` does not use water-filling in v1 because it is single-resource.
 The scheduler selects the first eligible resource by the same resource sort key
@@ -834,30 +842,32 @@ non-working gaps.
 
 Exact algorithm:
 
-1. Compute CPM schedule and topological order from selected process revisions.
+1. Compute dependency topology and constraint-only ready metadata from selected
+   process revisions.
 2. Expand calendars for the query horizon.
-3. Initialize `previous_state_by_process` from CPM readiness, start, and finish
-   times clipped to the horizon start when necessary.
+3. Initialize `previous_state_by_process` from constraint-only readiness.
 4. For iteration `1..max_iterations`:
    - Clear the global contention ledger to full expanded capacity.
    - Set every process `ready_at` to the later of project start,
      `earliest_start_at`, dependency delay, and blocker policy effect when all
      dependency predecessors have non-null finishes. If any dependency
      predecessor has `ends_at = null`, set successor `ready_at = null`.
-   - Repeatedly build the ready queue from unallocated requirements whose
-     process dependencies have allocated finishes in this iteration.
-   - Pop the first ready requirement and allocate effort over eligible resource
-     buckets using the ledger, per-day caps, concurrency ceiling, allocation
-     policy, and half-open intervals.
+   - Visit project-time buckets in UTC order. Within each bucket, build ready
+     demand from unallocated requirements whose process dependencies have
+     allocated finishes in this iteration and whose `ready_at` is before the
+     bucket end.
+   - For each resource bucket, water-fill capacity across all ready demand that
+     can consume that resource using the ledger, per-day caps, concurrency
+     ceiling, allocation policy, and half-open intervals.
    - When all requirements for a process are fulfilled, set process finish to
-     the max requirement finish. A process with no requirements uses its CPM
-     finish after dependency/resource-constrained starts are applied.
+     the max requirement finish. A process with no requirements completes at
+     its resource-aware ready datetime.
    - Record unallocated requirements with structured reasons instead of
      dropping them.
    - Recompute dependent process ready times from predecessor finishes produced
      in this iteration.
-   - After the queue is empty, compare the normalized process state with
-     `previous_state_by_process`.
+   - After all buckets in the horizon have been swept, compare the normalized
+     process state with `previous_state_by_process`.
 5. Converged when every comparable process `ready_at`, `starts_at`, and
    `ends_at` changes by at most `convergence_tolerance_hours`, allocation
    states match, sorted unallocated reasons match, and the allocation-slice
@@ -935,7 +945,8 @@ Process duration recomputation:
 
 - Resource schedule duration is recomputed from assigned allocation slices on
   every iteration. The engine does not stretch or shrink persisted process
-  duration facts.
+  duration facts, and a process with role effort uses allocated bucket effort
+  rather than dependency-business-day duration.
 - Each requirement reaches 100% utilization when cumulative assigned slice
   `effort_hours` equals its `effort_hours` within `0.0001` hours. Assigned
   slices consume their selected resource bucket at 100% of the slice amount;
@@ -969,7 +980,10 @@ The engine derives criticality after iterative resource-constrained finish
 convergence. It uses final process `ready_at`, `starts_at`, `ends_at`, CPM
 metadata, and persisted process dependency edges. Resource contention changes
 process finish times through the global capacity ledger; the critical path does
-not introduce synthetic resource or allocation edges.
+not introduce synthetic resource or allocation edges. For processes with role
+effort, those final `starts_at` and `ends_at` values come from consumed
+timezone-aware capacity buckets and allocation slices, not from persisted
+business-day duration arithmetic.
 
 User-facing semantics and limitations:
 
@@ -1000,9 +1014,8 @@ Criticality rules:
   of the selected process. A predecessor gates the selected process when its
   resource-constrained finish is within `convergence_tolerance_hours` of the
   selected process `ready_at`.
-- If several predecessors gate the selected process, choose by smaller slack,
-  then dependency topological index, then lexicographically smallest
-  `process_id`.
+- If several predecessors gate the selected process, choose by dependency
+  topological index, then lexicographically smallest `process_id`.
 - Stop traversal when no dependency predecessor gates the selected process. A
   resource-delayed process with no gating predecessor is therefore a one-process
   critical path; its delay is still visible through `resource_delay_hours`.

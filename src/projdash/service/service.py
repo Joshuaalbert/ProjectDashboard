@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import inspect
+import json
 from collections import defaultdict
 from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal
@@ -25,6 +27,7 @@ from projdash.service.commands import (
     ClearProjectDueAt,
     CollapseSubgraph,
     CommandEnvelope,
+    CommitProjectState,
     CreateProject,
     CreateRole,
     DeactivateRole,
@@ -56,6 +59,8 @@ from projdash.service.errors import Error, ServiceValidationError, ValidationIss
 from projdash.service.identifiers import new_id
 from projdash.service.models import (
     RequiredRolesTransitionMode,
+    ScheduleBasis,
+    ScheduleSnapshotRecord,
     ServiceConfig,
     WarningSeverity,
 )
@@ -72,6 +77,7 @@ from projdash.service.queries import (
     QueryResourceCapacity,
     QueryResourceSchedule,
     QuerySchedule,
+    QueryScheduleSnapshots,
     QueryUnallocatedRequirements,
     QueryUtilization,
 )
@@ -336,6 +342,7 @@ class ProjectService:
                 process_id=process_id,
                 status=command.status,
                 edit_at=command.edit_at,
+                started_at=command.started_at,
                 finished_at=command.finished_at,
             )
             return CommandResult(
@@ -343,6 +350,15 @@ class ProjectService:
                 entity_ids={
                     "process_id": process.process_id,
                     "lifecycle_event_id": lifecycle_event_id,
+                },
+            )
+        if isinstance(command, CommitProjectState):
+            snapshot = self._commit_project_state(envelope, command)
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={
+                    "project_id": command.project_id,
+                    "schedule_snapshot_id": snapshot.snapshot_id,
                 },
             )
         if isinstance(command, SetProcessDueAt):
@@ -761,6 +777,8 @@ class ProjectService:
             data = self._blocker_data(query)
         elif isinstance(query, QueryDueDateHistory):
             data = self._due_date_history_data(query)
+        elif isinstance(query, QueryScheduleSnapshots):
+            data = self._schedule_snapshot_data(query)
         elif isinstance(query, QueryProcessGraph):
             data = self._process_graph_data(query)
         elif isinstance(query, QueryResourceSchedule):
@@ -830,6 +848,212 @@ class ProjectService:
         schedule_input = self._schedule_input_for_scope(project_id, as_of, scope)
         return compute_schedule(schedule_input, now)
 
+    def _commit_project_state(
+        self,
+        envelope: CommandEnvelope,
+        command: CommitProjectState,
+    ) -> ScheduleSnapshotRecord:
+        terminal_symbols = sorted(command.terminal_process_symbols)
+        scope = self._terminal_scope_data(terminal_symbols)
+        horizon_starts_at, horizon_ends_at = self._snapshot_horizon(
+            command.project_id,
+            command.committed_at,
+            scope,
+        )
+        schedule_query = QueryResourceSchedule(
+            project_id=command.project_id,
+            as_of=command.committed_at,
+            now=command.committed_at,
+            scope=scope,
+            horizon_starts_at=horizon_starts_at,
+            horizon_ends_at=horizon_ends_at,
+            include_allocation_slices=False,
+        )
+        schedule, _warnings = self._resource_schedule_data(schedule_query)
+        process_rows = list(schedule["processes"])
+        terminal_process_ids = self._terminal_process_ids(
+            command.project_id,
+            command.committed_at,
+            terminal_symbols,
+            process_rows,
+        )
+        terminal_rows = [
+            row for row in process_rows if row.get("process_id") in terminal_process_ids
+        ]
+        ends_at_values = []
+        for row in terminal_rows:
+            end_value = row.get("finished_at") or row.get("ends_at")
+            if end_value is not None:
+                ends_at_values.append(self._parse_datetime(end_value))
+        completion_at = None
+        if terminal_rows and len(ends_at_values) == len(terminal_rows):
+            completion_at = max(ends_at_values)
+        scoped_ids = None
+        if scope is not None:
+            scoped_ids, _scope_data, _target_id = (
+                self._repository.process_ids_for_scope(
+                    command.project_id,
+                    command.committed_at,
+                    schedule_query.scope,
+                )
+            )
+        derived_due_at = self._repository.derived_project_due_at(
+            command.project_id,
+            command.committed_at,
+            scoped_ids,
+        )
+        snapshot = ScheduleSnapshotRecord(
+            snapshot_id=self._schedule_snapshot_id(
+                command.project_id,
+                command.committed_at,
+                terminal_symbols,
+            ),
+            project_id=command.project_id,
+            committed_at=command.committed_at,
+            terminal_process_symbols=terminal_symbols,
+            schedule_basis=ScheduleBasis.RESOURCE_AWARE,
+            completion_at=completion_at,
+            derived_due_at=derived_due_at,
+            horizon_starts_at=horizon_starts_at,
+            horizon_ends_at=horizon_ends_at,
+            converged=schedule.get("converged"),
+            unallocated_count=len(schedule.get("unallocated_requirements", [])),
+            note=command.note,
+        )
+        recorder = getattr(self._repository, "record_schedule_snapshot", None)
+        if recorder is None:
+            raise ServiceValidationError(
+                code="unsupported_repository",
+                message="Repository does not support schedule snapshots.",
+            )
+        return recorder(snapshot)
+
+    def _terminal_process_ids(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        terminal_symbols: list[str],
+        process_rows: list[dict[str, object]],
+    ) -> set[str]:
+        if not terminal_symbols:
+            return {str(row["process_id"]) for row in process_rows}
+        return {
+            self._repository.resolve_process_id(project_id, symbol)
+            for symbol in terminal_symbols
+        }
+
+    def _snapshot_horizon(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        scope: dict[str, object] | None,
+    ) -> tuple[dt.datetime, dt.datetime]:
+        schedule_input = self._schedule_input_for_scope(project_id, as_of, scope)
+        projection = compute_schedule(schedule_input, as_of)
+        total_effort_hours = 0.0
+        for process in schedule_input.processes:
+            revision = self._repository.selected_revision_as_of(
+                project_id,
+                process.process_id,
+                as_of,
+            )
+            if revision is None:
+                continue
+            total_effort_hours += sum(
+                float(requirement.effort_hours)
+                for requirement in revision.role_requirements
+            )
+        horizon_start = min(schedule_input.start_at, as_of).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        horizon_finish = max(projection.completion_at, as_of)
+        horizon_end = self._resource_capacity_horizon_end(
+            project_id=project_id,
+            horizon_start=horizon_start,
+            seed_finish=horizon_finish,
+            total_effort_hours=total_effort_hours,
+        )
+        if horizon_end <= horizon_start:
+            horizon_end = horizon_start + dt.timedelta(days=1)
+        return horizon_start, horizon_end
+
+    def _resource_capacity_horizon_end(
+        self,
+        *,
+        project_id: str,
+        horizon_start: dt.datetime,
+        seed_finish: dt.datetime,
+        total_effort_hours: float,
+    ) -> dt.datetime:
+        horizon_end = (seed_finish + dt.timedelta(days=30)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        if total_effort_hours <= 0:
+            return horizon_end
+
+        for _attempt in range(8):
+            if horizon_end <= horizon_start:
+                horizon_end = horizon_start + dt.timedelta(days=1)
+            capacity_hours = sum(
+                float(bucket["capacity_hours"])
+                for bucket in self._expanded_capacity(
+                    project_id,
+                    horizon_start,
+                    horizon_end,
+                    None,
+                    None,
+                )
+            )
+            if capacity_hours + 0.0001 >= total_effort_hours:
+                return horizon_end
+            current_days = max(1, (horizon_end - horizon_start).days)
+            if capacity_hours <= 0:
+                next_days = current_days * 2
+            else:
+                next_days = int(current_days * max(2.0, total_effort_hours / capacity_hours))
+            horizon_end = horizon_start + dt.timedelta(days=min(next_days + 7, 3650))
+        return horizon_end
+
+    def _terminal_scope_data(
+        self,
+        terminal_symbols: list[str],
+    ) -> dict[str, object] | None:
+        if not terminal_symbols:
+            return None
+        return {
+            "type": "topo_filter",
+            "root_process_symbols": terminal_symbols,
+            "direction": "ancestors",
+        }
+
+    def _schedule_snapshot_id(
+        self,
+        project_id: str,
+        committed_at: dt.datetime,
+        terminal_process_symbols: list[str],
+    ) -> str:
+        payload = json.dumps(
+            {
+                "project_id": project_id,
+                "committed_at": committed_at.isoformat(),
+                "terminal_process_symbols": terminal_process_symbols,
+            },
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        return f"snapshot-{digest}"
+
+    def _parse_datetime(self, value: Any) -> dt.datetime:
+        if isinstance(value, dt.datetime):
+            return value
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
     def _schedule_data(self, query: QuerySchedule) -> dict[str, object]:
         graph = self._dependency_graph_parts(
             query.project_id,
@@ -875,12 +1099,6 @@ class ProjectService:
                 node["resource_aware"] = None
                 if row is not None:
                     resource_ends_at = row["ends_at"]
-                    dependency_ef_at = node["dependency_only"]["ef_at"]
-                    if (
-                        resource_ends_at is not None
-                        and resource_ends_at < dependency_ef_at
-                    ):
-                        resource_ends_at = dependency_ef_at
                     node["resource_aware"] = {
                         "ready_at": row["ready_at"],
                         "starts_at": row["starts_at"],
@@ -955,6 +1173,7 @@ class ProjectService:
                 row.process_id,
                 as_of,
             )
+            started_at = getattr(process, "started_at", None)
             finished_at = getattr(process, "finished_at", None)
             process_symbol = getattr(process, "symbol", row.process_id)
             computed_status = self._graph_computed_status(
@@ -996,6 +1215,7 @@ class ProjectService:
                 ),
                 "due_at": row.due_at.isoformat() if row.due_at else None,
                 "status": row.explicit_status,
+                "started_at": started_at.isoformat() if started_at else None,
                 "finished_at": finished_at.isoformat() if finished_at else None,
                 "computed_status": computed_status,
                 "blocker_summary": blocker_summary.get(
@@ -1306,6 +1526,25 @@ class ProjectService:
             ),
         }
 
+    def _schedule_snapshot_data(
+        self,
+        query: QueryScheduleSnapshots,
+    ) -> dict[str, object]:
+        snapshots = self._repository.schedule_snapshots_as_of(
+            query.project_id,
+            query.as_of,
+            query.terminal_process_symbols,
+        )
+        return {
+            "project_id": query.project_id,
+            "as_of": query.as_of.isoformat(),
+            "terminal_process_symbols": query.terminal_process_symbols,
+            "snapshots": [
+                snapshot.model_dump(mode="json")
+                for snapshot in snapshots
+            ],
+        }
+
     def _due_event_json(
         self,
         event: dict[str, Any],
@@ -1441,6 +1680,11 @@ class ProjectService:
                         self._enum_value(process.status)
                         if process is not None
                         else "planned"
+                    ),
+                    "started_at": (
+                        getattr(process, "started_at", None)
+                        if process is not None
+                        else None
                     ),
                     "due_at": revision.due_at,
                     "earliest_start_at": revision.earliest_start_at,
@@ -1986,6 +2230,9 @@ class ProjectService:
             if process is None:
                 continue
             row["status"] = self._enum_value(process.status)
+            row["started_at"] = (
+                process.started_at.isoformat() if process.started_at else None
+            )
             row["finished_at"] = (
                 process.finished_at.isoformat() if process.finished_at else None
             )
@@ -2050,8 +2297,17 @@ class ProjectService:
                         slice_data["starts_at"],
                         slice_data["ends_at"],
                     )
-                    bucket["allocated_hours"] += overlap
-                    bucket["remaining_hours"] -= overlap
+                    slice_hours = self._overlap_hours(
+                        slice_data["starts_at"],
+                        slice_data["ends_at"],
+                        slice_data["starts_at"],
+                        slice_data["ends_at"],
+                    )
+                    if slice_hours <= 0:
+                        continue
+                    capacity = float(slice_data["capacity_hours"]) * overlap / slice_hours
+                    bucket["allocated_hours"] += capacity
+                    bucket["remaining_hours"] -= capacity
         by_resource = []
         for resource_id in sorted({bucket["resource_id"] for bucket in buckets}):
             resource_buckets = [

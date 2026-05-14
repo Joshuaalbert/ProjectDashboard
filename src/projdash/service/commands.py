@@ -166,11 +166,14 @@ class SetProcessStatus(CommandModel, ProcessIdentityMixin):
     project_id: str = Field(min_length=1)
     status: ProcessStatus
     edit_at: AwareDatetime
+    started_at: AwareDatetime | None = None
     finished_at: AwareDatetime | None = None
     note: str | None = None
 
     @model_validator(mode="after")
     def _validate_finished_at_order(self) -> SetProcessStatus:
+        if self.started_at is not None and self.started_at > self.edit_at:
+            raise ValueError("started_at must be no later than edit_at.")
         if self.finished_at is not None and self.finished_at > self.edit_at:
             raise ValueError("finished_at must be no later than edit_at.")
         return self
@@ -210,6 +213,21 @@ class AddBlocker(CommandModel, ProcessIdentityMixin):
     def opened_at(self):
         """Backward-compatible blocker timestamp name for the prototype service."""
         return self.created_at
+
+
+class CommitProjectState(CommandModel):
+    """Persist a committed schedule snapshot for slippage tracking."""
+
+    action: Literal["commit_project_state"] = "commit_project_state"
+    project_id: str = Field(min_length=1)
+    committed_at: AwareDatetime
+    terminal_process_symbols: list[str] = Field(default_factory=list)
+    note: str | None = None
+
+    @field_validator("terminal_process_symbols")
+    @classmethod
+    def _validate_terminal_symbols(cls, value: list[str]) -> list[str]:
+        return validate_unique_non_empty(value, "terminal_process_symbols")
 
 
 class ResolveBlocker(CommandModel):
@@ -622,6 +640,7 @@ Command = Annotated[
     | ClearProjectDueAt
     | UpsertProcessRevision
     | SetProcessStatus
+    | CommitProjectState
     | SetProcessDueAt
     | AddBlocker
     | ResolveBlocker

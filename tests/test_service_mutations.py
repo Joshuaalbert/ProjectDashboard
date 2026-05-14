@@ -745,6 +745,284 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
     assert node["finished_at"] != node["resource_aware"]["ends_at"]
 
 
+def test_started_process_anchors_dependency_schedule_windows():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, _design_id, build_id, _ship_id = _seed_linear_graph(service)
+    started_at = _iso(14, 11)
+
+    started = _handle(
+        service,
+        {
+            "action": "set_process_status",
+            "project_id": project_id,
+            "process_id": build_id,
+            "status": "in_progress",
+            "edit_at": _iso(14, 12),
+            "started_at": started_at,
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(14, 13),
+            "now": _iso(14, 13),
+        },
+    ).data
+    node = next(node for node in graph["nodes"] if node["process_id"] == build_id)
+
+    assert started.ok is True
+    assert node["status"] == "in_progress"
+    assert node["started_at"] == started_at
+    assert node["dependency_only"]["es_at"] == started_at
+    assert node["dependency_only"]["ls_at"] == started_at
+    assert node["dependency_only"]["slack_hours"] == 0
+
+
+def test_commit_project_state_records_slippage_points_by_terminal_scope():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, _design_id, build_id, _ship_id = _seed_linear_graph(service)
+
+    first = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(13, 12),
+            "note": "Initial plan",
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "set_process_status",
+            "project_id": project_id,
+            "process_id": build_id,
+            "status": "in_progress",
+            "edit_at": _iso(14, 12),
+            "started_at": _iso(14, 11),
+        },
+    )
+    second = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(14, 12),
+            "note": "Build started late",
+        },
+    )
+    terminal = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(14, 13),
+            "terminal_process_symbols": ["build"],
+            "note": "Build-only target",
+        },
+    )
+    project_snapshots = _query(
+        service,
+        {
+            "action": "query_schedule_snapshots",
+            "project_id": project_id,
+            "as_of": _iso(14, 14),
+        },
+    ).data["snapshots"]
+    build_snapshots = _query(
+        service,
+        {
+            "action": "query_schedule_snapshots",
+            "project_id": project_id,
+            "as_of": _iso(14, 14),
+            "terminal_process_symbols": ["build"],
+        },
+    ).data["snapshots"]
+
+    assert first.ok is True
+    assert second.ok is True
+    assert terminal.ok is True
+    assert [row["completion_at"] for row in project_snapshots] == [
+        _iso(13, 9),
+        _iso(14, 11),
+    ]
+    assert project_snapshots[0]["terminal_process_symbols"] == []
+    assert project_snapshots[1]["note"] == "Build started late"
+    assert build_snapshots[0]["completion_at"] == _iso(14, 11)
+    assert build_snapshots[0]["terminal_process_symbols"] == ["build"]
+
+
+def test_schedule_snapshot_terminal_symbols_are_set_idempotent():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    alpha_id = _create_process(service, project_id, name="Alpha")
+    beta_id = _create_process(service, project_id, name="Beta", dependencies=[alpha_id])
+    _create_process(service, project_id, name="Gamma", dependencies=[beta_id])
+
+    first = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(13, 12),
+            "terminal_process_symbols": ["gamma", "beta"],
+        },
+    )
+    second = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(13, 12),
+            "terminal_process_symbols": ["beta", "gamma"],
+        },
+    )
+    snapshots = _query(
+        service,
+        {
+            "action": "query_schedule_snapshots",
+            "project_id": project_id,
+            "as_of": _iso(13, 13),
+            "terminal_process_symbols": ["gamma", "beta"],
+        },
+    ).data["snapshots"]
+
+    assert first.ok is True
+    assert second.ok is True
+    assert first.entity_ids["schedule_snapshot_id"] == (
+        second.entity_ids["schedule_snapshot_id"]
+    )
+    assert len(snapshots) == 1
+    assert snapshots[0]["terminal_process_symbols"] == ["beta", "gamma"]
+
+
+def test_commit_project_state_extends_horizon_to_sparse_resource_capacity():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    role_id = _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-sparse",
+            "name": "Sparse Specialist",
+        },
+    ).entity_ids["role_id"]
+    calendar_id = _handle(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-sparse",
+            "name": "Sparse Fridays",
+            "timezone": "UTC",
+            "weekly_windows": [
+                {
+                    "window_id": "friday-one-hour",
+                    "weekday": 4,
+                    "start_local_time": "09:00",
+                    "end_local_time": "10:00",
+                    "capacity_hours": 1,
+                },
+            ],
+        },
+    ).entity_ids["calendar_id"]
+    _handle(
+        service,
+        {
+            "action": "upsert_resource",
+            "project_id": project_id,
+            "resource_id": "resource-sparse",
+            "name": "Sparse Resource",
+            "role_ids": [role_id],
+            "calendar_id": calendar_id,
+            "available_from_at": _iso(13),
+            "cost_rate": "100.00",
+            "cost_unit": "hour",
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-sparse",
+            "name": "Sparse Work",
+            "effective_at": _iso(13),
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-sparse",
+                    "role_id": role_id,
+                    "effort_hours": 40,
+                },
+            ],
+        },
+    )
+
+    committed = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(13, 12),
+        },
+    )
+    snapshots = _query(
+        service,
+        {
+            "action": "query_schedule_snapshots",
+            "project_id": project_id,
+            "as_of": _iso(13, 13),
+        },
+    ).data["snapshots"]
+
+    assert committed.ok is True
+    assert snapshots[0]["completion_at"] is not None
+    assert snapshots[0]["unallocated_count"] == 0
+    assert snapshots[0]["horizon_ends_at"] > "2026-06-30T00:00:00+00:00"
+
+
+def test_done_terminal_snapshot_uses_actual_finished_at():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, _design_id, build_id, _ship_id = _seed_linear_graph(service)
+    _handle(
+        service,
+        {
+            "action": "set_process_status",
+            "project_id": project_id,
+            "process_id": build_id,
+            "status": "done",
+            "edit_at": _iso(14, 15),
+            "finished_at": _iso(14, 14),
+        },
+    )
+
+    result = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(14, 16),
+            "terminal_process_symbols": ["build"],
+        },
+    )
+    snapshots = _query(
+        service,
+        {
+            "action": "query_schedule_snapshots",
+            "project_id": project_id,
+            "as_of": _iso(14, 17),
+            "terminal_process_symbols": ["build"],
+        },
+    ).data["snapshots"]
+
+    assert result.ok is True
+    assert snapshots[0]["completion_at"] == _iso(14, 14)
+
+
 def test_cancel_unfinished_process_preserves_null_finished_at_without_inference():
     service = ProjectService(InMemoryProjectRepository())
     project_id, _, process_id, _ = _seed_linear_graph(service)

@@ -46,6 +46,7 @@ class ProcessScheduleInput:
     dependencies: tuple[str, ...]
     duration_business_days: int
     explicit_status: str
+    started_at: dt.datetime | None = None
     due_at: dt.datetime | None = None
     earliest_start_at: dt.datetime | None = None
     start_at_earliest: bool = False
@@ -146,7 +147,7 @@ def compute_schedule(
 
     earliest_start: dict[str, dt.datetime] = {}
     earliest_finish: dict[str, dt.datetime] = {}
-    project_start = next_business_day(project.start_at)
+    project_start = project.start_at
 
     for process_id in nx.topological_sort(graph):
         process = process_by_id[process_id]
@@ -154,18 +155,21 @@ def compute_schedule(
             (earliest_finish[dependency] for dependency in graph.predecessors(process_id)),
             default=project_start,
         )
-        constraints = [dependency_finish]
-        if process.earliest_start_at is not None:
-            constraints.append(next_business_day(process.earliest_start_at))
-        if process.delay_after_dependencies_business_days:
-            constraints.append(
-                add_business_days(
-                    dependency_finish,
-                    process.delay_after_dependencies_business_days,
+        if process.started_at is not None:
+            start = process.started_at
+        else:
+            constraints = [dependency_finish]
+            if process.earliest_start_at is not None:
+                constraints.append(next_business_day(process.earliest_start_at))
+            if process.delay_after_dependencies_business_days:
+                constraints.append(
+                    add_business_days(
+                        dependency_finish,
+                        process.delay_after_dependencies_business_days,
+                    )
                 )
-            )
+            start = max(constraints)
 
-        start = max(constraints)
         earliest_start[process_id] = start
         earliest_finish[process_id] = add_business_days(
             start,
@@ -179,6 +183,11 @@ def compute_schedule(
 
     for process_id in reversed(list(nx.topological_sort(graph))):
         process = process_by_id[process_id]
+        if process.started_at is not None:
+            latest_start[process_id] = process.started_at
+            latest_finish[process_id] = earliest_finish[process_id]
+            total_float[process_id] = 0
+            continue
         finish = min(
             (latest_start[successor] for successor in graph.successors(process_id)),
             default=completion_at,

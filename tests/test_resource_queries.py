@@ -494,6 +494,7 @@ def test_process_graph_dependency_only_contract_includes_cpm_status_and_blockers
         "earliest_start_at",
         "due_at",
         "status",
+        "started_at",
         "finished_at",
         "computed_status",
         "blocker_summary",
@@ -585,7 +586,7 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
         "allocation_state",
     }
     assert build["resource_aware"]["allocation_state"] == "complete"
-    assert build["resource_aware"]["ends_at"] >= build["dependency_only"]["ef_at"]
+    assert build["resource_aware"]["ends_at"] < build["dependency_only"]["ef_at"]
 
 
 def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
@@ -637,6 +638,7 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
         "resource_delay_hours",
         "allocation_state",
         "status",
+        "started_at",
         "finished_at",
         "requirement_ids",
     }
@@ -896,7 +898,8 @@ def test_query_critical_path_remains_dependency_only_under_resource_delay():
     assert "allocation_slices" not in critical_path
     assert "unallocated_requirements" not in critical_path
     assert resource_schedule["critical_path_process_ids"] == [resource_delayed_id]
-    assert delayed_row["resource_delay_hours"] > 0
+    assert delayed_row["resource_delay_hours"] == 0
+    assert delayed_row["ends_at"] > delayed_row["dependency_only_ends_at"]
 
 
 def test_resource_schedule_row_nullability_for_partial_and_unallocated_rows():

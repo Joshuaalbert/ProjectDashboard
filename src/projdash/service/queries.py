@@ -176,6 +176,22 @@ class QueryDueDateHistory(QueryModel):
         return self
 
 
+class QueryScheduleSnapshots(QueryModel):
+    """Fetch committed schedule snapshots for slippage history."""
+
+    action: Literal["query_schedule_snapshots"] = "query_schedule_snapshots"
+    project_id: str = Field(min_length=1)
+    as_of: AwareDatetime
+    terminal_process_symbols: list[str] | None = None
+
+    @field_validator("terminal_process_symbols")
+    @classmethod
+    def _validate_terminal_symbols(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return validate_unique_non_empty(value, "terminal_process_symbols")
+
+
 class QueryResourceSchedule(QueryModel, HorizonMixin, ResourceOptionsMixin):
     """Compute resource-constrained schedule projection."""
 
@@ -292,6 +308,7 @@ Query = Annotated[
     | QueryProcessGraph
     | QueryBlockers
     | QueryDueDateHistory
+    | QueryScheduleSnapshots
     | QueryResourceSchedule
     | QueryUtilization
     | QueryCosts
@@ -315,6 +332,7 @@ __all__ = [
     "QueryCosts",
     "QueryCriticalPath",
     "QueryDueDateHistory",
+    "QueryScheduleSnapshots",
     "QueryEnvelope",
     "QueryProcessGraph",
     "QueryProjects",

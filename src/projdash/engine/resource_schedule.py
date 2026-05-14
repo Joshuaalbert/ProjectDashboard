@@ -65,6 +65,17 @@ class _RequirementState:
     ready_at: dt.datetime | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _RequirementCandidate:
+    requirement: Mapping[str, object]
+    state: _RequirementState
+    bucket: _LedgerBucket
+    resource: Mapping[str, object]
+    ready_at: dt.datetime
+    headroom_hours: float
+    sort_key: tuple[object, ...]
+
+
 def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, object]:
     """Compute a deterministic resource-constrained schedule.
 
@@ -357,14 +368,245 @@ def _run_allocation_iteration(
     allocation_slices: list[dict[str, object]] = []
     unallocated: list[dict[str, object]] = []
     completed_process_ids: set[str] = set()
-    finalized_process_ids: set[str] = set()
+    closed_process_ids: set[str] = set()
+    processes_by_id = {str(item["process_id"]): item for item in processes}
 
-    while len(finalized_process_ids) < len(processes):
+    _initialize_requirement_eligibility(
+        requirement_states=requirement_states,
+        active_role_ids=active_role_ids,
+        resources=resources,
+        expanded_buckets=expanded_buckets,
+    )
+
+    bucket_intervals = sorted({(bucket.starts_at, bucket.ends_at) for bucket in ledger.values()})
+    if not bucket_intervals:
+        bucket_intervals = [(project_start_at, horizon_ends_at)]
+
+    for _starts_at, bucket_ends_at in bucket_intervals:
+        _settle_ready_processes(
+            project_id=project_id,
+            until_at=bucket_ends_at,
+            topo_order=topo_order,
+            dependencies=dependencies,
+            process_rows=process_rows,
+            completed_process_ids=completed_process_ids,
+            closed_process_ids=closed_process_ids,
+            cpm_by_id=cpm_by_id,
+            requirements_by_process=requirements_by_process,
+            requirement_states=requirement_states,
+            blocked_process_ids=blocked_process_ids,
+            blocked_policy=blocked_policy,
+            project_start_at=project_start_at,
+            processes_by_id=processes_by_id,
+            unallocated=unallocated,
+        )
+        resources_used_by_requirement: dict[tuple[str, dt.datetime, dt.datetime], set[str]]
+        resources_used_by_requirement = defaultdict(set)
+        for bucket in sorted(
+            (
+                item
+                for item in ledger.values()
+                if item.starts_at == _starts_at and item.ends_at == bucket_ends_at
+            ),
+            key=lambda item: _bucket_resource_sort_key(item, resource_by_id),
+        ):
+            if bucket.remaining_hours <= EPSILON:
+                continue
+            candidates = _ready_split_candidates_for_bucket(
+                bucket=bucket,
+                active_role_ids=active_role_ids,
+                resources=resources,
+                resource_by_id=resource_by_id,
+                daily_allocated=daily_allocated,
+                dependencies=dependencies,
+                process_rows=process_rows,
+                completed_process_ids=completed_process_ids,
+                cpm_by_id=cpm_by_id,
+                requirements_by_process=requirements_by_process,
+                requirement_states=requirement_states,
+                closed_process_ids=closed_process_ids,
+                project_start_at=project_start_at,
+                processes_by_id=processes_by_id,
+                ledger=ledger,
+                resources_used_by_requirement=resources_used_by_requirement,
+            )
+            assignments = _water_fill_requirement_candidates(
+                candidates,
+                bucket.remaining_hours,
+            )
+            for candidate, amount in assignments:
+                if amount <= EPSILON:
+                    continue
+                _consume_bucket(
+                    candidate.bucket,
+                    amount,
+                    daily_allocated,
+                    candidate.requirement,
+                )
+                resources_used_by_requirement[
+                    (
+                        str(candidate.requirement["requirement_id"]),
+                        bucket.starts_at,
+                        bucket.ends_at,
+                    )
+                ].add(bucket.resource_id)
+                allocation = _allocation_row(
+                    project_id=project_id,
+                    requirement=candidate.requirement,
+                    resource=candidate.resource,
+                    bucket=candidate.bucket,
+                    effort_hours=amount,
+                    ready_at=candidate.ready_at,
+                    iteration=iteration,
+                )
+                allocation_slices.append(allocation)
+                _apply_allocation_to_requirement_state(
+                    candidate.state,
+                    allocation,
+                    amount,
+                )
+            if bucket.remaining_hours > EPSILON and _allocate_contiguous_ready_requirements(
+                project_id=project_id,
+                bucket=bucket,
+                active_role_ids=active_role_ids,
+                resources=resources,
+                resource_by_id=resource_by_id,
+                ledger=ledger,
+                daily_allocated=daily_allocated,
+                dependencies=dependencies,
+                process_rows=process_rows,
+                completed_process_ids=completed_process_ids,
+                cpm_by_id=cpm_by_id,
+                requirements_by_process=requirements_by_process,
+                requirement_states=requirement_states,
+                project_start_at=project_start_at,
+                processes_by_id=processes_by_id,
+                horizon_ends_at=horizon_ends_at,
+                iteration=iteration,
+                allocation_slices=allocation_slices,
+            ):
+                _complete_fulfilled_processes(
+                    topo_order=topo_order,
+                    completed_process_ids=completed_process_ids,
+                    closed_process_ids=closed_process_ids,
+                    requirements_by_process=requirements_by_process,
+                    requirement_states=requirement_states,
+                    cpm_by_id=cpm_by_id,
+                    process_rows=process_rows,
+                )
+        _complete_fulfilled_processes(
+            topo_order=topo_order,
+            completed_process_ids=completed_process_ids,
+            closed_process_ids=closed_process_ids,
+            requirements_by_process=requirements_by_process,
+            requirement_states=requirement_states,
+            cpm_by_id=cpm_by_id,
+            process_rows=process_rows,
+        )
+
+    _settle_ready_processes(
+        project_id=project_id,
+        until_at=horizon_ends_at,
+        topo_order=topo_order,
+        dependencies=dependencies,
+        process_rows=process_rows,
+        completed_process_ids=completed_process_ids,
+        closed_process_ids=closed_process_ids,
+        cpm_by_id=cpm_by_id,
+        requirements_by_process=requirements_by_process,
+        requirement_states=requirement_states,
+        blocked_process_ids=blocked_process_ids,
+        blocked_policy=blocked_policy,
+        project_start_at=project_start_at,
+        processes_by_id=processes_by_id,
+        unallocated=unallocated,
+    )
+    _complete_fulfilled_processes(
+        topo_order=topo_order,
+        completed_process_ids=completed_process_ids,
+        closed_process_ids=closed_process_ids,
+        requirements_by_process=requirements_by_process,
+        requirement_states=requirement_states,
+        cpm_by_id=cpm_by_id,
+        process_rows=process_rows,
+    )
+    _finalize_open_processes(
+        project_id=project_id,
+        topo_order=topo_order,
+        dependencies=dependencies,
+        process_rows=process_rows,
+        completed_process_ids=completed_process_ids,
+        closed_process_ids=closed_process_ids,
+        cpm_by_id=cpm_by_id,
+        requirements_by_process=requirements_by_process,
+        requirement_states=requirement_states,
+        unallocated=unallocated,
+    )
+
+    rows = [process_rows[process_id] for process_id in topo_order]
+    return {
+        "processes": rows,
+        "allocation_slices": _coalesced_slices(allocation_slices),
+        "unallocated_requirements": sorted(
+            unallocated,
+            key=lambda item: (item["process_id"], item["requirement_id"], item["reason"]),
+        ),
+        "iteration_count": iteration,
+    }
+
+
+def _initialize_requirement_eligibility(
+    *,
+    requirement_states: dict[str, _RequirementState],
+    active_role_ids: set[str],
+    resources: list[Mapping[str, object]],
+    expanded_buckets: tuple[_LedgerBucket, ...],
+) -> None:
+    buckets_by_resource = defaultdict(list)
+    for bucket in expanded_buckets:
+        if bucket.capacity_hours > EPSILON:
+            buckets_by_resource[bucket.resource_id].append(bucket)
+
+    for state in requirement_states.values():
+        requirement = state.requirement
+        role_id = str(requirement["role_id"])
+        if role_id not in active_role_ids:
+            state.reason = "missing_role"
+            state.eligible_resource_ids = ()
+            continue
+        eligible = _eligible_resources(requirement, active_role_ids, resources)
+        eligible_ids = tuple(str(resource["resource_id"]) for resource in eligible)
+        state.eligible_resource_ids = eligible_ids
+        if not eligible_ids:
+            state.reason = "no_eligible_resource"
+            continue
+        if not any(buckets_by_resource[resource_id] for resource_id in eligible_ids):
+            state.reason = "no_calendar_capacity"
+
+
+def _settle_ready_processes(
+    *,
+    project_id: str,
+    until_at: dt.datetime,
+    topo_order: tuple[str, ...],
+    dependencies: dict[str, tuple[str, ...]],
+    process_rows: dict[str, dict[str, object]],
+    completed_process_ids: set[str],
+    closed_process_ids: set[str],
+    cpm_by_id: dict[str, _ProcessCpm],
+    requirements_by_process: dict[str, list[Mapping[str, object]]],
+    requirement_states: dict[str, _RequirementState],
+    blocked_process_ids: set[str],
+    blocked_policy: str,
+    project_start_at: dt.datetime,
+    processes_by_id: dict[str, Mapping[str, object]],
+    unallocated: list[dict[str, object]],
+) -> None:
+    made_progress = True
+    while made_progress:
         made_progress = False
-        ready_requirements: list[tuple[tuple[object, ...], Mapping[str, object], dt.datetime]] = []
-
         for process_id in topo_order:
-            if process_id in finalized_process_ids:
+            if process_id in closed_process_ids:
                 continue
             ready_at = _process_ready_at(
                 process_id=process_id,
@@ -373,25 +615,12 @@ def _run_allocation_iteration(
                 completed_process_ids=completed_process_ids,
                 cpm_by_id=cpm_by_id,
                 project_start_at=project_start_at,
-                processes_by_id={str(item["process_id"]): item for item in processes},
+                processes_by_id=processes_by_id,
             )
-            if ready_at is None:
-                if all(
-                    dependency in finalized_process_ids
-                    for dependency in dependencies.get(process_id, ())
-                ):
-                    _finalize_predecessor_unallocated(
-                        project_id=project_id,
-                        process_id=process_id,
-                        cpm_by_id=cpm_by_id,
-                        requirements=requirements_by_process.get(process_id, []),
-                        process_rows=process_rows,
-                        unallocated=unallocated,
-                    )
-                    finalized_process_ids.add(process_id)
-                    made_progress = True
+            if ready_at is None or ready_at >= until_at:
                 continue
 
+            process_requirements = requirements_by_process.get(process_id, [])
             if process_id in blocked_process_ids and blocked_policy != "include_normally":
                 state = (
                     "blocked_zero_capacity"
@@ -404,143 +633,379 @@ def _run_allocation_iteration(
                     ready_at=ready_at,
                     state=state,
                     cpm_by_id=cpm_by_id,
-                    requirements=requirements_by_process.get(process_id, []),
+                    requirements=process_requirements,
                     process_rows=process_rows,
                     unallocated=unallocated,
                     emit_reason=blocked_policy == "exclude",
                 )
-                finalized_process_ids.add(process_id)
+                closed_process_ids.add(process_id)
                 made_progress = True
                 continue
 
-            process_requirements = requirements_by_process.get(process_id, [])
             if not process_requirements:
                 _finalize_no_requirement_process(
                     process_id=process_id,
                     ready_at=ready_at,
                     process_rows=process_rows,
                     cpm_by_id=cpm_by_id,
-                    processes_by_id={str(item["process_id"]): item for item in processes},
+                    processes_by_id=processes_by_id,
                 )
-                finalized_process_ids.add(process_id)
                 completed_process_ids.add(process_id)
+                closed_process_ids.add(process_id)
                 made_progress = True
                 continue
 
-            pending = []
             for requirement in process_requirements:
                 state = requirement_states[str(requirement["requirement_id"])]
-                if state.reason is None and state.allocated_hours + EPSILON < float(
-                    requirement["effort_hours"]
-                ):
-                    pending.append(requirement)
-            if not pending:
-                _finalize_process_with_requirements(
-                    process_id=process_id,
-                    requirements=process_requirements,
-                    states=requirement_states,
-                    cpm_by_id=cpm_by_id,
-                    process_rows=process_rows,
-                )
-                finalized_process_ids.add(process_id)
-                if process_rows[process_id]["allocation_state"] == "complete":
-                    completed_process_ids.add(process_id)
-                for requirement in process_requirements:
-                    state = requirement_states[str(requirement["requirement_id"])]
-                    if state.reason is not None:
-                        unallocated.append(
-                            _unallocated_row(
-                                project_id=project_id,
-                                requirement=requirement,
-                                state=state,
-                            )
-                        )
-                made_progress = True
+                state.ready_at = ready_at
+
+
+def _ready_split_candidates_for_bucket(
+    *,
+    bucket: _LedgerBucket,
+    active_role_ids: set[str],
+    resources: list[Mapping[str, object]],
+    resource_by_id: dict[str, Mapping[str, object]],
+    daily_allocated: dict[tuple[str, str, str], float],
+    dependencies: dict[str, tuple[str, ...]],
+    process_rows: dict[str, dict[str, object]],
+    completed_process_ids: set[str],
+    cpm_by_id: dict[str, _ProcessCpm],
+    requirements_by_process: dict[str, list[Mapping[str, object]]],
+    requirement_states: dict[str, _RequirementState],
+    closed_process_ids: set[str],
+    project_start_at: dt.datetime,
+    processes_by_id: dict[str, Mapping[str, object]],
+    ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
+    resources_used_by_requirement: dict[
+        tuple[str, dt.datetime, dt.datetime],
+        set[str],
+    ],
+) -> list[_RequirementCandidate]:
+    candidates = []
+    for process_id in cpm_by_id:
+        if process_id in completed_process_ids or process_id in closed_process_ids:
+            continue
+        ready_at = _process_ready_at(
+            process_id=process_id,
+            dependencies=dependencies,
+            process_rows=process_rows,
+            completed_process_ids=completed_process_ids,
+            cpm_by_id=cpm_by_id,
+            project_start_at=project_start_at,
+            processes_by_id=processes_by_id,
+        )
+        if ready_at is None or ready_at >= bucket.ends_at:
+            continue
+        for requirement in requirements_by_process.get(process_id, []):
+            if str(requirement.get("allocation_policy", "split_allowed")) != "split_allowed":
                 continue
-
-            for requirement in pending:
-                cpm = cpm_by_id[process_id]
-                # Keep this aligned with the documented ready-queue tie breakers.
-                ready_requirements.append(
-                    (
-                        (
-                            ready_at,
-                            cpm.latest_finish_at,
-                            cpm.topo_index,
-                            process_id,
-                            str(requirement["requirement_id"]),
-                        ),
-                        requirement,
-                        ready_at,
-                    )
-                )
-
-        if ready_requirements:
-            _, requirement, ready_at = sorted(ready_requirements, key=lambda item: item[0])[0]
             state = requirement_states[str(requirement["requirement_id"])]
-            new_slices = _allocate_requirement(
+            if state.reason is not None:
+                continue
+            remaining = float(requirement["effort_hours"]) - state.allocated_hours
+            if remaining <= EPSILON:
+                continue
+            role_id = str(requirement["role_id"])
+            if role_id not in bucket.role_ids or role_id not in active_role_ids:
+                continue
+            eligible_resource_ids = set(state.eligible_resource_ids)
+            if bucket.resource_id not in eligible_resource_ids:
+                continue
+            concurrency_key = (
+                str(requirement["requirement_id"]),
+                bucket.starts_at,
+                bucket.ends_at,
+            )
+            used_resources = resources_used_by_requirement[concurrency_key]
+            required_count = max(1, int(requirement.get("required_resource_count", 1)))
+            if (
+                bucket.resource_id not in used_resources
+                and len(used_resources) >= required_count
+            ):
+                continue
+            headroom = _candidate_headroom(
+                requirement=requirement,
+                bucket=bucket,
+                daily_allocated=daily_allocated,
+                remaining=remaining,
+                ready_at=ready_at,
+            )
+            if headroom <= EPSILON:
+                continue
+            minimum = float(requirement.get("min_allocation_hours_per_day", 0) or 0)
+            if minimum:
+                block_headroom = _block_headroom(
+                    requirement=requirement,
+                    bucket=bucket,
+                    ledger=ledger,
+                    daily_allocated=daily_allocated,
+                    remaining=remaining,
+                    ready_at=ready_at,
+                )
+                daily_key = (
+                    str(requirement["requirement_id"]),
+                    bucket.resource_id,
+                    bucket.local_date,
+                )
+                if (
+                    daily_allocated[daily_key] <= EPSILON
+                    and block_headroom + EPSILON < minimum
+                    and remaining - block_headroom > EPSILON
+                ):
+                    continue
+            feasible_start = max(bucket.starts_at, ready_at)
+            if (
+                state.first_feasible_starts_at is None
+                or feasible_start < state.first_feasible_starts_at
+            ):
+                state.first_feasible_starts_at = feasible_start
+            state.ready_at = ready_at
+            cpm = cpm_by_id[process_id]
+            candidates.append(
+                _RequirementCandidate(
+                    requirement=requirement,
+                    state=state,
+                    bucket=bucket,
+                    resource=resource_by_id[bucket.resource_id],
+                    ready_at=ready_at,
+                    headroom_hours=headroom,
+                    sort_key=(
+                        ready_at,
+                        cpm.topo_index,
+                        process_id,
+                        str(requirement["requirement_id"]),
+                        bucket.resource_id,
+                    ),
+                )
+            )
+    return sorted(candidates, key=lambda item: item.sort_key)
+
+
+def _water_fill_requirement_candidates(
+    candidates: list[_RequirementCandidate],
+    capacity_hours: float,
+) -> list[tuple[_RequirementCandidate, float]]:
+    if not candidates or capacity_hours <= EPSILON:
+        return []
+    demand = min(capacity_hours, sum(item.headroom_hours for item in candidates))
+    assignments = {index: 0.0 for index in range(len(candidates))}
+    unfrozen = [
+        (index, candidate, candidate.headroom_hours)
+        for index, candidate in enumerate(candidates)
+    ]
+    while demand > EPSILON and unfrozen:
+        share = demand / len(unfrozen)
+        consumed = 0.0
+        next_unfrozen = []
+        for index, candidate, headroom in unfrozen:
+            assignable = min(share, headroom)
+            assignments[index] += assignable
+            consumed += assignable
+            residual_headroom = headroom - assignable
+            if residual_headroom > EPSILON:
+                next_unfrozen.append((index, candidate, residual_headroom))
+        if consumed <= EPSILON:
+            break
+        demand -= consumed
+        unfrozen = next_unfrozen
+    return [
+        (candidate, assignments[index])
+        for index, candidate in enumerate(candidates)
+        if assignments[index] > EPSILON
+    ]
+
+
+def _apply_allocation_to_requirement_state(
+    state: _RequirementState,
+    allocation: dict[str, object],
+    amount: float,
+) -> None:
+    state.reason = None
+    state.allocated_hours += amount
+    starts_at = _as_utc(allocation["starts_at"])
+    ends_at = _as_utc(allocation["ends_at"])
+    if state.starts_at is None or starts_at < state.starts_at:
+        state.starts_at = starts_at
+    if state.ends_at is None or ends_at > state.ends_at:
+        state.ends_at = ends_at
+    if (
+        state.first_feasible_starts_at is None
+        or starts_at < state.first_feasible_starts_at
+    ):
+        state.first_feasible_starts_at = starts_at
+
+
+def _allocate_contiguous_ready_requirements(
+    *,
+    project_id: str,
+    bucket: _LedgerBucket,
+    active_role_ids: set[str],
+    resources: list[Mapping[str, object]],
+    resource_by_id: dict[str, Mapping[str, object]],
+    ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
+    daily_allocated: dict[tuple[str, str, str], float],
+    dependencies: dict[str, tuple[str, ...]],
+    process_rows: dict[str, dict[str, object]],
+    completed_process_ids: set[str],
+    cpm_by_id: dict[str, _ProcessCpm],
+    requirements_by_process: dict[str, list[Mapping[str, object]]],
+    requirement_states: dict[str, _RequirementState],
+    project_start_at: dt.datetime,
+    processes_by_id: dict[str, Mapping[str, object]],
+    horizon_ends_at: dt.datetime,
+    iteration: int,
+    allocation_slices: list[dict[str, object]],
+) -> bool:
+    del bucket, horizon_ends_at
+    changed = False
+    for process_id in cpm_by_id:
+        if process_id in completed_process_ids or process_id in process_rows:
+            continue
+        ready_at = _process_ready_at(
+            process_id=process_id,
+            dependencies=dependencies,
+            process_rows=process_rows,
+            completed_process_ids=completed_process_ids,
+            cpm_by_id=cpm_by_id,
+            project_start_at=project_start_at,
+            processes_by_id=processes_by_id,
+        )
+        if ready_at is None:
+            continue
+        for requirement in requirements_by_process.get(process_id, []):
+            if str(requirement.get("allocation_policy", "split_allowed")) != "contiguous":
+                continue
+            state = requirement_states[str(requirement["requirement_id"])]
+            if state.reason is not None:
+                continue
+            if state.allocated_hours + EPSILON >= float(requirement["effort_hours"]):
+                continue
+            eligible = _eligible_resources(requirement, active_role_ids, resources)
+            new_slices = _allocate_contiguous(
                 project_id=project_id,
                 requirement=requirement,
                 ready_at=ready_at,
-                active_role_ids=active_role_ids,
-                resources=resources,
+                eligible=eligible,
                 resource_by_id=resource_by_id,
                 ledger=ledger,
                 daily_allocated=daily_allocated,
-                horizon_ends_at=horizon_ends_at,
                 iteration=iteration,
             )
-            temp_state = requirement.get("_state")
-            if isinstance(temp_state, _RequirementState):
-                state.eligible_resource_ids = temp_state.eligible_resource_ids
-                state.first_feasible_starts_at = temp_state.first_feasible_starts_at
-                state.ready_at = temp_state.ready_at
-                if temp_state.reason is not None:
-                    state.reason = temp_state.reason
-            allocation_slices.extend(new_slices)
-            state.allocated_hours = sum(
-                float(item["effort_hours"])
-                for item in allocation_slices
-                if item["requirement_id"] == requirement["requirement_id"]
-            )
-            matching_slices = [
-                item
-                for item in allocation_slices
-                if item["requirement_id"] == requirement["requirement_id"]
-            ]
-            if matching_slices:
-                state.starts_at = min(item["starts_at"] for item in matching_slices)
-                state.ends_at = max(item["ends_at"] for item in matching_slices)
-            if state.allocated_hours + EPSILON < float(requirement["effort_hours"]):
-                state.reason = _incomplete_reason(requirement, state)
-            made_progress = True
-            continue
-
-        if not made_progress:
-            for process_id in topo_order:
-                if process_id in finalized_process_ids:
-                    continue
-                _finalize_predecessor_unallocated(
-                    project_id=project_id,
-                    process_id=process_id,
-                    cpm_by_id=cpm_by_id,
-                    requirements=requirements_by_process.get(process_id, []),
-                    process_rows=process_rows,
-                    unallocated=unallocated,
+            for allocation in new_slices:
+                allocation_slices.append(allocation)
+                _apply_allocation_to_requirement_state(
+                    state,
+                    allocation,
+                    float(allocation["effort_hours"]),
                 )
-                finalized_process_ids.add(process_id)
-            break
+                changed = True
+            if not new_slices:
+                state.ready_at = ready_at
+    return changed
 
-    rows = [process_rows[process_id] for process_id in topo_order]
-    return {
-        "processes": rows,
-        "allocation_slices": _coalesced_slices(allocation_slices),
-        "unallocated_requirements": sorted(
-            unallocated,
-            key=lambda item: (item["process_id"], item["requirement_id"], item["reason"]),
-        ),
-        "iteration_count": iteration,
-    }
+
+def _complete_fulfilled_processes(
+    *,
+    topo_order: tuple[str, ...],
+    completed_process_ids: set[str],
+    closed_process_ids: set[str],
+    requirements_by_process: dict[str, list[Mapping[str, object]]],
+    requirement_states: dict[str, _RequirementState],
+    cpm_by_id: dict[str, _ProcessCpm],
+    process_rows: dict[str, dict[str, object]],
+) -> None:
+    for process_id in topo_order:
+        if process_id in closed_process_ids:
+            continue
+        requirements = requirements_by_process.get(process_id, [])
+        if not requirements:
+            continue
+        if not all(
+            requirement_states[str(requirement["requirement_id"])].allocated_hours
+            + EPSILON
+            >= float(requirement["effort_hours"])
+            for requirement in requirements
+        ):
+            continue
+        _finalize_process_with_requirements(
+            process_id=process_id,
+            requirements=requirements,
+            states=requirement_states,
+            cpm_by_id=cpm_by_id,
+            process_rows=process_rows,
+        )
+        if process_rows[process_id]["allocation_state"] == "complete":
+            completed_process_ids.add(process_id)
+            closed_process_ids.add(process_id)
+
+
+def _finalize_open_processes(
+    *,
+    project_id: str,
+    topo_order: tuple[str, ...],
+    dependencies: dict[str, tuple[str, ...]],
+    process_rows: dict[str, dict[str, object]],
+    completed_process_ids: set[str],
+    closed_process_ids: set[str],
+    cpm_by_id: dict[str, _ProcessCpm],
+    requirements_by_process: dict[str, list[Mapping[str, object]]],
+    requirement_states: dict[str, _RequirementState],
+    unallocated: list[dict[str, object]],
+) -> None:
+    for process_id in topo_order:
+        if process_id in closed_process_ids:
+            continue
+        requirements = requirements_by_process.get(process_id, [])
+        if not all(
+            dependency in completed_process_ids
+            for dependency in dependencies.get(process_id, ())
+        ):
+            _finalize_predecessor_unallocated(
+                project_id=project_id,
+                process_id=process_id,
+                cpm_by_id=cpm_by_id,
+                requirements=requirements,
+                process_rows=process_rows,
+                unallocated=unallocated,
+            )
+            closed_process_ids.add(process_id)
+            continue
+        if not requirements:
+            process_rows[process_id] = _process_row(
+                cpm=cpm_by_id[process_id],
+                ready_at=cpm_by_id[process_id].earliest_start_at,
+                starts_at=None,
+                ends_at=None,
+                allocation_state="unallocated",
+                requirement_ids=[],
+            )
+            closed_process_ids.add(process_id)
+            continue
+        for requirement in requirements:
+            state = requirement_states[str(requirement["requirement_id"])]
+            if state.allocated_hours + EPSILON >= float(requirement["effort_hours"]):
+                continue
+            if state.reason is None:
+                state.reason = _incomplete_reason(requirement, state)
+        _finalize_process_with_requirements(
+            process_id=process_id,
+            requirements=requirements,
+            states=requirement_states,
+            cpm_by_id=cpm_by_id,
+            process_rows=process_rows,
+        )
+        for requirement in requirements:
+            state = requirement_states[str(requirement["requirement_id"])]
+            if state.allocated_hours + EPSILON < float(requirement["effort_hours"]):
+                unallocated.append(
+                    _unallocated_row(
+                        project_id=project_id,
+                        requirement=requirement,
+                        state=state,
+                    )
+                )
+        closed_process_ids.add(process_id)
 
 
 def _allocate_requirement(
@@ -1070,7 +1535,7 @@ def _compute_cpm(
     topo_order: tuple[str, ...],
 ) -> dict[str, _ProcessCpm]:
     process_by_id = {str(process["process_id"]): process for process in processes}
-    project_start = next_business_day(project_start_at)
+    project_start = project_start_at
     earliest_start: dict[str, dt.datetime] = {}
     earliest_finish: dict[str, dt.datetime] = {}
     for process_id in topo_order:
@@ -1079,13 +1544,16 @@ def _compute_cpm(
             (earliest_finish[dependency] for dependency in dependencies.get(process_id, ())),
             default=project_start,
         )
-        constraints = [dependency_finish]
-        if process.get("earliest_start_at") is not None:
-            constraints.append(next_business_day(_as_utc(process["earliest_start_at"])))
-        delay_days = int(process.get("delay_after_dependencies_business_days", 0) or 0)
-        if delay_days:
-            constraints.append(add_business_days(dependency_finish, delay_days))
-        start = max(constraints)
+        if process.get("started_at") is not None:
+            start = _as_utc(process["started_at"])
+        else:
+            constraints = [dependency_finish]
+            if process.get("earliest_start_at") is not None:
+                constraints.append(next_business_day(_as_utc(process["earliest_start_at"])))
+            delay_days = int(process.get("delay_after_dependencies_business_days", 0) or 0)
+            if delay_days:
+                constraints.append(add_business_days(dependency_finish, delay_days))
+            start = max(constraints)
         earliest_start[process_id] = start
         earliest_finish[process_id] = add_business_days(
             start,
@@ -1103,6 +1571,11 @@ def _compute_cpm(
     slack: dict[str, int] = {}
     for process_id in reversed(topo_order):
         process = process_by_id[process_id]
+        if process.get("started_at") is not None:
+            latest_start[process_id] = _as_utc(process["started_at"])
+            latest_finish[process_id] = earliest_finish[process_id]
+            slack[process_id] = 0
+            continue
         finish = min(
             (latest_start[successor] for successor in successors.get(process_id, ())),
             default=completion_at,
@@ -1151,12 +1624,14 @@ def _process_ready_at(
         dependency_finishes.append(_as_utc(ends_at))
     dependency_finish = max(dependency_finishes, default=project_start_at)
     process = processes_by_id[process_id]
+    if process.get("started_at") is not None:
+        return _as_utc(process["started_at"])
     constraints = [project_start_at, dependency_finish]
     if process.get("earliest_start_at") is not None:
         constraints.append(_as_utc(process["earliest_start_at"]))
     delay_days = int(process.get("delay_after_dependencies_business_days", 0) or 0)
     if delay_days:
-        constraints.append(add_business_days(dependency_finish, delay_days))
+        constraints.append(dependency_finish + dt.timedelta(days=delay_days))
     return max(constraints)
 
 
@@ -1324,6 +1799,18 @@ def _bucket_sort_key(bucket: _LedgerBucket) -> tuple[object, ...]:
     return (bucket.starts_at, bucket.ends_at, bucket.resource_id)
 
 
+def _bucket_resource_sort_key(
+    bucket: _LedgerBucket,
+    resource_by_id: dict[str, Mapping[str, object]],
+) -> tuple[object, ...]:
+    return (
+        bucket.starts_at,
+        bucket.ends_at,
+        _resource_cost(resource_by_id[bucket.resource_id]),
+        bucket.resource_id,
+    )
+
+
 def _bucket_capacity_after(bucket: _LedgerBucket, ready_at: dt.datetime) -> float:
     return _bucket_capacity_between(bucket, max(bucket.starts_at, ready_at), bucket.ends_at)
 
@@ -1428,11 +1915,8 @@ def _finalize_no_requirement_process(
     cpm_by_id: dict[str, _ProcessCpm],
     processes_by_id: dict[str, Mapping[str, object]],
 ) -> None:
-    process = processes_by_id[process_id]
-    ends_at = add_business_days(
-        ready_at,
-        int(process.get("duration_business_days", 0) or 0),
-    )
+    del processes_by_id
+    ends_at = ready_at
     process_rows[process_id] = _process_row(
         cpm=cpm_by_id[process_id],
         ready_at=ready_at,
@@ -1489,8 +1973,8 @@ def _process_row(
     requirement_ids: list[str],
 ) -> dict[str, object]:
     delay = 0.0
-    if ends_at is not None:
-        delay = max(0.0, (ends_at - cpm.earliest_finish_at).total_seconds() / 3600)
+    if ready_at is not None and starts_at is not None:
+        delay = max(0.0, (starts_at - ready_at).total_seconds() / 3600)
     return {
         "process_id": cpm.process_id,
         "name": cpm.name,
@@ -1635,10 +2119,16 @@ def _resource_critical_path(
     complete_rows = [row for row in processes if row.get("ends_at") is not None]
     if not complete_rows:
         return []
+    latest_finish = max(_as_utc(row["ends_at"]) for row in complete_rows)
+    tolerance = dt.timedelta(hours=tolerance_hours + EPSILON)
+    terminal_candidates = [
+        row
+        for row in complete_rows
+        if latest_finish - _as_utc(row["ends_at"]) <= tolerance
+    ]
     terminal = sorted(
-        complete_rows,
+        terminal_candidates,
         key=lambda row: (
-            -_as_utc(row["ends_at"]).timestamp(),
             cpm_by_id[str(row["process_id"])].topo_index,
             str(row["process_id"]),
         ),
@@ -1661,10 +2151,10 @@ def _resource_critical_path(
             )
             if delta <= tolerance_hours + EPSILON:
                 cpm = cpm_by_id[predecessor]
-                candidates.append((cpm.slack_business_days, cpm.topo_index, predecessor))
+                candidates.append((cpm.topo_index, predecessor))
         if not candidates:
             break
-        _, _, current = sorted(candidates)[0]
+        _, current = sorted(candidates)[0]
         path.append(current)
     return list(reversed(path))
 

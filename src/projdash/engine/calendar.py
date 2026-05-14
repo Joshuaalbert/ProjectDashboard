@@ -99,6 +99,8 @@ def add_business_days(value: dt.datetime, days: int) -> dt.datetime:
     """
     if days < 0:
         raise ValueError("days must be non-negative")
+    if days == 0:
+        return require_aware(value)
 
     output = previous_business_day(value)
     count = 0
