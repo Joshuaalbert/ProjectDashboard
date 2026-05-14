@@ -497,10 +497,11 @@ Topology rewrite operations:
 
 - `replace_process_with_subgraph` retires one active parent process and creates
   supplied child processes and internal dependencies in one atomic revision.
-  Every external incoming edge to the parent is copied to each supplied root.
-  Every external outgoing edge from the parent is copied from each supplied
-  leaf. Roots and leaves must be children, child symbols must be unique, and the
-  final graph must be acyclic. Parent-symbol alias preservation is controlled by
+  Every external incoming edge to the parent is copied to each inferred root.
+  Every external outgoing edge from the parent is copied from each inferred
+  leaf. Explicit root/leaf lists may be supplied only when they match the child
+  topology. Child symbols must be unique and the final graph must be acyclic.
+  Parent-symbol alias preservation is controlled by
   `preserve_parent_symbol_as_alias`, which defaults to `true`. When true, the
   retired parent canonical symbol becomes an alias for exactly one created
   child; `parent_alias_target_symbol` defaults to the only child when there is
@@ -1069,7 +1070,7 @@ Command field tables:
 | `rename_process` | `project_id`, `process_id` or `process_symbol`, `new_symbol`, `edit_at` | `keep_old_symbol_as_alias` default `true` | `process_id` |
 | `add_process_aliases` | `project_id`, `process_id` or `process_symbol`, `aliases`, `edit_at` | none | `process_id` |
 | `batch_update_process_graph` | `project_id`, `edit_at`, `operations` | `idempotency_key` | affected process and edge ids |
-| `replace_process_with_subgraph` | `project_id`, `edit_at`, `process_id` or `process_symbol`, `processes`, `dependencies`, `root_symbols`, `leaf_symbols` | `preserve_parent_symbol_as_alias` default `true`, `parent_alias_target_symbol` | created process, retired process, retirement event, and edge ids |
+| `replace_process_with_subgraph` | `project_id`, `edit_at`, `process_id` or `process_symbol`, `processes`, `dependencies` | `root_symbols`/`leaf_symbols` may be omitted for topology inference, `preserve_parent_symbol_as_alias` default `true`, `parent_alias_target_symbol` | created process, retired process, retirement event, and edge ids |
 | `collapse_subgraph` | `project_id`, `edit_at`, `process_symbols`, `new_process` | `role_conflict_policy` default `reject` | replacement process, retired process, retirement event, requirement, and edge ids |
 | `create_role` | `project_id`, `name` | `role_id` | `role_id` |
 | `rename_role` | `project_id`, `role_id`, `name` | none | `role_id` |
@@ -1620,7 +1621,9 @@ Acceptance tests should be added before implementation and cover:
   conflict cases, report final `revision_id`/`requirement_ids`, and replay
   without appending another revision.
 - `replace_process_with_subgraph` preserves external dependency semantics by
-  parent-to-root and leaf-to-child rewiring.
+  parent-to-inferred-root and inferred-leaf-to-child rewiring. Explicit
+  non-empty root/leaf lists must match the inferred child topology; explicit
+  empty lists are rejected.
 - `replace_process_with_subgraph` tests cover
   `preserve_parent_symbol_as_alias` default `true`, one-child target defaulting,
   required `parent_alias_target_symbol` for multi-child preservation, forbidden

@@ -14,6 +14,35 @@ from projdash.service.queries import QueryEnvelope
 from projdash.service.service import ProjectService
 
 DEFAULT_TIMEZONE = "UTC"
+DISPLAY_DATETIME_FORMAT = "%a, %d %b %Y, %H:%M"
+DISPLAY_DATETIME_KEYS = {
+    "as_of",
+    "available_from_at",
+    "available_until_at",
+    "committed_at",
+    "completion_at",
+    "created_at",
+    "current_due_at",
+    "dep_finish",
+    "dep_start",
+    "derived_due_at",
+    "due_at",
+    "edit_at",
+    "ef_at",
+    "ends_at",
+    "finished_at",
+    "horizon_ends_at",
+    "horizon_starts_at",
+    "lf_at",
+    "ls_at",
+    "opened_at",
+    "ready_at",
+    "resolved_at",
+    "resource_finish",
+    "resource_start",
+    "started_at",
+    "starts_at",
+}
 
 
 @dataclass(frozen=True)
@@ -74,6 +103,61 @@ def validate_timezone(timezone_name: str) -> str:
     except ZoneInfoNotFoundError as exc:
         raise ValueError("Timezone must be a valid IANA timezone name.") from exc
     return timezone_name
+
+
+def format_display_datetime(
+    value: Any,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> str:
+    """Format a service datetime for visible UI text in the selected timezone."""
+    if value is None or value == "":
+        return "-"
+    return to_display_timezone(value, timezone_name).strftime(DISPLAY_DATETIME_FORMAT)
+
+
+def to_display_timezone(
+    value: Any,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> dt.datetime:
+    """Convert a service datetime into the selected UI timezone."""
+    timezone = ZoneInfo(validate_timezone(timezone_name))
+    parsed = _parse_datetime_value(value)
+    if parsed.tzinfo is None:
+        raise ValueError("Visible datetimes must be timezone-aware.")
+    return parsed.astimezone(timezone)
+
+
+def format_display_datetimes(
+    value: Any,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> Any:
+    """Recursively format timestamp fields for visible UI tables."""
+    if isinstance(value, list):
+        return [format_display_datetimes(item, timezone_name) for item in value]
+    if isinstance(value, tuple):
+        return tuple(format_display_datetimes(item, timezone_name) for item in value)
+    if isinstance(value, dict):
+        formatted = {}
+        for key, item in value.items():
+            if _is_display_datetime_key(str(key)) and item is not None and item != "":
+                try:
+                    formatted[key] = format_display_datetime(item, timezone_name)
+                except (TypeError, ValueError):
+                    formatted[key] = item
+            else:
+                formatted[key] = format_display_datetimes(item, timezone_name)
+        return formatted
+    return value
+
+
+def _is_display_datetime_key(key: str) -> bool:
+    return key in DISPLAY_DATETIME_KEYS or key.endswith("_at")
+
+
+def _parse_datetime_value(value: Any) -> dt.datetime:
+    if isinstance(value, dt.datetime):
+        return value
+    return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
 def split_lines(value: str) -> list[str]:
@@ -283,27 +367,112 @@ def parse_dependency_lines(value: str) -> list[tuple[str, str]]:
 
 
 def parse_subgraph_process_lines(value: str) -> list[dict[str, Any]]:
-    """Parse subgraph child rows as `SYMBOL | Name | duration_hours`."""
+    """Parse child rows as `SYMBOL | Name | role_id:hours,...`.
+
+    The service still accepts a diagnostic ``duration_hours`` field for
+    topology rewrites. The UI derives it from total role effort so operators do
+    not maintain two duration-like inputs for the same child process.
+    """
     processes = []
     seen: set[str] = set()
     for line in split_lines(value):
         parts = [part.strip() for part in line.split("|")]
         if len(parts) != 3:
-            raise ValueError("Subgraph process lines must use `SYMBOL | Name | hours`.")
-        symbol, name, duration_text = parts
+            raise ValueError(
+                "Subgraph process lines must use `SYMBOL | Name | role_id:hours,...`."
+            )
+        symbol, name, effort_text = parts
         if not symbol or not name:
             raise ValueError("Subgraph process symbols and names must be non-empty.")
         if symbol in seen:
             raise ValueError(f"Duplicate subgraph process symbol: {symbol}")
         seen.add(symbol)
-        processes.append(
-            {
-                "process_symbol": symbol,
-                "name": name,
-                "duration_hours": float(duration_text),
-            }
+        process = {
+            "process_symbol": symbol,
+            "name": name,
+        }
+        role_requirements = _parse_role_effort_tokens(effort_text)
+        process["role_requirements"] = role_requirements
+        process["duration_hours"] = sum(
+            requirement["effort_hours"] for requirement in role_requirements
         )
+        processes.append(process)
     return processes
+
+
+def infer_subgraph_roots_and_leaves(
+    processes: list[dict[str, Any]],
+    dependencies: list[tuple[str, str]],
+) -> tuple[list[str], list[str]]:
+    """Infer topological roots and leaves from child dependency rows.
+
+    Args:
+        processes: Parsed child process dictionaries with ``process_symbol``.
+        dependencies: Parsed ``(predecessor_symbol, successor_symbol)`` pairs.
+
+    Returns:
+        Ordered root symbols and ordered leaf symbols, preserving child row
+        order.
+
+    Raises:
+        ValueError: If a dependency endpoint is unknown or the child graph
+            contains a directed cycle.
+    """
+    child_symbols = [
+        str(process.get("process_symbol"))
+        for process in processes
+        if process.get("process_symbol")
+    ]
+    child_symbol_set = set(child_symbols)
+    incoming = {symbol: set() for symbol in child_symbols}
+    outgoing = {symbol: set() for symbol in child_symbols}
+    for predecessor, successor in dependencies:
+        if predecessor not in child_symbol_set or successor not in child_symbol_set:
+            raise ValueError(
+                "Child dependency endpoints must name supplied child processes."
+            )
+        incoming[successor].add(predecessor)
+        outgoing[predecessor].add(successor)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(symbol: str) -> None:
+        if symbol in visiting:
+            raise ValueError("Child dependency graph must be acyclic.")
+        if symbol in visited:
+            return
+        visiting.add(symbol)
+        for successor in outgoing[symbol]:
+            visit(successor)
+        visiting.remove(symbol)
+        visited.add(symbol)
+
+    for symbol in child_symbols:
+        visit(symbol)
+    roots = [symbol for symbol in child_symbols if not incoming[symbol]]
+    leaves = [symbol for symbol in child_symbols if not outgoing[symbol]]
+    return roots, leaves
+
+
+def _parse_role_effort_tokens(value: str) -> list[dict[str, Any]]:
+    requirements = []
+    seen: set[str] = set()
+    for token in split_csv(value):
+        role_id, separator, hours_text = token.partition(":")
+        role_id = role_id.strip()
+        if not separator or not role_id or not hours_text.strip():
+            raise ValueError("Role effort tokens must use `role_id:hours`.")
+        if role_id in seen:
+            raise ValueError(f"Duplicate role id in child row: {role_id}")
+        seen.add(role_id)
+        effort_hours = float(hours_text)
+        if effort_hours <= 0:
+            raise ValueError("Role effort hours must be greater than 0.")
+        requirements.append({"role_id": role_id, "effort_hours": effort_hours})
+    if not requirements:
+        raise ValueError("At least one role effort token is required.")
+    return requirements
 
 
 def command_envelope(command: Any) -> CommandEnvelope:

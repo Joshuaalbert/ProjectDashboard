@@ -2517,6 +2517,12 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                             "process_symbol": "api-contract",
                             "name": "API Contract",
                             "duration_hours": 8,
+                            "role_requirements": [
+                                {
+                                    "role_id": "role-engineer",
+                                    "effort_hours": 8,
+                                }
+                            ],
                         },
                         {
                             "process_symbol": "api-implementation",
@@ -2535,6 +2541,36 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                     ],
                     "root_symbols": ["api-contract"],
                     "leaf_symbols": ["api-implementation"],
+                    "parent_alias_target_symbol": "api-implementation",
+                }
+            ),
+        ),
+        ApiCase(
+            "replace_process_multi_child_omits_roots_and_leaves",
+            _command_payload(
+                {
+                    "action": "replace_process_with_subgraph",
+                    "project_id": "project-alpha",
+                    "edit_at": _at(14).isoformat(),
+                    "process_id": "process-legacy-api",
+                    "processes": [
+                        {
+                            "process_symbol": "api-contract",
+                            "name": "API Contract",
+                            "duration_hours": 8,
+                        },
+                        {
+                            "process_symbol": "api-implementation",
+                            "name": "API Implementation",
+                            "duration_hours": 16,
+                        },
+                    ],
+                    "dependencies": [
+                        {
+                            "predecessor_symbol": "api-contract",
+                            "successor_symbol": "api-implementation",
+                        }
+                    ],
                     "parent_alias_target_symbol": "api-implementation",
                 }
             ),
@@ -2628,6 +2664,28 @@ def test_topology_rewrite_command_payloads_round_trip(case):
                     "leaf_symbols": ["service-api"],
                     "preserve_parent_symbol_as_alias": False,
                     "parent_alias_target_symbol": "service-api",
+                }
+            ),
+        ),
+        ApiCase(
+            "replace_rejects_explicit_empty_roots_and_leaves",
+            _command_payload(
+                {
+                    "action": "replace_process_with_subgraph",
+                    "project_id": "project-alpha",
+                    "edit_at": _at(14).isoformat(),
+                    "process_symbol": "legacy-api",
+                    "processes": [
+                        {
+                            "process_symbol": "service-api",
+                            "name": "Service API",
+                            "duration_hours": 16,
+                        }
+                    ],
+                    "dependencies": [],
+                    "root_symbols": [],
+                    "leaf_symbols": [],
+                    "preserve_parent_symbol_as_alias": True,
                 }
             ),
         ),

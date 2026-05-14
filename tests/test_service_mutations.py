@@ -2739,6 +2739,95 @@ def test_replace_process_with_subgraph_explicit_target_and_disabled_alias():
     assert retired_symbol.error.code == "not_found"
 
 
+def test_replace_process_with_subgraph_infers_roots_and_leaves_from_topology():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, design_id, build_id, ship_id = _seed_linear_graph(service)
+    for role_id, name in (
+        ("role-engineer", "Engineer"),
+        ("role-docs", "Documentation"),
+    ):
+        _handle(
+            service,
+            {
+                "action": "create_role",
+                "project_id": project_id,
+                "role_id": role_id,
+                "name": name,
+            },
+        )
+
+    result = _handle(
+        service,
+        {
+            "action": "replace_process_with_subgraph",
+            "project_id": project_id,
+            "process_id": build_id,
+            "edit_at": _iso(15, 9),
+            "processes": [
+                {
+                    "process_symbol": "api",
+                    "name": "API",
+                    "role_requirements": [
+                        {"role_id": "role-engineer", "effort_hours": 4}
+                    ],
+                },
+                {
+                    "process_symbol": "worker",
+                    "name": "Worker",
+                    "role_requirements": [
+                        {"role_id": "role-engineer", "effort_hours": 6}
+                    ],
+                },
+                {
+                    "process_symbol": "docs",
+                    "name": "Docs",
+                    "role_requirements": [
+                        {"role_id": "role-docs", "effort_hours": 2}
+                    ],
+                },
+            ],
+            "dependencies": [
+                {"predecessor_symbol": "api", "successor_symbol": "worker"},
+                {"predecessor_symbol": "api", "successor_symbol": "docs"},
+            ],
+            "parent_alias_target_symbol": "api",
+        },
+    )
+    graph = _process_graph(service, project_id, day=15, hour=10)
+    ids_by_symbol = {
+        node["process_symbol"]: node["process_id"]
+        for node in graph["nodes"]
+    }
+    nodes_by_symbol = {
+        node["process_symbol"]: node
+        for node in graph["nodes"]
+    }
+
+    assert result.ok is True
+    assert _edge_pairs(graph) == {
+        (design_id, ids_by_symbol["api"]),
+        (ids_by_symbol["api"], ids_by_symbol["worker"]),
+        (ids_by_symbol["api"], ids_by_symbol["docs"]),
+        (ids_by_symbol["worker"], ship_id),
+        (ids_by_symbol["docs"], ship_id),
+    }
+    assert {
+        node["process_symbol"]: {
+            requirement["role_id"]: requirement["effort_hours"]
+            for requirement in node["role_requirements"]
+        }
+        for node in (
+            nodes_by_symbol["api"],
+            nodes_by_symbol["worker"],
+            nodes_by_symbol["docs"],
+        )
+    } == {
+        "api": {"role-engineer": 4},
+        "worker": {"role-engineer": 6},
+        "docs": {"role-docs": 2},
+    }
+
+
 def test_replace_process_with_subgraph_alias_collision_rejects_without_writes():
     service = ProjectService(InMemoryProjectRepository())
     project_id, design_id, build_id, ship_id = _seed_linear_graph(service)
@@ -2811,6 +2900,14 @@ def test_replace_process_with_subgraph_alias_collision_rejects_without_writes():
         ),
         pytest.param(
             {
+                "root_symbols": ["worker"],
+                "leaf_symbols": ["api"],
+            },
+            "root_symbols",
+            id="explicit_roots_leaves_must_match_topology",
+        ),
+        pytest.param(
+            {
                 "dependencies": [
                     {
                         "predecessor_symbol": "api",
@@ -2842,6 +2939,16 @@ def test_replace_process_with_subgraph_alias_collision_rejects_without_writes():
             {"leaf_symbols": ["worker", "worker"]},
             "leaf_symbols",
             id="duplicate_leaf_symbols",
+        ),
+        pytest.param(
+            {"root_symbols": ["worker"]},
+            "root_symbols",
+            id="root_symbols_must_match_topological_roots",
+        ),
+        pytest.param(
+            {"leaf_symbols": ["api"]},
+            "leaf_symbols",
+            id="leaf_symbols_must_match_topological_leaves",
         ),
         pytest.param(
             {"parent_alias_target_symbol": "missing-child"},
@@ -3157,10 +3264,228 @@ def test_collapse_subgraph_required_resource_count_conflict_requires_replacement
     validation_error = conflict.error.validation_errors[0]
     assert validation_error.type == "collapse_role_requirement_conflict"
     assert validation_error.ctx["field"] == "required_resource_count"
+    assert validation_error.ctx["role_id"] == "role-engineer"
     assert validation_error.ctx["values"] == [1, 2]
     assert explicit.ok is True
     assert explicit.entity_ids["process_id"]
     assert explicit.entity_ids["requirement_ids"] == ["req-implementation-eng"]
+
+
+def test_collapse_subgraph_preserves_total_effort_hours_by_role_when_omitted():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, design_id, build_id, _ship_id = _seed_linear_graph(service)
+    for role_id, name in (
+        ("role-engineer", "Engineer"),
+        ("role-qa", "QA"),
+    ):
+        _handle(
+            service,
+            {
+                "action": "create_role",
+                "project_id": project_id,
+                "role_id": role_id,
+                "name": name,
+            },
+        )
+    _handle(
+        service,
+        {
+            "action": "batch_update_process_graph",
+            "project_id": project_id,
+            "edit_at": _iso(14, 9),
+            "operations": [
+                {
+                    "action": "add_role_requirement",
+                    "process_id": design_id,
+                    "requirement": {
+                        "requirement_id": "req-design-eng",
+                        "role_id": "role-engineer",
+                        "effort_hours": 3,
+                    },
+                },
+                {
+                    "action": "add_role_requirement",
+                    "process_id": design_id,
+                    "requirement": {
+                        "requirement_id": "req-design-qa",
+                        "role_id": "role-qa",
+                        "effort_hours": 2,
+                    },
+                },
+                {
+                    "action": "add_role_requirement",
+                    "process_id": build_id,
+                    "requirement": {
+                        "requirement_id": "req-build-eng",
+                        "role_id": "role-engineer",
+                        "effort_hours": 5,
+                    },
+                },
+            ],
+        },
+    )
+
+    collapse = _handle(
+        service,
+        {
+            "action": "collapse_subgraph",
+            "project_id": project_id,
+            "edit_at": _iso(16, 9),
+            "process_symbols": ["design", "build"],
+            "new_process": {
+                "process_symbol": "implementation",
+                "name": "Implementation",
+            },
+        },
+    )
+    graph = _process_graph(service, project_id, day=16, hour=10)
+    replacement = next(
+        node
+        for node in graph["nodes"]
+        if node["process_id"] == collapse.entity_ids["process_id"]
+    )
+
+    assert {
+        requirement["role_id"]: requirement["effort_hours"]
+        for requirement in replacement["role_requirements"]
+    } == {
+        "role-engineer": 8,
+        "role-qa": 2,
+    }
+
+
+def test_collapse_subgraph_explicit_effort_requirements_do_not_merge_legacy_roles():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    design_id = _create_legacy_process(
+        service,
+        project_id,
+        name="Design",
+        duration_business_days=1,
+        required_roles={"engineer": 0.25},
+    )
+    build_id = _create_legacy_process(
+        service,
+        project_id,
+        name="Build",
+        duration_business_days=1,
+        required_roles={"engineer": 0.75},
+        dependencies=[design_id],
+    )
+    _create_process(
+        service,
+        project_id,
+        name="Ship",
+        dependencies=[build_id],
+    )
+    _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-delivery",
+            "name": "Delivery",
+        },
+    )
+
+    collapse = _handle(
+        service,
+        {
+            "action": "collapse_subgraph",
+            "project_id": project_id,
+            "edit_at": _iso(16, 9),
+            "process_symbols": ["design", "build"],
+            "new_process": {
+                "process_symbol": "implementation",
+                "name": "Implementation",
+                "role_requirements": [
+                    {"role_id": "role-delivery", "effort_hours": 10}
+                ],
+            },
+        },
+    )
+    graph = _process_graph(service, project_id, day=16, hour=10)
+    replacement = next(
+        node
+        for node in graph["nodes"]
+        if node["process_id"] == collapse.entity_ids["process_id"]
+    )
+
+    assert collapse.ok is True
+    assert replacement.get("required_roles", {}) == {}
+    assert {
+        requirement["role_id"]: requirement["effort_hours"]
+        for requirement in replacement["role_requirements"]
+    } == {"role-delivery": 10}
+
+
+def test_collapse_subgraph_mixed_role_modes_require_explicit_replacement():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    design_id = _create_legacy_process(
+        service,
+        project_id,
+        name="Design",
+        duration_business_days=1,
+        required_roles={"engineer": 0.25},
+    )
+    build_id = _create_process(
+        service,
+        project_id,
+        name="Build",
+        dependencies=[design_id],
+    )
+    _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-engineer",
+            "name": "Engineer",
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "batch_update_process_graph",
+            "project_id": project_id,
+            "edit_at": _iso(14, 9),
+            "operations": [
+                {
+                    "action": "add_role_requirement",
+                    "process_id": build_id,
+                    "requirement": {
+                        "role_id": "role-engineer",
+                        "effort_hours": 5,
+                    },
+                }
+            ],
+        },
+    )
+    baseline = _process_graph(service, project_id, day=16, hour=10)
+
+    collapse = _handle(
+        service,
+        {
+            "action": "collapse_subgraph",
+            "project_id": project_id,
+            "edit_at": _iso(16, 9),
+            "process_symbols": ["design", "build"],
+            "new_process": {
+                "process_symbol": "implementation",
+                "name": "Implementation",
+            },
+        },
+    )
+    after_rejection = _process_graph(service, project_id, day=16, hour=10)
+
+    assert collapse.ok is False
+    assert collapse.error.code == "validation_error"
+    validation_error = collapse.error.validation_errors[0]
+    assert validation_error.type == "collapse_mixed_role_requirement_modes"
+    assert validation_error.ctx["role_requirement_process_ids"] == [build_id]
+    assert validation_error.ctx["legacy_required_role_process_ids"] == [design_id]
+    assert after_rejection == baseline
 
 
 def test_collapse_subgraph_legacy_required_roles_conserves_attention_by_role():

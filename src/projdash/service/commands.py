@@ -517,7 +517,7 @@ class SubgraphProcessCommand(CommandModel):
 
     process_symbol: str = Field(min_length=1)
     name: str = Field(min_length=1)
-    duration_hours: NonNegativeFloat
+    duration_hours: NonNegativeFloat | None = None
     earliest_start_at: AwareDatetime | None = None
     due_at: AwareDatetime | None = None
     status: ProcessStatus = ProcessStatus.PLANNED
@@ -532,6 +532,15 @@ class SubgraphProcessCommand(CommandModel):
 
     @model_validator(mode="after")
     def _validate_finished_at_status(self) -> SubgraphProcessCommand:
+        if self.duration_hours is None:
+            if not self.role_requirements:
+                raise ValueError(
+                    "duration_hours is required when role_requirements are omitted."
+                )
+            self.duration_hours = sum(
+                float(requirement.effort_hours)
+                for requirement in self.role_requirements
+            )
         if self.status != ProcessStatus.DONE and self.finished_at is not None:
             raise ValueError("finished_at is only accepted when status is done.")
         return self
@@ -554,14 +563,16 @@ class ReplaceProcessWithSubgraph(CommandModel, ProcessIdentityMixin):
     edit_at: AwareDatetime
     processes: list[SubgraphProcessCommand] = Field(min_length=1)
     dependencies: list[SubgraphDependencyCommand]
-    root_symbols: list[str] = Field(min_length=1)
-    leaf_symbols: list[str] = Field(min_length=1)
+    root_symbols: list[str] | None = None
+    leaf_symbols: list[str] | None = None
     preserve_parent_symbol_as_alias: bool = True
     parent_alias_target_symbol: str | None = Field(default=None, min_length=1)
 
     @field_validator("root_symbols", "leaf_symbols")
     @classmethod
-    def _validate_symbol_list(cls, value: list[str]) -> list[str]:
+    def _validate_symbol_list(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
         for symbol in value:
             if not symbol:
                 raise ValueError("symbols entries must be non-empty strings.")
@@ -571,6 +582,12 @@ class ReplaceProcessWithSubgraph(CommandModel, ProcessIdentityMixin):
     def _validate_alias_target(self) -> ReplaceProcessWithSubgraph:
         for process in self.processes:
             _validate_topology_finished_at(process, self.edit_at)
+        for field_name in ("root_symbols", "leaf_symbols"):
+            if field_name in self.model_fields_set and getattr(self, field_name) == []:
+                raise ValueError(
+                    f"{field_name} may be omitted for inference, but explicit empty "
+                    "lists are not accepted."
+                )
         if not self.preserve_parent_symbol_as_alias:
             if self.parent_alias_target_symbol is not None:
                 raise ValueError(

@@ -1,5 +1,6 @@
 import datetime as dt
 
+import matplotlib.dates as mdates
 import pytest
 
 from projdash.ui.adapters import (
@@ -17,11 +18,15 @@ from projdash.ui.adapters import (
     resource_utilization_heatmap,
     role_utilization_heatmap,
 )
+from projdash.ui.app import _datetime_axis_locator_and_formatter
 from projdash.ui.service_client import (
     batch_payload_envelope,
     calendar_options,
     combine_datetime,
     command_payload_envelope,
+    format_display_datetime,
+    format_display_datetimes,
+    infer_subgraph_roots_and_leaves,
     parse_dependency_lines,
     parse_holiday_lines,
     parse_resource_lines,
@@ -30,6 +35,7 @@ from projdash.ui.service_client import (
     project_options,
     query_payload_envelope,
     scoped_id,
+    to_display_timezone,
     validate_timezone,
 )
 
@@ -60,7 +66,18 @@ def test_guided_form_parsers_accept_compact_rows():
         "UTC",
     )
     dependencies = parse_dependency_lines("A -> B\nB, C")
-    children = parse_subgraph_process_lines("A | First child | 8")
+    children = parse_subgraph_process_lines(
+        "A | First child | role_eng:6,role_review:2\n"
+        "B | Second child | role_eng:4,role_qa:2"
+    )
+    roots, leaves = infer_subgraph_roots_and_leaves(
+        [
+            {"process_symbol": "A"},
+            {"process_symbol": "B"},
+            {"process_symbol": "C"},
+        ],
+        [("A", "B")],
+    )
 
     assert roles[0].role_id == "role_eng"
     assert roles[1].role_id == "role_reviewer"
@@ -73,6 +90,70 @@ def test_guided_form_parsers_accept_compact_rows():
     assert identified_holidays[0]["ends_at"].isoformat() == "2026-05-28T00:00:00+00:00"
     assert dependencies == [("A", "B"), ("B", "C")]
     assert children[0]["duration_hours"] == 8.0
+    assert children[0]["role_requirements"] == [
+        {"role_id": "role_eng", "effort_hours": 6.0},
+        {"role_id": "role_review", "effort_hours": 2.0},
+    ]
+    assert children[1]["duration_hours"] == 6.0
+    assert children[1]["role_requirements"] == [
+        {"role_id": "role_eng", "effort_hours": 4.0},
+        {"role_id": "role_qa", "effort_hours": 2.0},
+    ]
+    assert roots == ["A", "C"]
+    assert leaves == ["B", "C"]
+
+
+def test_display_datetime_helpers_use_selected_timezone_and_visible_format():
+    value = "2026-01-01T18:00:00+00:00"
+    rows = [
+        {
+            "process_symbol": "A",
+            "due_at": value,
+            "resource_start": value,
+            "nested": {"finished_at": value},
+        }
+    ]
+
+    assert format_display_datetime(value, "America/New_York") == (
+        "Thu, 01 Jan 2026, 13:00"
+    )
+    assert to_display_timezone(value, "America/New_York").isoformat() == (
+        "2026-01-01T13:00:00-05:00"
+    )
+    assert format_display_datetime(value, "Europe/Paris") == (
+        "Thu, 01 Jan 2026, 19:00"
+    )
+    assert format_display_datetimes(rows, "America/New_York") == [
+        {
+            "process_symbol": "A",
+            "due_at": "Thu, 01 Jan 2026, 13:00",
+            "resource_start": "Thu, 01 Jan 2026, 13:00",
+            "nested": {"finished_at": "Thu, 01 Jan 2026, 13:00"},
+        }
+    ]
+
+
+def test_chart_datetime_formatter_uses_selected_timezone_and_visible_format():
+    _locator, formatter = _datetime_axis_locator_and_formatter("America/New_York")
+    timestamp = dt.datetime(2026, 1, 1, 18, tzinfo=dt.UTC)
+
+    assert formatter(mdates.date2num(timestamp)) == "Thu, 01 Jan 2026, 13:00"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "B | Second child | ",
+        "B | Second child | 8",
+        "B | Second child | :4",
+        "B | Second child | role_eng:",
+        "B | Second child | role_eng:4,role_eng:2",
+        "B | Second child | role_eng:0",
+    ],
+)
+def test_subgraph_process_role_effort_rows_reject_malformed_tokens(line: str):
+    with pytest.raises(ValueError):
+        parse_subgraph_process_lines(line)
 
 
 def test_command_payload_envelope_validates_service_command():

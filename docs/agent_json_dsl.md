@@ -128,7 +128,7 @@ Process lifecycle and graph actions:
 | `rename_process` | `project_id`, `process_id` or `process_symbol`, `new_symbol`, `edit_at` | `keep_old_symbol_as_alias` default `true` | `process_id` |
 | `add_process_aliases` | `project_id`, `process_id` or `process_symbol`, `aliases`, `edit_at` | none | `process_id` |
 | `batch_update_process_graph` | `project_id`, `edit_at`, `operations` | `idempotency_key` | affected process and edge ids |
-| `replace_process_with_subgraph` | `project_id`, `edit_at`, `process_id` or `process_symbol`, `processes`, `dependencies`, `root_symbols`, `leaf_symbols` | `preserve_parent_symbol_as_alias` default `true`, `parent_alias_target_symbol` | created process, retired process, retirement event, and edge ids |
+| `replace_process_with_subgraph` | `project_id`, `edit_at`, `process_id` or `process_symbol`, `processes`, `dependencies` | `root_symbols`/`leaf_symbols` may be omitted for inference, `preserve_parent_symbol_as_alias` default `true`, `parent_alias_target_symbol` | created process, retired process, retirement event, and edge ids |
 | `collapse_subgraph` | `project_id`, `edit_at`, `process_symbols`, `new_process` | `role_conflict_policy` default `reject` | replacement process, retired process, retirement event, requirement, and edge ids |
 
 Stored process status is the explicit project-manager lifecycle:
@@ -310,9 +310,9 @@ coalesced requirement mutations append process revisions.
 | `edit_at` | aware datetime | yes | Mutation timestamp. |
 | `process_id` or `process_symbol` | string | yes | Exactly one active parent identity. |
 | `processes` | list[SubgraphProcessCommand] | yes | Non-empty child process list. |
-| `dependencies` | list[SubgraphDependencyCommand] | yes | Internal child dependencies; may be empty only when there is one child. |
-| `root_symbols` | list[string] | yes | Non-empty supplied child symbols receiving external incoming edges. |
-| `leaf_symbols` | list[string] | yes | Non-empty supplied child symbols feeding external outgoing edges. |
+| `dependencies` | list[SubgraphDependencyCommand] | yes | Internal child dependencies; may be empty when children are independent components. |
+| `root_symbols` | list[string] | no | When omitted, inferred as child symbols with no internal predecessors. If supplied, must be non-empty and exactly match inferred roots. |
+| `leaf_symbols` | list[string] | no | When omitted, inferred as child symbols with no internal successors. If supplied, must be non-empty and exactly match inferred leaves. |
 | `preserve_parent_symbol_as_alias` | bool | no | Default `true`. When true, the retired parent canonical symbol is assigned as an alias to one created child process. When false, the parent symbol is not preserved for active identity resolution. |
 | `parent_alias_target_symbol` | string | conditional | Required when `preserve_parent_symbol_as_alias = true` and more than one child process is supplied; defaults to the only child when there is exactly one child; forbidden when `preserve_parent_symbol_as_alias = false`. Must name one supplied child `process_symbol`. |
 
@@ -480,7 +480,7 @@ Setting the same calendar is a no-op.
 | --- | --- | --- | --- |
 | `process_symbol` | string | yes | New active canonical symbol unique in the final project graph. |
 | `name` | string | yes | Non-empty display name. |
-| `duration_hours` | number | yes | Finite and `>= 0`. |
+| `duration_hours` | number | conditional | Finite and `>= 0`; required when `role_requirements` are omitted. If omitted with `role_requirements`, the service derives it from total role effort hours. |
 | `earliest_start_at` | aware datetime or null | no | Nullable persisted constraint. |
 | `due_at` | aware datetime or null | no | Nullable process due datetime. |
 | `status` | enum | no | Default `planned`; cannot be `blocked`. |
@@ -498,9 +498,11 @@ Setting the same calendar is a no-op.
 | `dependency_type` | enum | no | Default `finish_to_start`; only value accepted in v1. |
 | `edge_id` | string | no | Generated when omitted; unique within the final graph. |
 
-`root_symbols` and `leaf_symbols` are non-empty lists of supplied child
-symbols. Duplicate roots/leaves are rejected. A child may be both a root and a
-leaf only when valid for the internal dependency graph.
+`root_symbols` and `leaf_symbols` may be omitted; omission infers roots and
+leaves from the internal dependency DAG. Explicit empty lists are rejected.
+Explicit non-empty lists must exactly match the inferred topological roots and
+leaves. A one-child subgraph infers that child as both root and leaf. Multiple
+disconnected child components are allowed when the internal graph is acyclic.
 
 `collapse_subgraph.new_process` has this exact shape:
 
@@ -577,9 +579,10 @@ resolve the retired process's historical symbols and aliases.
 `replace_process_with_subgraph` retires the selected parent process from the
 active graph and adds the supplied child processes and internal dependencies in
 one atomic revision. Every external incoming edge to the parent is rewired to
-each `root_symbols` child. Every external outgoing edge from the parent is
-rewired from each `leaf_symbols` child. Roots and leaves must be supplied
-children, child symbols must be unique, and the resulting graph must remain
+each inferred or validated root child. Every external outgoing edge from the
+parent is rewired from each inferred or validated leaf child. Child symbols must
+be unique, explicit roots/leaves must match the child topology, and the resulting
+graph must remain
 acyclic. Parent-symbol alias preservation is deterministic: the command
 defaults `preserve_parent_symbol_as_alias = true`; when true, the retired
 parent canonical symbol becomes an alias for exactly one created child. With
@@ -632,8 +635,8 @@ command is rejected unless explicit replacement `role_requirements` are
 provided. Legacy attention/FTE values do not derive
 `required_resource_count`; once legacy values are mapped to effort-hour
 requirements, the same compatibility rule above applies. Mixed legacy
-attention/FTE and effort-hour requirements for the same role are rejected unless
-explicit replacement `role_requirements` are provided.
+attention/FTE and effort-hour requirements in the same collapsed selection are
+rejected unless explicit replacement `role_requirements` are provided.
 
 Process symbols are unique among active processes and aliases in one project.
 `rename_process` changes the canonical symbol while preserving `process_id`.

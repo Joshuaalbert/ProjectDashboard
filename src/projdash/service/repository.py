@@ -1321,13 +1321,15 @@ class InMemoryProjectRepository:
         edit_at: dt.datetime,
         processes: list[Any],
         dependencies: list[Any],
-        root_symbols: list[str],
-        leaf_symbols: list[str],
+        root_symbols: list[str] | None,
+        leaf_symbols: list[str] | None,
         command_id: str,
         preserve_parent_symbol_as_alias: bool = True,
         parent_alias_target_symbol: str | None = None,
     ) -> dict[str, Any]:
         parent = self._get_process(project_id, process_id)
+        root_symbols = list(root_symbols or [])
+        leaf_symbols = list(leaf_symbols or [])
         child_symbols = [child.process_symbol for child in processes]
         self._validate_unique_values(
             child_symbols,
@@ -1398,6 +1400,38 @@ class InMemoryProjectRepository:
                 "Child dependency graph must be acyclic.",
                 "dependency_cycle",
             )
+        inferred_root_symbols = [
+            symbol for symbol in child_symbols if child_graph.in_degree(symbol) == 0
+        ]
+        inferred_leaf_symbols = [
+            symbol for symbol in child_symbols if child_graph.out_degree(symbol) == 0
+        ]
+        if root_symbols:
+            if set(root_symbols) != set(inferred_root_symbols):
+                self._raise_validation(
+                    ["command", "root_symbols"],
+                    "Root symbols must match the child graph's topological roots.",
+                    "root_symbols_mismatch",
+                    {
+                        "inferred_root_symbols": inferred_root_symbols,
+                        "supplied_root_symbols": list(root_symbols),
+                    },
+                )
+        else:
+            root_symbols = inferred_root_symbols
+        if leaf_symbols:
+            if set(leaf_symbols) != set(inferred_leaf_symbols):
+                self._raise_validation(
+                    ["command", "leaf_symbols"],
+                    "Leaf symbols must match the child graph's topological leaves.",
+                    "leaf_symbols_mismatch",
+                    {
+                        "inferred_leaf_symbols": inferred_leaf_symbols,
+                        "supplied_leaf_symbols": list(leaf_symbols),
+                    },
+                )
+        else:
+            leaf_symbols = inferred_leaf_symbols
         child_ids: dict[str, str] = {}
         incoming, outgoing = self._external_edges(project_id, edit_at, {process_id})
         for child in processes:
@@ -1571,6 +1605,31 @@ class InMemoryProjectRepository:
             if requirement.requirement_id is not None
         ]
         if not role_requirements:
+            role_requirement_process_ids = [
+                revision.process_id
+                for revision in selected_revisions
+                if revision.role_requirements
+            ]
+            legacy_required_role_process_ids = [
+                revision.process_id
+                for revision in selected_revisions
+                if revision.required_roles
+            ]
+            if role_requirement_process_ids and legacy_required_role_process_ids:
+                self._raise_validation(
+                    ["command", "new_process", "role_requirements"],
+                    (
+                        "Cannot infer collapsed role usage from mixed "
+                        "role_requirements and legacy required_roles."
+                    ),
+                    "collapse_mixed_role_requirement_modes",
+                    {
+                        "role_requirement_process_ids": role_requirement_process_ids,
+                        "legacy_required_role_process_ids": (
+                            legacy_required_role_process_ids
+                        ),
+                    },
+                )
             role_requirements = self._merged_role_requirements(selected_revisions)
             requirement_ids = [
                 requirement.requirement_id
@@ -1578,7 +1637,7 @@ class InMemoryProjectRepository:
                 if requirement.requirement_id is not None
             ]
         required_roles = dict(getattr(new_process, "required_roles", {}) or {})
-        if not required_roles:
+        if not required_roles and not role_requirements:
             required_roles = self._merged_legacy_required_roles(selected_revisions)
         if new_process.duration_hours is None:
             duration_days = sum(
@@ -1916,6 +1975,7 @@ class InMemoryProjectRepository:
                         "collapse_role_requirement_conflict",
                         {
                             "field": field,
+                            "role_id": role_id,
                             "values": values,
                             "process_ids": process_ids_by_role[role_id],
                             "requirement_ids": requirement_ids_by_role[role_id],

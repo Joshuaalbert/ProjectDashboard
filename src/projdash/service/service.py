@@ -587,8 +587,8 @@ class ProjectService:
                 edit_at=command.edit_at,
                 processes=command.processes,
                 dependencies=command.dependencies,
-                root_symbols=command.root_symbols,
-                leaf_symbols=command.leaf_symbols,
+                root_symbols=command.root_symbols or [],
+                leaf_symbols=command.leaf_symbols or [],
                 command_id=str(envelope.command_id),
                 preserve_parent_symbol_as_alias=(
                     command.preserve_parent_symbol_as_alias
@@ -1248,7 +1248,7 @@ class ProjectService:
                     "active": late_active,
                 },
             }
-            if required_roles:
+            if required_roles or role_requirements:
                 node["required_roles"] = required_roles
             project_has_roles = bool(
                 getattr(self._repository, "role_ids_by_project", {}).get(project_id, [])

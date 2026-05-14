@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -29,19 +30,23 @@ from projdash.ui.adapters import (
 )
 from projdash.ui.service_client import (
     DEFAULT_TIMEZONE,
+    DISPLAY_DATETIME_FORMAT,
     batch_payload_envelope,
     calendar_options,
     combine_datetime,
     command_payload_envelope,
     create_project_service,
+    format_display_datetime,
+    format_display_datetimes,
+    infer_subgraph_roots_and_leaves,
     parse_dependency_lines,
     parse_subgraph_process_lines,
     project_options,
     query_payload_envelope,
     result_to_dict,
     scoped_id,
-    split_csv,
     stable_id,
+    to_display_timezone,
     validate_timezone,
 )
 
@@ -90,7 +95,7 @@ def main() -> None:
         ]
     )
     with tabs[0]:
-        _render_dashboard(context)
+        _render_dashboard(controls, context)
     with tabs[1]:
         _render_project_settings(service, controls, context)
     with tabs[2]:
@@ -100,13 +105,13 @@ def main() -> None:
     with tabs[4]:
         _render_resources(service, controls, context)
     with tabs[5]:
-        _render_schedule(context)
+        _render_schedule(controls, context)
     with tabs[6]:
         _render_slippage(service, controls, context)
     with tabs[7]:
-        _render_costs(context)
+        _render_costs(controls, context)
     with tabs[8]:
-        _render_history(context)
+        _render_history(controls, context)
     with tabs[9]:
         _render_topology(service, controls, context)
 
@@ -154,6 +159,7 @@ def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, A
     except ValueError as exc:
         st.sidebar.error(str(exc))
         st.stop()
+    default_as_of = to_display_timezone(default_as_of, timezone_name)
     as_of_date = st.sidebar.date_input(
         "As of date",
         default_as_of.date(),
@@ -187,15 +193,39 @@ def _calendar_label(calendar_id: str, options: list[Any]) -> str:
     return labels.get(calendar_id, calendar_id)
 
 
-def _snapshot_label(snapshot_id: str, snapshots: list[dict[str, Any]]) -> str:
+def _snapshot_label(
+    snapshot_id: str,
+    snapshots: list[dict[str, Any]],
+    timezone_name: str,
+) -> str:
     if not snapshot_id:
         return "Select a committed timestamp"
     rows = {snapshot["snapshot_id"]: snapshot for snapshot in snapshots}
     snapshot = rows.get(snapshot_id)
     if snapshot is None:
         return snapshot_id
-    completion = snapshot.get("completion_at") or "unresolved"
-    return f"{snapshot.get('committed_at')} -> {completion}"
+    committed = format_display_datetime(snapshot.get("committed_at"), timezone_name)
+    completion = (
+        format_display_datetime(snapshot.get("completion_at"), timezone_name)
+        if snapshot.get("completion_at")
+        else "unresolved"
+    )
+    return f"{committed} -> {completion}"
+
+
+def _datetime_axis_locator_and_formatter(timezone_name: str):
+    """Return Matplotlib date locator/formatter for the selected UI timezone."""
+    timezone = ZoneInfo(validate_timezone(timezone_name))
+    return (
+        mdates.AutoDateLocator(tz=timezone),
+        mdates.DateFormatter(DISPLAY_DATETIME_FORMAT, tz=timezone),
+    )
+
+
+def _format_datetime_axis(axis: Any, timezone_name: str) -> None:
+    locator, formatter = _datetime_axis_locator_and_formatter(timezone_name)
+    axis.set_major_locator(locator)
+    axis.set_major_formatter(formatter)
 
 
 def _render_first_run(service, controls: dict[str, Any]) -> None:
@@ -415,7 +445,7 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
-def _render_dashboard(context: dict[str, Any]) -> None:
+def _render_dashboard(controls: dict[str, Any], context: dict[str, Any]) -> None:
     project = context["project"]["project"]
     graph = context.get("graph") or {}
     blockers = context.get("blockers") or {}
@@ -432,10 +462,20 @@ def _render_dashboard(context: dict[str, Any]) -> None:
     col2.metric("Processes", len(nodes))
     col3.metric("Open blockers", len(unresolved))
     col4.metric("Total cost", costs.get("total_cost", "0"))
-    st.dataframe(process_table_rows(graph), use_container_width=True, hide_index=True)
+    st.dataframe(
+        format_display_datetimes(process_table_rows(graph), controls["timezone"]),
+        use_container_width=True,
+        hide_index=True,
+    )
     due_cols = st.columns(3)
-    due_cols[0].metric("Explicit due", history.get("current_project_due_at") or "-")
-    due_cols[1].metric("Derived due", history.get("derived_project_due_at") or "-")
+    due_cols[0].metric(
+        "Explicit due",
+        format_display_datetime(history.get("current_project_due_at"), controls["timezone"]),
+    )
+    due_cols[1].metric(
+        "Derived due",
+        format_display_datetime(history.get("derived_project_due_at"), controls["timezone"]),
+    )
     due_cols[2].metric("Schedule basis", graph.get("schedule_basis", "-"))
 
 
@@ -446,7 +486,10 @@ def _render_project_settings(
 ) -> None:
     project = (context.get("project") or {}).get("project", {})
     st.subheader("Project settings")
-    start_at = _parse_iso_datetime(project.get("start_at"), controls["as_of"])
+    start_at = to_display_timezone(
+        _parse_iso_datetime(project.get("start_at"), controls["as_of"]),
+        controls["timezone"],
+    )
     with st.form("project_settings"):
         name = st.text_input(
             "Project name",
@@ -484,9 +527,12 @@ def _render_project_settings(
 
     st.subheader("Project due date")
     history = context.get("history") or {}
-    current_due = _parse_iso_datetime(
-        history.get("current_project_due_at"),
-        controls["as_of"] + dt.timedelta(days=30),
+    current_due = to_display_timezone(
+        _parse_iso_datetime(
+            history.get("current_project_due_at"),
+            controls["as_of"] + dt.timedelta(days=30),
+        ),
+        controls["timezone"],
     )
     with st.form("project_due"):
         clear_due = st.checkbox(
@@ -551,12 +597,14 @@ def _render_process_table(
     graph: dict[str, Any],
     *,
     key: str,
+    timezone_name: str,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     rows = process_table_rows(graph)
+    display_rows = format_display_datetimes(rows, timezone_name)
     selected_symbols: list[str] = []
     try:
         event = st.dataframe(
-            rows,
+            display_rows,
             use_container_width=True,
             hide_index=True,
             on_select="rerun",
@@ -574,7 +622,7 @@ def _render_process_table(
             if 0 <= index < len(rows) and rows[index].get("symbol")
         ]
     except TypeError:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(display_rows, use_container_width=True, hide_index=True)
     if selected_symbols:
         st.session_state["selected_process_symbols"] = selected_symbols
         return rows, selected_symbols
@@ -599,7 +647,11 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
         if node.get("process_symbol")
     }
     st.subheader("Process plan")
-    _rows, selected_symbols = _render_process_table(graph, key="process_table")
+    _rows, selected_symbols = _render_process_table(
+        graph,
+        key="process_table",
+        timezone_name=controls["timezone"],
+    )
 
     with st.expander("Create or revise process", expanded=True):
         with st.form("process_revision"):
@@ -1119,6 +1171,7 @@ def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]
     _render_heatmap(
         "Resource utilization",
         *resource_utilization_heatmap(context.get("utilization") or {}),
+        timezone_name=controls["timezone"],
     )
     st.subheader("Role utilization")
     _render_heatmap(
@@ -1127,11 +1180,15 @@ def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]
             context.get("capacity") or {},
             context.get("resource_schedule") or {},
         ),
+        timezone_name=controls["timezone"],
     )
 
     st.subheader("Capacity")
     st.dataframe(
-        (context.get("capacity") or {}).get("buckets", []),
+        format_display_datetimes(
+            (context.get("capacity") or {}).get("buckets", []),
+            controls["timezone"],
+        ),
         use_container_width=True,
         hide_index=True,
     )
@@ -1396,6 +1453,10 @@ def _render_resource_forms(
                 selected_resource.get("available_from_at"),
                 controls["as_of"],
             )
+            available_from = to_display_timezone(
+                available_from,
+                controls["timezone"],
+            )
             available_date = st.date_input(
                 "Available from",
                 available_from.date(),
@@ -1602,7 +1663,7 @@ def _resource_payload_with_holidays(
     }
 
 
-def _render_schedule(context: dict[str, Any]) -> None:
+def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
     graph = context.get("graph") or {}
     full_graph = context.get("full_graph") or graph
     schedule = context.get("resource_schedule") or {}
@@ -1633,24 +1694,34 @@ def _render_schedule(context: dict[str, Any]) -> None:
     horizon_end = context.get("horizon_ends_at")
     if horizon_start and horizon_end:
         st.caption(
-            f"Query horizon: {horizon_start.isoformat()} to {horizon_end.isoformat()}"
+            "Query horizon: "
+            f"{format_display_datetime(horizon_start, controls['timezone'])} to "
+            f"{format_display_datetime(horizon_end, controls['timezone'])}"
         )
     st.metric("Converged", str(schedule.get("converged", "-")))
     _render_gantt_chart(
         graph,
         controls_now=context.get("now"),
         terminal_symbols=terminal_symbols,
+        timezone_name=controls["timezone"],
     )
-    st.dataframe(schedule.get("processes", []), use_container_width=True, hide_index=True)
+    st.dataframe(
+        format_display_datetimes(schedule.get("processes", []), controls["timezone"]),
+        use_container_width=True,
+        hide_index=True,
+    )
     st.subheader("Unallocated requirements")
     st.dataframe(
-        schedule.get("unallocated_requirements", []),
+        format_display_datetimes(
+            schedule.get("unallocated_requirements", []),
+            controls["timezone"],
+        ),
         use_container_width=True,
         hide_index=True,
     )
     st.subheader("Allocation slices")
     st.dataframe(
-        schedule.get("allocation_slices", []),
+        format_display_datetimes(schedule.get("allocation_slices", []), controls["timezone"]),
         use_container_width=True,
         hide_index=True,
     )
@@ -1661,6 +1732,7 @@ def _render_gantt_chart(
     *,
     controls_now: dt.datetime | None,
     terminal_symbols: list[str],
+    timezone_name: str,
 ) -> None:
     rows = gantt_rows(graph, terminal_symbols=terminal_symbols)
     rows = [
@@ -1701,9 +1773,7 @@ def _render_gantt_chart(
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels([row["symbol"] for row in reversed(rows)])
     ax.set_xlabel("Time")
-    locator = mdates.AutoDateLocator()
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    _format_datetime_axis(ax.xaxis, timezone_name)
     ax.grid(axis="x", color="#e5e7eb", linewidth=0.8)
     fig.tight_layout()
     st.pyplot(fig)
@@ -1714,6 +1784,8 @@ def _render_heatmap(
     labels: list[str],
     times: list[dt.datetime],
     matrix: list[list[float]],
+    *,
+    timezone_name: str,
 ) -> None:
     if not labels or not times or not matrix:
         st.info(f"No {title.lower()} data for the inferred horizon.")
@@ -1734,9 +1806,7 @@ def _render_heatmap(
     )
     ax.set_yticks([index + 0.5 for index in range(len(labels))])
     ax.set_yticklabels(labels)
-    locator = mdates.AutoDateLocator()
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    _format_datetime_axis(ax.xaxis, timezone_name)
     ax.set_xlabel("Time")
     fig.colorbar(image, ax=ax, label="Utilization")
     fig.tight_layout()
@@ -1791,14 +1861,15 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         )
         ax.set_xlabel("Commit time")
         ax.set_ylabel("Calculated completion")
-        locator = mdates.AutoDateLocator()
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-        ax.yaxis.set_major_locator(locator)
-        ax.yaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        _format_datetime_axis(ax.xaxis, controls["timezone"])
+        _format_datetime_axis(ax.yaxis, controls["timezone"])
         fig.tight_layout()
         st.pyplot(fig)
-    st.dataframe(snapshots, use_container_width=True, hide_index=True)
+    st.dataframe(
+        format_display_datetimes(snapshots, controls["timezone"]),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     if not snapshots:
         return
@@ -1806,7 +1877,11 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
     selected_snapshot_id = st.selectbox(
         "Historical commit",
         [""] + snapshot_options,
-        format_func=lambda value: _snapshot_label(value, snapshots),
+        format_func=lambda value: _snapshot_label(
+            value,
+            snapshots,
+            controls["timezone"],
+        ),
         help="Choose a committed schedule timestamp to load into the as-of controls.",
     )
     if st.button("Load commit timestamp") and selected_snapshot_id:
@@ -1819,7 +1894,7 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         st.rerun()
 
 
-def _render_costs(context: dict[str, Any]) -> None:
+def _render_costs(controls: dict[str, Any], context: dict[str, Any]) -> None:
     costs = context.get("costs") or {}
     utilization = context.get("utilization") or {}
     cols = st.columns(2)
@@ -1836,40 +1911,57 @@ def _render_costs(context: dict[str, Any]) -> None:
             [row["cost_amount"] for row in rows],
         )
         ax.set_ylabel("Cost")
-        locator = mdates.AutoDateLocator()
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        _format_datetime_axis(ax.xaxis, controls["timezone"])
         fig.tight_layout()
         st.pyplot(fig)
-    st.dataframe(costs.get("by_resource", []), use_container_width=True, hide_index=True)
-    st.dataframe(costs.get("by_process", []), use_container_width=True, hide_index=True)
+    st.dataframe(
+        format_display_datetimes(costs.get("by_resource", []), controls["timezone"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.dataframe(
+        format_display_datetimes(costs.get("by_process", []), controls["timezone"]),
+        use_container_width=True,
+        hide_index=True,
+    )
     st.subheader("Utilization by resource")
     st.dataframe(
-        utilization.get("by_resource", []),
+        format_display_datetimes(utilization.get("by_resource", []), controls["timezone"]),
         use_container_width=True,
         hide_index=True,
     )
     st.subheader("Utilization by role")
-    st.dataframe(utilization.get("by_role", []), use_container_width=True, hide_index=True)
+    st.dataframe(
+        format_display_datetimes(utilization.get("by_role", []), controls["timezone"]),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
-def _render_history(context: dict[str, Any]) -> None:
+def _render_history(controls: dict[str, Any], context: dict[str, Any]) -> None:
     history = context.get("history") or {}
     blockers = context.get("blockers") or {}
     st.subheader("Process due-date events")
     st.dataframe(
-        history.get("process_events", []),
+        format_display_datetimes(history.get("process_events", []), controls["timezone"]),
         use_container_width=True,
         hide_index=True,
     )
     st.subheader("Project due-date events")
     st.dataframe(
-        history.get("project_total_events", []),
+        format_display_datetimes(
+            history.get("project_total_events", []),
+            controls["timezone"],
+        ),
         use_container_width=True,
         hide_index=True,
     )
     st.subheader("Blocker history")
-    st.dataframe(blockers.get("blockers", []), use_container_width=True, hide_index=True)
+    st.dataframe(
+        format_display_datetimes(blockers.get("blockers", []), controls["timezone"]),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 def _render_topology(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
@@ -1901,28 +1993,24 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
             )
             children = st.text_area(
                 "Children",
-                "A | First child | 8\nB | Second child | 8",
-                help="Rows of new process symbol, name, and duration hours.",
+                "A | First child | role_eng:8\nB | Second child | role_eng:8",
+                help=(
+                    "Rows of new process symbol, name, and role effort hours, "
+                    "for example `A | Name | role_eng:8,role_qa:2`."
+                ),
             )
             dependencies = st.text_area(
                 "Internal dependencies",
                 "A -> B",
                 help="Dependencies between child process symbols.",
             )
-            roots = st.text_input(
-                "Root symbols",
-                "A",
-                help="Comma-separated child symbols that receive original parents.",
-            )
-            leaves = st.text_input(
-                "Leaf symbols",
-                "B",
-                help="Comma-separated child symbols that receive original children.",
-            )
             alias_target = st.text_input(
                 "Parent alias target symbol",
-                "A",
-                help="Child symbol that should keep the parent process symbol as an alias.",
+                "",
+                help=(
+                    "Child symbol that should keep the parent process symbol as "
+                    "an alias. Leave blank to use the first inferred root."
+                ),
             )
             preserve_alias = st.checkbox(
                 "Preserve parent symbol as alias",
@@ -1933,16 +2021,22 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
         if replace and target:
             try:
                 parsed_children = parse_subgraph_process_lines(children)
+                dependency_pairs = parse_dependency_lines(dependencies)
+                root_symbols, _leaf_symbols = infer_subgraph_roots_and_leaves(
+                    parsed_children,
+                    dependency_pairs,
+                )
                 parsed_dependencies = [
                     {
                         "predecessor_symbol": predecessor,
                         "successor_symbol": successor,
                     }
-                    for predecessor, successor in parse_dependency_lines(dependencies)
+                    for predecessor, successor in dependency_pairs
                 ]
             except ValueError as exc:
                 st.error(str(exc))
             else:
+                inferred_alias_target = root_symbols[0] if root_symbols else None
                 _apply_command(
                     service,
                     {
@@ -1952,10 +2046,12 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                         "edit_at": controls["as_of"],
                         "processes": parsed_children,
                         "dependencies": parsed_dependencies,
-                        "root_symbols": split_csv(roots),
-                        "leaf_symbols": split_csv(leaves),
                         "preserve_parent_symbol_as_alias": preserve_alias,
-                        "parent_alias_target_symbol": alias_target or None,
+                        "parent_alias_target_symbol": (
+                            (alias_target or inferred_alias_target)
+                            if preserve_alias
+                            else None
+                        ),
                     },
                 )
 
