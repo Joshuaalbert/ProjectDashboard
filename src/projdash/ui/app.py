@@ -30,6 +30,7 @@ from projdash.ui.adapters import (
     resource_utilization_heatmap,
     role_priority_rows,
     role_utilization_heatmap,
+    schedule_time_span,
 )
 from projdash.ui.service_client import (
     DEFAULT_TIMEZONE,
@@ -1300,19 +1301,10 @@ def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]
     st.write(", ".join(catalog["role_ids"]) or "No roles configured.")
     _render_role_forms(service, controls, catalog)
 
-    st.subheader("Resource utilization")
-    _render_heatmap(
-        "Resource utilization",
-        *resource_utilization_heatmap(context.get("utilization") or {}),
-        timezone_name=controls["timezone"],
-    )
-    st.subheader("Role utilization")
-    _render_heatmap(
-        "Role utilization",
-        *role_utilization_heatmap(
-            context.get("utilization") or {},
-            context.get("resource_schedule") or {},
-        ),
+    st.subheader("Utilization")
+    _render_utilization_heatmaps(
+        context.get("utilization") or {},
+        context.get("resource_schedule") or {},
         timezone_name=controls["timezone"],
     )
 
@@ -2084,6 +2076,69 @@ def _render_heatmap(
     ax.set_xlabel("Time")
     fig.colorbar(image, ax=ax, label="Utilization")
     fig.tight_layout()
+    st.pyplot(fig)
+
+
+def _render_utilization_heatmaps(
+    utilization: dict[str, Any],
+    schedule: dict[str, Any],
+    *,
+    timezone_name: str,
+) -> None:
+    resource_panel = (
+        "Resources",
+        *resource_utilization_heatmap(utilization, schedule),
+    )
+    role_panel = (
+        "Roles",
+        *role_utilization_heatmap(utilization, schedule),
+    )
+    panels = [
+        panel
+        for panel in (resource_panel, role_panel)
+        if panel[1] and panel[2] and panel[3]
+    ]
+    if not panels:
+        st.info("No utilization data for the computed schedule span.")
+        return
+
+    height_ratios = [max(1.2, len(panel[1]) * 0.35) for panel in panels]
+    fig_height = max(3.0, sum(height_ratios) + 1.0)
+    fig, axes = plt.subplots(
+        len(panels),
+        1,
+        figsize=(12, fig_height),
+        sharex=True,
+        gridspec_kw={"height_ratios": height_ratios},
+    )
+    axes_list = list(axes.flat) if hasattr(axes, "flat") else [axes]
+    image = None
+    for ax, (title, labels, times, matrix) in zip(axes_list, panels, strict=False):
+        step = times[1] - times[0] if len(times) > 1 else dt.timedelta(hours=1)
+        time_edges = [*times, times[-1] + step]
+        y_edges = list(range(len(labels) + 1))
+        image = ax.pcolormesh(
+            mdates.date2num(time_edges),
+            y_edges,
+            matrix,
+            cmap="jet",
+            vmin=0,
+            vmax=1,
+            shading="flat",
+        )
+        ax.set_title(title, loc="left", fontsize=10)
+        ax.set_yticks([index + 0.5 for index in range(len(labels))])
+        ax.set_yticklabels(labels)
+        ax.grid(axis="x", color="#e5e7eb", linewidth=0.8)
+
+    span = schedule_time_span(schedule)
+    if span is not None:
+        axes_list[-1].set_xlim(mdates.date2num(span[0]), mdates.date2num(span[1]))
+    _format_datetime_axis(axes_list[-1].xaxis, timezone_name)
+    axes_list[-1].set_xlabel("Time")
+    if image is not None:
+        fig.colorbar(image, ax=axes_list, label="Utilization")
+    fig.autofmt_xdate(rotation=30, ha="right")
     st.pyplot(fig)
 
 

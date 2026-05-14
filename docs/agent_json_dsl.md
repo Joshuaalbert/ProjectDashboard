@@ -128,6 +128,7 @@ Supported query actions are:
 - `query_blockers`
 - `query_schedule_snapshots`
 - `query_resource_schedule`
+- `query_agent_context`
 - `query_resource_capacity`
 - `query_utilization`
 - `query_costs`
@@ -145,6 +146,24 @@ If a resource-aware schedule cannot ever be solved because required roles,
 eligible resources, or recurring calendar capacity are missing, the query
 returns a structured `resource_schedule_unsatisfiable` error rather than a
 partial schedule.
+
+`query_agent_context` returns a concise JSON report intended for project-manager
+agents. It includes the resource-aware process graph, role requirements,
+inferred process durations, critical path, committed slippage summary, blockers,
+and role-prioritized work. Agents should use the narrower queries above when
+they need detailed schedule, utilization, cost, or capacity evidence.
+
+The request accepts `project_id`, timezone-aware `as_of` and `now`, optional
+`scope`, optional `terminal_process_symbols`, scheduler convergence options, and
+`snapshot_limit`. When terminal symbols are provided without an explicit scope,
+the context is scoped to those terminal nodes and their ancestors. Terminal
+symbols may be aliases; the response includes both requested
+`terminal_process_symbols` and resolved `canonical_terminal_process_symbols`.
+Slippage lookup includes snapshots committed under either the requested aliases
+or the resolved canonical terminal symbols. Top-level query warnings mirror
+resource-schedule warnings, such as `max_iterations_reached`. The response is
+stable JSON with these main sections: `project`, `summary`, `graph`, `schedule`,
+`slippage`, `prioritized_work`, `blockers`, and `available_queries`.
 
 ## Slippage
 

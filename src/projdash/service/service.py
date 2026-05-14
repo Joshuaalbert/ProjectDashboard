@@ -63,6 +63,7 @@ from projdash.service.models import (
 )
 from projdash.service.queries import (
     GetProject,
+    QueryAgentContext,
     QueryBlockers,
     QueryCosts,
     QueryCriticalPath,
@@ -734,6 +735,8 @@ class ProjectService:
             data = self._process_graph_data(query)
         elif isinstance(query, QueryResourceSchedule):
             data, warnings = self._resource_schedule_data(query)
+        elif isinstance(query, QueryAgentContext):
+            data, warnings = self._agent_context_data(query)
         elif isinstance(query, QueryResourceCapacity):
             data = self._capacity_data(query)
         elif isinstance(query, QueryUtilization):
@@ -991,7 +994,12 @@ class ProjectService:
             "critical_path_process_ids": graph["critical_path_process_ids"],
         }
 
-    def _process_graph_data(self, query: QueryProcessGraph) -> dict[str, object]:
+    def _process_graph_data(
+        self,
+        query: QueryProcessGraph,
+        *,
+        include_warnings: bool = False,
+    ) -> dict[str, object] | tuple[dict[str, object], list[Warning]]:
         graph = self._dependency_graph_parts(
             query.project_id,
             query.as_of,
@@ -1000,8 +1008,9 @@ class ProjectService:
         )
         resource_schedule = None
         resource_by_process: dict[str, dict[str, object]] = {}
+        resource_warnings: list[Warning] = []
         if query.include_resource_fields:
-            resource_schedule, _warnings = self._resource_schedule_data(query)
+            resource_schedule, resource_warnings = self._resource_schedule_data(query)
             resource_by_process = {
                 row["process_id"]: row for row in resource_schedule["processes"]
             }
@@ -1082,7 +1091,7 @@ class ProjectService:
                         "allocation_diagnostic": row.get("allocation_diagnostic"),
                     }
             nodes.append(node)
-        return {
+        data = {
             "project_id": query.project_id,
             "as_of": query.as_of.isoformat(),
             "now": query.now.isoformat(),
@@ -1105,6 +1114,9 @@ class ProjectService:
                 else []
             ),
         }
+        if include_warnings:
+            return data, resource_warnings
+        return data
 
     def _dependency_graph_parts(
         self,
@@ -1460,6 +1472,450 @@ class ProjectService:
             ],
         }
 
+    def _agent_context_data(
+        self,
+        query: QueryAgentContext,
+    ) -> tuple[dict[str, object], list[Warning]]:
+        context_scope = self._agent_context_scope(query)
+        graph_query = QueryProcessGraph(
+            project_id=query.project_id,
+            as_of=query.as_of,
+            now=query.now,
+            scope=context_scope,
+            include_resource_fields=True,
+            include_allocation_slices=False,
+            planning_granularity=query.planning_granularity,
+            max_iterations=query.max_iterations,
+            convergence_tolerance_hours=query.convergence_tolerance_hours,
+        )
+        graph, warnings = self._process_graph_data(
+            graph_query,
+            include_warnings=True,
+        )
+        canonical_terminal_symbols = self._canonical_process_symbols(
+            query.project_id,
+            query.terminal_process_symbols or [],
+        )
+        priority_terminal_symbols = (
+            canonical_terminal_symbols if query.scope is None else []
+        )
+        project = self._repository.get_project(query.project_id)
+        scoped_process_ids = [
+            str(node["process_id"])
+            for node in graph["nodes"]
+            if node.get("process_id")
+        ]
+        blockers = self._blocker_data(
+            QueryBlockers(
+                project_id=query.project_id,
+                as_of=query.as_of,
+                process_ids=scoped_process_ids,
+                include_resolved=False,
+            )
+        )
+        snapshots = self._agent_schedule_snapshots(
+            query,
+            canonical_terminal_symbols,
+        )
+        return (
+            {
+                "context_version": 1,
+                "project": {
+                    "project_id": project.project_id,
+                    "name": project.name,
+                    "start_at": project.start_at.isoformat(),
+                    "default_currency": project.default_currency,
+                },
+                "as_of": query.as_of.isoformat(),
+                "now": query.now.isoformat(),
+                "scope": self._json_ready(context_scope or {"type": "project"}),
+                "terminal_process_symbols": query.terminal_process_symbols or [],
+                "canonical_terminal_process_symbols": canonical_terminal_symbols,
+                "summary": self._agent_context_summary(graph),
+                "graph": self._agent_graph_context(graph),
+                "schedule": self._agent_schedule_context(graph),
+                "slippage": self._agent_slippage_context(
+                    snapshots,
+                    query.snapshot_limit,
+                ),
+                "prioritized_work": {
+                    "by_role": self._agent_role_priority_context(
+                        graph,
+                        query.now,
+                        priority_terminal_symbols,
+                    ),
+                },
+                "blockers": blockers["blockers"],
+                "available_queries": [
+                    "query_process_graph",
+                    "query_resource_schedule",
+                    "query_schedule_snapshots",
+                    "query_utilization",
+                    "query_costs",
+                    "query_resource_capacity",
+                ],
+            },
+            warnings,
+        )
+
+    def _agent_context_scope(self, query: QueryAgentContext):
+        if query.scope is not None or not query.terminal_process_symbols:
+            return query.scope
+        return {
+            "type": "topo_filter",
+            "root_process_symbols": query.terminal_process_symbols,
+            "direction": "ancestors",
+        }
+
+    def _canonical_process_symbols(
+        self,
+        project_id: str,
+        process_symbols: list[str],
+    ) -> list[str]:
+        processes = getattr(self._repository, "processes", {})
+        output = []
+        for symbol in process_symbols:
+            process_id = self._repository.resolve_process_id(project_id, symbol)
+            process = processes.get(process_id)
+            output.append(str(getattr(process, "symbol", symbol)))
+        return output
+
+    def _agent_schedule_snapshots(
+        self,
+        query: QueryAgentContext,
+        canonical_terminal_symbols: list[str],
+    ) -> list[object]:
+        symbol_sets: list[list[str] | None] = []
+        if query.terminal_process_symbols:
+            symbol_sets.append(query.terminal_process_symbols)
+            if sorted(canonical_terminal_symbols) != sorted(
+                query.terminal_process_symbols
+            ):
+                symbol_sets.append(canonical_terminal_symbols)
+        else:
+            symbol_sets.append(None)
+
+        snapshots_by_id: dict[str, object] = {}
+        for terminal_symbols in symbol_sets:
+            rows = self._schedule_snapshot_data(
+                QueryScheduleSnapshots(
+                    project_id=query.project_id,
+                    as_of=query.as_of,
+                    terminal_process_symbols=terminal_symbols,
+                )
+            )["snapshots"]
+            for snapshot in rows:
+                snapshots_by_id[str(snapshot["snapshot_id"])] = snapshot
+        return sorted(
+            snapshots_by_id.values(),
+            key=self._agent_snapshot_sort_key,
+        )
+
+    def _agent_snapshot_sort_key(self, snapshot: object) -> tuple[dt.datetime, str]:
+        committed_at = self._parse_datetime(snapshot.get("committed_at"))
+        if committed_at is None:
+            committed_at = dt.datetime.min.replace(tzinfo=dt.UTC)
+        return committed_at.astimezone(dt.UTC), str(snapshot["snapshot_id"])
+
+    def _agent_context_summary(self, graph: dict[str, object]) -> dict[str, object]:
+        nodes = list(graph.get("nodes", []))
+        status_counts: dict[str, int] = defaultdict(int)
+        total_effort = 0.0
+        blocked_count = 0
+        for node in nodes:
+            status = str(node.get("status") or "unknown")
+            status_counts[status] += 1
+            blocker_summary = node.get("blocker_summary") or {}
+            if int(blocker_summary.get("blocking_count") or 0) > 0:
+                blocked_count += 1
+            for requirement in node.get("role_requirements") or []:
+                total_effort += float(requirement.get("effort_hours") or 0)
+        completion_at = self._latest_datetime(
+            (node.get("resource_aware") or {}).get("ends_at")
+            for node in nodes
+        )
+        return {
+            "process_count": len(nodes),
+            "edge_count": len(graph.get("edges", [])),
+            "status_counts": dict(sorted(status_counts.items())),
+            "blocked_process_count": blocked_count,
+            "total_role_effort_hours": self._clean_number(total_effort),
+            "projected_completion_at": (
+                completion_at.isoformat() if completion_at is not None else None
+            ),
+            "critical_path": self._critical_path_symbols(graph),
+            "converged": graph.get("converged"),
+        }
+
+    def _agent_graph_context(self, graph: dict[str, object]) -> dict[str, object]:
+        predecessors: dict[str, list[str]] = defaultdict(list)
+        successors: dict[str, list[str]] = defaultdict(list)
+        edges = []
+        for edge in graph.get("edges", []):
+            predecessor = edge.get("predecessor_process_symbol")
+            successor = edge.get("successor_process_symbol")
+            if predecessor and successor:
+                predecessors[str(successor)].append(str(predecessor))
+                successors[str(predecessor)].append(str(successor))
+            edges.append(
+                {
+                    "predecessor": predecessor,
+                    "successor": successor,
+                    "dependency_type": edge.get("dependency_type"),
+                }
+            )
+        nodes = []
+        for node in graph.get("nodes", []):
+            resource = node.get("resource_aware") or {}
+            symbol = str(node.get("process_symbol"))
+            nodes.append(
+                {
+                    "process_id": node.get("process_id"),
+                    "symbol": symbol,
+                    "aliases": node.get("aliases") or [],
+                    "name": node.get("name"),
+                    "description": node.get("description") or "",
+                    "status": node.get("status"),
+                    "computed_status": node.get("computed_status"),
+                    "predecessors": sorted(predecessors.get(symbol, [])),
+                    "successors": sorted(successors.get(symbol, [])),
+                    "role_requirements": node.get("role_requirements") or [],
+                    "earliest_start_at": node.get("earliest_start_at"),
+                    "started_at": node.get("started_at"),
+                    "finished_at": node.get("finished_at"),
+                    "blocker_summary": node.get("blocker_summary"),
+                    "schedule": {
+                        "starts_at": resource.get("starts_at"),
+                        "ends_at": resource.get("ends_at"),
+                        "inferred_duration_hours": resource.get(
+                            "inferred_duration_hours"
+                        ),
+                        "slack_hours": resource.get("slack_hours"),
+                        "criticality_label": resource.get("criticality_label"),
+                        "allocation_state": resource.get("allocation_state"),
+                    },
+                }
+            )
+        return {"nodes": nodes, "edges": edges}
+
+    def _agent_schedule_context(self, graph: dict[str, object]) -> dict[str, object]:
+        critical_ids = set(graph.get("critical_path_process_ids") or [])
+        rows = []
+        for node in graph.get("nodes", []):
+            resource = node.get("resource_aware") or {}
+            dependency = node.get("dependency_only") or {}
+            rows.append(
+                {
+                    "symbol": node.get("process_symbol"),
+                    "name": node.get("name"),
+                    "status": node.get("status"),
+                    "computed_status": node.get("computed_status"),
+                    "es_at": resource.get("es_at") or dependency.get("es_at"),
+                    "ef_at": resource.get("ef_at") or dependency.get("ef_at"),
+                    "ls_at": resource.get("ls_at") or dependency.get("ls_at"),
+                    "lf_at": resource.get("lf_at") or dependency.get("lf_at"),
+                    "starts_at": resource.get("starts_at"),
+                    "ends_at": resource.get("ends_at"),
+                    "inferred_duration_hours": resource.get(
+                        "inferred_duration_hours"
+                    ),
+                    "slack_hours": resource.get("slack_hours"),
+                    "critical": node.get("process_id") in critical_ids,
+                    "allocation_state": resource.get("allocation_state"),
+                }
+            )
+        completion_at = self._latest_datetime(row.get("ends_at") for row in rows)
+        return {
+            "basis": graph.get("schedule_basis"),
+            "converged": graph.get("converged"),
+            "completion_at": (
+                completion_at.isoformat() if completion_at is not None else None
+            ),
+            "critical_path": self._critical_path_symbols(graph),
+            "processes": rows,
+        }
+
+    def _agent_slippage_context(
+        self,
+        snapshots: list[object],
+        limit: int,
+    ) -> dict[str, object]:
+        history = list(snapshots)[-limit:]
+        latest = history[-1] if history else None
+        previous = history[-2] if len(history) > 1 else None
+        change_hours = None
+        if latest is not None and previous is not None:
+            latest_completion = self._parse_datetime(latest.get("completion_at"))
+            previous_completion = self._parse_datetime(previous.get("completion_at"))
+            if latest_completion is not None and previous_completion is not None:
+                change_hours = self._clean_number(
+                    (latest_completion - previous_completion).total_seconds() / 3600
+                )
+        return {
+            "snapshot_count": len(snapshots),
+            "latest": latest,
+            "previous": previous,
+            "completion_change_hours": change_hours,
+            "history": history,
+        }
+
+    def _agent_role_priority_context(
+        self,
+        graph: dict[str, object],
+        now: dt.datetime,
+        terminal_symbols: list[str],
+    ) -> list[dict[str, object]]:
+        role_rows: dict[str, list[dict[str, object]]] = defaultdict(list)
+        role_names = {
+            str(role["role_id"]): str(role.get("name", role["role_id"]))
+            for role in getattr(self._repository, "roles", {}).values()
+            if role["project_id"] == graph.get("project_id")
+        }
+        for node, priority in self._agent_priority_nodes(
+            graph,
+            now,
+            terminal_symbols,
+        ):
+            for requirement in node.get("role_requirements") or []:
+                role_id = requirement.get("role_id")
+                if not role_id:
+                    continue
+                role_rows[str(role_id)].append(
+                    {
+                        **priority,
+                        "effort_hours": self._clean_number(
+                            requirement.get("effort_hours") or 0
+                        ),
+                        "status": node.get("status"),
+                        "computed_status": node.get("computed_status"),
+                        "blocking_count": (
+                            (node.get("blocker_summary") or {}).get("blocking_count")
+                            or 0
+                        ),
+                    }
+                )
+        return [
+            {
+                "role_id": role_id,
+                "role_name": role_names.get(role_id, role_id),
+                "processes": self._sort_agent_priority_rows(rows),
+            }
+            for role_id, rows in sorted(role_rows.items())
+        ]
+
+    def _agent_priority_nodes(
+        self,
+        graph: dict[str, object],
+        now: dt.datetime,
+        terminal_symbols: list[str],
+    ) -> list[tuple[dict[str, object], dict[str, object]]]:
+        scoped_symbols = set(self._agent_ancestor_scope_symbols(graph, terminal_symbols))
+        rows = []
+        for node in graph.get("nodes", []):
+            symbol = node.get("process_symbol")
+            if scoped_symbols and symbol not in scoped_symbols:
+                continue
+            if node.get("status") in {"done", "canceled"}:
+                continue
+            dependency = node.get("dependency_only") or {}
+            resource = node.get("resource_aware") or {}
+            es_at = self._parse_datetime(resource.get("es_at") or resource.get("starts_at"))
+            ls_at = self._parse_datetime(resource.get("ls_at"))
+            lf_at = self._parse_datetime(resource.get("lf_at"))
+            if es_at is None:
+                es_at = self._parse_datetime(dependency.get("es_at"))
+            if ls_at is None:
+                ls_at = self._parse_datetime(dependency.get("ls_at"))
+            if lf_at is None:
+                lf_at = self._parse_datetime(dependency.get("lf_at"))
+            if es_at is None or ls_at is None or lf_at is None:
+                continue
+            if now >= lf_at:
+                priority, priority_rank = "P0", 0
+            elif now >= ls_at:
+                priority, priority_rank = "P1", 1
+            elif now >= es_at:
+                priority, priority_rank = "P2", 2
+            else:
+                priority, priority_rank = "P3", 3
+            rows.append(
+                (
+                    node,
+                    {
+                        "priority": priority,
+                        "priority_rank": priority_rank,
+                        "process_symbol": symbol,
+                        "process_name": node.get("name"),
+                        "es_at": es_at.isoformat(),
+                        "ls_at": ls_at.isoformat(),
+                        "lf_at": lf_at.isoformat(),
+                        "hours_until_lf": self._clean_number(
+                            (lf_at - now).total_seconds() / 3600
+                        ),
+                    },
+                )
+            )
+        return rows
+
+    def _agent_ancestor_scope_symbols(
+        self,
+        graph: dict[str, object],
+        terminal_symbols: list[str],
+    ) -> list[str]:
+        if not terminal_symbols:
+            return [str(node.get("process_symbol")) for node in graph.get("nodes", [])]
+        selected = {symbol for symbol in terminal_symbols if symbol}
+        predecessors: dict[str, set[str]] = defaultdict(set)
+        for edge in graph.get("edges", []):
+            predecessor = edge.get("predecessor_process_symbol")
+            successor = edge.get("successor_process_symbol")
+            if predecessor and successor:
+                predecessors[str(successor)].add(str(predecessor))
+        stack = list(selected)
+        while stack:
+            current = stack.pop()
+            for predecessor in predecessors.get(current, set()):
+                if predecessor in selected:
+                    continue
+                selected.add(predecessor)
+                stack.append(predecessor)
+        return [
+            str(node.get("process_symbol"))
+            for node in graph.get("nodes", [])
+            if node.get("process_symbol") in selected
+        ]
+
+    def _sort_agent_priority_rows(
+        self,
+        rows: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        return sorted(
+            rows,
+            key=lambda row: (
+                row["priority_rank"],
+                row["hours_until_lf"],
+                str(row.get("process_symbol") or ""),
+            ),
+        )
+
+    def _critical_path_symbols(self, graph: dict[str, object]) -> list[str]:
+        symbols_by_id = {
+            node.get("process_id"): node.get("process_symbol")
+            for node in graph.get("nodes", [])
+        }
+        return [
+            str(symbols_by_id.get(process_id, process_id))
+            for process_id in graph.get("critical_path_process_ids", [])
+        ]
+
+    def _latest_datetime(self, values) -> dt.datetime | None:
+        parsed = [
+            item
+            for item in (self._parse_datetime(value) for value in values)
+            if item is not None
+        ]
+        return max(parsed, default=None)
+
     def _capacity_data(self, query: QueryResourceCapacity) -> dict[str, object]:
         self._validate_resource_filters(
             query.project_id,
@@ -1742,6 +2198,8 @@ class ProjectService:
             return value.isoformat()
         if isinstance(value, Decimal):
             return str(value)
+        if hasattr(value, "model_dump"):
+            return self._json_ready(value.model_dump(mode="json"))
         if isinstance(value, dict):
             return {key: self._json_ready(item) for key, item in value.items()}
         if isinstance(value, list | tuple):

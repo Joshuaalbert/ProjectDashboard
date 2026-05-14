@@ -316,20 +316,22 @@ def gantt_rows(
 
 def resource_utilization_heatmap(
     utilization_data: dict[str, Any],
+    schedule_data: dict[str, Any] | None = None,
 ) -> tuple[list[str], list[dt.datetime], list[list[float]]]:
     """Return resource utilization matrix as labels, bucket starts, values."""
+    span = schedule_time_span(schedule_data or {})
     labels = sorted(
         {
             row["resource_id"]
             for row in utilization_data.get("time_series", [])
-            if row.get("resource_id")
+            if row.get("resource_id") and _bucket_overlaps_span(row, span)
         }
     )
     times = sorted(
         {
             _parse_datetime(row.get("starts_at"))
             for row in utilization_data.get("time_series", [])
-            if row.get("starts_at")
+            if row.get("starts_at") and _bucket_overlaps_span(row, span)
         }
     )
     matrix = [[0.0 for _time in times] for _label in labels]
@@ -338,6 +340,8 @@ def resource_utilization_heatmap(
     for row in utilization_data.get("time_series", []):
         label = row.get("resource_id")
         starts_at = _parse_datetime(row.get("starts_at"))
+        if not _bucket_overlaps_span(row, span):
+            continue
         if label not in label_index or starts_at not in time_index:
             continue
         matrix[label_index[label]][time_index[starts_at]] = max(
@@ -352,10 +356,12 @@ def role_utilization_heatmap(
     schedule_data: dict[str, Any],
 ) -> tuple[list[str], list[dt.datetime], list[list[float]]]:
     """Return role utilization matrix from utilization buckets and allocations."""
+    span = schedule_time_span(schedule_data)
     labels = sorted(
         {
             role_id
             for bucket in utilization_data.get("time_series", [])
+            if _bucket_overlaps_span(bucket, span)
             for role_id in bucket.get("role_ids", [])
         }
         | {
@@ -368,7 +374,7 @@ def role_utilization_heatmap(
         {
             _parse_datetime(bucket.get("starts_at"))
             for bucket in utilization_data.get("time_series", [])
-            if bucket.get("starts_at")
+            if bucket.get("starts_at") and _bucket_overlaps_span(bucket, span)
         }
     )
     capacity = {
@@ -383,6 +389,8 @@ def role_utilization_heatmap(
     }
     for bucket in utilization_data.get("time_series", []):
         starts_at = _parse_datetime(bucket.get("starts_at"))
+        if not _bucket_overlaps_span(bucket, span):
+            continue
         if starts_at not in times:
             continue
         for role_id in bucket.get("role_ids", []):
@@ -409,6 +417,43 @@ def role_utilization_heatmap(
             row.append(value)
         matrix.append(row)
     return labels, times, matrix
+
+
+def schedule_time_span(
+    schedule_data: dict[str, Any],
+) -> tuple[dt.datetime, dt.datetime] | None:
+    """Return the actual scheduled work span from allocation slices or rows."""
+    starts: list[dt.datetime] = []
+    ends: list[dt.datetime] = []
+    for slice_data in schedule_data.get("allocation_slices", []):
+        starts_at = _parse_datetime(slice_data.get("starts_at"))
+        ends_at = _parse_datetime(slice_data.get("ends_at"))
+        if starts_at is not None and ends_at is not None and ends_at > starts_at:
+            starts.append(starts_at)
+            ends.append(ends_at)
+    for row in schedule_data.get("processes", []):
+        starts_at = _parse_datetime(row.get("starts_at"))
+        ends_at = _parse_datetime(row.get("ends_at"))
+        if starts_at is not None and ends_at is not None and ends_at > starts_at:
+            starts.append(starts_at)
+            ends.append(ends_at)
+    if not starts or not ends:
+        return None
+    return min(starts), max(ends)
+
+
+def _bucket_overlaps_span(
+    bucket: dict[str, Any],
+    span: tuple[dt.datetime, dt.datetime] | None,
+) -> bool:
+    if span is None:
+        return True
+    starts_at = _parse_datetime(bucket.get("starts_at"))
+    ends_at = _parse_datetime(bucket.get("ends_at"))
+    if starts_at is None or ends_at is None:
+        return False
+    span_start, span_end = span
+    return starts_at < span_end and ends_at > span_start
 
 
 def aggregate_process_properties(

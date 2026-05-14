@@ -158,6 +158,25 @@ class QueryResourceSchedule(QueryModel, ResourceOptionsMixin):
     include_allocation_slices: bool = False
 
 
+class QueryAgentContext(QueryModel, ResourceOptionsMixin):
+    """Generate a concise project-management context report for agents."""
+
+    action: Literal["query_agent_context"] = "query_agent_context"
+    project_id: str = Field(min_length=1)
+    as_of: AwareDatetime
+    now: AwareDatetime
+    scope: Scope | None = None
+    terminal_process_symbols: list[str] | None = None
+    snapshot_limit: PositiveInt = 5
+
+    @field_validator("terminal_process_symbols")
+    @classmethod
+    def _validate_terminal_symbols(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return validate_unique_non_empty(value, "terminal_process_symbols")
+
+
 class QueryUtilization(QueryModel, ResourceOptionsMixin):
     """Compute resource utilization aggregates."""
 
@@ -254,6 +273,7 @@ Query = Annotated[
     | QueryBlockers
     | QueryScheduleSnapshots
     | QueryResourceSchedule
+    | QueryAgentContext
     | QueryUtilization
     | QueryCosts
     | QueryResourceCapacity,
@@ -272,6 +292,7 @@ __all__ = [
     "GetProject",
     "ProjectScope",
     "QueryBlockers",
+    "QueryAgentContext",
     "QueryCosts",
     "QueryCriticalPath",
     "QueryScheduleSnapshots",

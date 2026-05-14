@@ -20,6 +20,7 @@ from projdash.ui.adapters import (
     resource_utilization_heatmap,
     role_priority_rows,
     role_utilization_heatmap,
+    schedule_time_span,
 )
 from projdash.ui.app import (
     _datetime_axis_locator_and_formatter,
@@ -574,6 +575,15 @@ def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
                 "allocated_hours": 1,
                 "utilization_ratio": 1,
             },
+            {
+                "starts_at": "2026-05-13T11:00:00+00:00",
+                "ends_at": "2026-05-13T12:00:00+00:00",
+                "resource_id": "res_a",
+                "role_ids": ["role_dev"],
+                "capacity_hours": 1,
+                "allocated_hours": 0,
+                "utilization_ratio": 0,
+            },
         ]
     }
     schedule = {
@@ -583,11 +593,18 @@ def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
                 "starts_at": "2026-05-13T09:30:00+00:00",
                 "ends_at": "2026-05-13T10:30:00+00:00",
             }
-        ]
+        ],
+        "processes": [
+            {
+                "starts_at": "2026-05-13T09:30:00+00:00",
+                "ends_at": "2026-05-13T10:30:00+00:00",
+            }
+        ],
     }
 
     resource_labels, resource_times, resource_matrix = resource_utilization_heatmap(
         utilization,
+        schedule,
     )
     role_labels, role_times, role_matrix = role_utilization_heatmap(utilization, schedule)
 
@@ -597,6 +614,10 @@ def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
     assert role_labels == ["role_dev"]
     assert [time.hour for time in role_times] == [9, 10]
     assert role_matrix == [[0.5, 0.5]]
+    span = schedule_time_span(schedule)
+    assert span is not None
+    assert [span[0].hour, span[0].minute] == [9, 30]
+    assert [span[1].hour, span[1].minute] == [10, 30]
 
 
 def test_graph_adapter_marks_critical_path_and_collapsed_nodes():

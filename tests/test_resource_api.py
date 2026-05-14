@@ -211,6 +211,279 @@ def _calendar_exceptions(
     return calendar.get("exceptions", [])
 
 
+def test_agent_context_query_returns_concise_project_management_json():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, role_id, _calendar_id, _resource_id, process_id = (
+        _seed_allocatable_project(service)
+    )
+    ship_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-ship",
+            "name": "Ship API",
+            "description": "Release the API deliverable.",
+            "effective_at": _iso(13),
+            "dependencies": [process_id],
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-ship-eng",
+                    "role_id": role_id,
+                    "effort_hours": 2,
+                }
+            ],
+        },
+    ).entity_ids["process_id"]
+    _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": ship_id,
+            "summary": "Awaiting release approval",
+            "severity": "blocking",
+            "created_at": _iso(13, 12),
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(13, 12),
+            "note": "Initial context baseline",
+        },
+    )
+
+    result = _query(
+        service,
+        {
+            "action": "query_agent_context",
+            "project_id": project_id,
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 14),
+        },
+    )
+
+    assert result.ok is True
+    assert result.warnings == []
+    data = result.data
+    assert data["context_version"] == 1
+    assert data["project"]["project_id"] == project_id
+    assert data["summary"]["process_count"] == 2
+    assert data["summary"]["edge_count"] == 1
+    assert data["summary"]["blocked_process_count"] == 1
+    assert data["summary"]["total_role_effort_hours"] == 10
+    assert data["schedule"]["basis"] == "resource_aware"
+    assert data["schedule"]["critical_path"]
+    assert data["slippage"]["snapshot_count"] == 1
+    assert data["slippage"]["latest"]["note"] == "Initial context baseline"
+    assert data["blockers"][0]["summary"] == "Awaiting release approval"
+    assert "query_resource_schedule" in data["available_queries"]
+
+    nodes = {node["symbol"]: node for node in data["graph"]["nodes"]}
+    assert nodes["process-api"]["successors"] == ["process-ship"]
+    assert nodes["process-ship"]["predecessors"] == ["process-api"]
+    assert nodes["process-ship"]["role_requirements"] == [
+        {
+            "requirement_id": "req-ship-eng",
+            "role_id": role_id,
+            "effort_hours": 2,
+            "required_resource_count": 1,
+            "allocation_policy": "split_allowed",
+            "min_allocation_hours_per_day": None,
+            "max_allocation_hours_per_day": None,
+        }
+    ]
+
+    priority_by_role = {
+        row["role_id"]: row["processes"]
+        for row in data["prioritized_work"]["by_role"]
+    }
+    assert priority_by_role[role_id][0]["process_symbol"] == "process-api"
+    assert priority_by_role[role_id][0]["priority"] in {"P1", "P2"}
+    assert priority_by_role[role_id][0]["effort_hours"] == 8
+
+
+def test_agent_context_terminal_scope_filters_blockers_and_accepts_aliases():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, role_id, _calendar_id, _resource_id, process_id = (
+        _seed_allocatable_project(service)
+    )
+    ship_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-ship",
+            "name": "Ship API",
+            "effective_at": _iso(13),
+            "dependencies": [process_id],
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-ship-eng",
+                    "role_id": role_id,
+                    "effort_hours": 2,
+                }
+            ],
+        },
+    ).entity_ids["process_id"]
+    docs_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-docs",
+            "name": "Write Docs",
+            "effective_at": _iso(13),
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-docs-eng",
+                    "role_id": role_id,
+                    "effort_hours": 1,
+                }
+            ],
+        },
+    ).entity_ids["process_id"]
+    _handle(
+        service,
+        {
+            "action": "add_process_aliases",
+            "project_id": project_id,
+            "process_id": ship_id,
+            "aliases": ["ship-target"],
+            "edit_at": _iso(13, 12),
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": ship_id,
+            "summary": "Ship approval",
+            "severity": "blocking",
+            "created_at": _iso(13, 12),
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": docs_id,
+            "summary": "Docs review",
+            "severity": "blocking",
+            "created_at": _iso(13, 12),
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": _iso(13, 12),
+            "terminal_process_symbols": ["process-ship"],
+            "note": "Canonical ship scope",
+        },
+    )
+
+    result = _query(
+        service,
+        {
+            "action": "query_agent_context",
+            "project_id": project_id,
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 14),
+            "terminal_process_symbols": ["ship-target"],
+        },
+    )
+
+    data = result.data
+    assert result.ok is True
+    assert data["terminal_process_symbols"] == ["ship-target"]
+    assert data["canonical_terminal_process_symbols"] == ["process-ship"]
+    assert {node["symbol"] for node in data["graph"]["nodes"]} == {
+        "process-api",
+        "process-ship",
+    }
+    assert [blocker["summary"] for blocker in data["blockers"]] == [
+        "Ship approval"
+    ]
+    assert data["slippage"]["snapshot_count"] == 1
+    assert data["slippage"]["latest"]["terminal_process_symbols"] == [
+        "process-ship"
+    ]
+    assert data["slippage"]["latest"]["note"] == "Canonical ship scope"
+    priority_symbols = {
+        process["process_symbol"]
+        for role in data["prioritized_work"]["by_role"]
+        for process in role["processes"]
+    }
+    assert priority_symbols == {"process-api", "process-ship"}
+
+    explicit_scope_result = _query(
+        service,
+        {
+            "action": "query_agent_context",
+            "project_id": project_id,
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 14),
+            "scope": {"type": "project"},
+            "terminal_process_symbols": ["ship-target"],
+        },
+    )
+    explicit_scope_data = explicit_scope_result.data
+    explicit_priority_symbols = {
+        process["process_symbol"]
+        for role in explicit_scope_data["prioritized_work"]["by_role"]
+        for process in role["processes"]
+    }
+    assert {node["symbol"] for node in explicit_scope_data["graph"]["nodes"]} == {
+        "process-api",
+        "process-docs",
+        "process-ship",
+    }
+    assert explicit_priority_symbols == {
+        "process-api",
+        "process-docs",
+        "process-ship",
+    }
+
+
+def test_agent_context_propagates_resource_schedule_warnings():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, _role_id, _calendar_id, _resource_id, _process_id = (
+        _seed_allocatable_project(service)
+    )
+
+    result = _query(
+        service,
+        {
+            "action": "query_agent_context",
+            "project_id": project_id,
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 12),
+            "max_iterations": 1,
+        },
+    )
+
+    assert result.ok is True
+    assert result.data["summary"]["converged"] is False
+    assert result.warnings == [
+        {
+            "code": "max_iterations_reached",
+            "message": "Resource schedule did not converge.",
+            "severity": "warning",
+            "details": {"max_iterations": 1},
+        }
+    ]
+
+
 def test_upsert_resource_stores_timezone_aware_holidays():
     repository = InMemoryProjectRepository()
     service = ProjectService(repository)

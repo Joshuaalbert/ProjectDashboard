@@ -890,6 +890,19 @@ def test_resource_command_validation_rejects_invalid_values(payload):
         (
             {
                 "query": {
+                    "action": "query_agent_context",
+                    "project_id": "project-alpha",
+                    "as_of": _at(13, 12).isoformat(),
+                    "now": _at(13, 12).isoformat(),
+                    "terminal_process_symbols": ["build-api"],
+                    "snapshot_limit": 3,
+                }
+            },
+            "query_agent_context",
+        ),
+        (
+            {
+                "query": {
                     "action": "query_resource_schedule",
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
