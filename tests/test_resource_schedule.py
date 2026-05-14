@@ -1030,8 +1030,77 @@ def test_no_calendar_capacity_reports_structured_unallocated_reason():
     assert _value(item, "reason") == "no_calendar_capacity"
     assert _value(item, "eligible_resource_ids") == ["res_alex"]
     assert _value(item, "first_feasible_starts_at") is None
+    assert _value(item, "required_effort_hours") == 2.0
+    assert _value(item, "diagnostic_message")
+    assert _value(_value(item, "diagnostics"), "candidate_capacity_hours") == 0.0
+    assert _value(_value(item, "diagnostics"), "eligible_resource_count") == 1
     assert _value(item, "message")
     assert data["allocation_slices"] == []
+
+
+def test_no_capacity_after_ready_reports_actionable_diagnostic():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[
+                    _process("setup"),
+                    _process("build", dependencies=["setup"]),
+                ],
+                role_requirements=[
+                    _requirement("setup", 2),
+                    _requirement("build", 1),
+                ],
+                horizon_ends_at=_at(13, 11),
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    item = _unallocated_by_process(data)["build"]
+    diagnostics = _value(item, "diagnostics")
+
+    assert _value(rows["setup"], "allocation_state") == "complete"
+    assert _iso(_value(rows["build"], "ready_at")) == "2026-05-13T11:00:00+00:00"
+    assert _value(rows["build"], "allocation_state") == "unallocated"
+    assert _value(rows["build"], "allocation_diagnostic")
+    assert _value(item, "reason") == "no_calendar_capacity"
+    assert "eligible resource" in _value(item, "diagnostic_message")
+    assert _value(diagnostics, "eligible_resource_ids") == ["res_alex"]
+    assert _value(diagnostics, "candidate_capacity_hours") == 0.0
+    assert _value(diagnostics, "remaining_candidate_capacity_hours") == 0.0
+    assert _iso(_value(diagnostics, "process_ready_at")) == "2026-05-13T11:00:00+00:00"
+    assert _iso(_value(diagnostics, "horizon_ends_at")) == "2026-05-13T11:00:00+00:00"
+
+
+def test_exhausted_resource_capacity_is_distinct_from_missing_roles():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[
+                    _process("early"),
+                    _process("late", earliest_start_at=_at(13, 10)),
+                ],
+                role_requirements=[
+                    _requirement("early", 2),
+                    _requirement("late", 1),
+                ],
+                horizon_ends_at=_at(13, 11),
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    item = _unallocated_by_process(data)["late"]
+    diagnostics = _value(item, "diagnostics")
+
+    assert _value(rows["late"], "allocation_state") == "partial"
+    assert _value(item, "reason") == "resource_capacity_exhausted"
+    assert _value(item, "allocated_effort_hours") > 0
+    assert _value(diagnostics, "eligible_resource_count") == 1
+    assert _value(diagnostics, "candidate_capacity_hours") == 1.0
+    assert _value(diagnostics, "remaining_candidate_capacity_hours") == 0.0
+    assert _value(diagnostics, "resources_with_remaining_capacity") == []
+    assert "capacity" in _value(item, "diagnostic_message")
 
 
 @pytest.mark.parametrize(
@@ -1797,7 +1866,8 @@ def test_partial_row_keeps_ready_at_and_first_allocation_start_with_null_finish(
     assert _iso(_value(rows["build"], "ready_at")) == "2026-05-13T09:00:00+00:00"
     assert _iso(_value(rows["build"], "starts_at")) == "2026-05-13T09:00:00+00:00"
     assert _value(rows["build"], "ends_at") is None
-    assert _value(unallocated["build"], "reason") == "horizon_exhausted"
+    assert _value(unallocated["build"], "reason") == "resource_capacity_exhausted"
+    assert _value(rows["build"], "allocation_diagnostic")
     assert sum(
         float(_value(allocation, "effort_hours"))
         for allocation in data["allocation_slices"]

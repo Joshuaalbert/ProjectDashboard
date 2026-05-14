@@ -2277,6 +2277,7 @@ def test_resource_schedule_query_returns_documented_output_contract():
         "inferred_duration_hours",
         "resource_delay_hours",
         "allocation_state",
+        "allocation_diagnostic",
         "status",
         "started_at",
         "finished_at",
@@ -2443,14 +2444,20 @@ def test_unallocated_requirements_query_matches_resource_schedule_contract():
         "role_id",
         "reason",
         "message",
+        "diagnostic_message",
+        "required_effort_hours",
         "remaining_effort_hours",
         "allocated_effort_hours",
         "eligible_resource_ids",
         "first_feasible_starts_at",
+        "diagnostics",
     }
     assert item["reason"] == "no_eligible_resource"
+    assert item["diagnostic_message"]
+    assert item["required_effort_hours"] == 8
     assert item["remaining_effort_hours"] == 8
     assert item["allocated_effort_hours"] == 0
+    assert item["diagnostics"]["eligible_resource_count"] == 0
 
 
 def test_utilization_query_returns_aggregate_contract():

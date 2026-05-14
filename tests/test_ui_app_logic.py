@@ -1,9 +1,11 @@
 import datetime as dt
+import json
 
 from projdash.ui.app import (
     _batch_role_requirements_by_symbol,
     _dependency_set_operations,
     _process_revision_defaults_signature,
+    _schedule_debug_payload,
 )
 
 
@@ -103,3 +105,37 @@ def test_process_revision_defaults_signature_ignores_volatile_as_of_time():
     )
 
     assert first == second
+
+
+def test_schedule_debug_payload_contains_query_and_schedule_context():
+    as_of = dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC)
+    payload = _schedule_debug_payload(
+        {
+            "project_id": "project-alpha",
+            "timezone": "UTC",
+            "as_of": as_of,
+            "now": as_of,
+        },
+        {
+            "scope": {"type": "project"},
+            "now": as_of,
+            "horizon_starts_at": as_of,
+            "horizon_ends_at": as_of + dt.timedelta(hours=8),
+            "project": {"project": {"project_id": "project-alpha"}},
+            "catalog": {"roles": [], "resources": [], "calendars": []},
+            "graph": {"nodes": []},
+            "full_graph": {"nodes": []},
+            "blockers": {"blockers": []},
+            "resource_schedule": {"processes": [], "unallocated_requirements": []},
+            "capacity": {"buckets": []},
+            "utilization": {"by_resource": [], "by_role": []},
+            "costs": {"total_cost": "0"},
+        },
+        ["A"],
+    )
+
+    assert payload["debug_schema"] == 1
+    assert payload["terminal_process_symbols"] == ["A"]
+    assert payload["resource_schedule_query"]["action"] == "query_resource_schedule"
+    assert payload["resource_schedule"]["unallocated_requirements"] == []
+    json.dumps(payload, default=str)

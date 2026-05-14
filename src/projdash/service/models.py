@@ -121,6 +121,7 @@ class UnallocatedReason(str, Enum):
     MISSING_ROLE = "missing_role"
     NO_ELIGIBLE_RESOURCE = "no_eligible_resource"
     NO_CALENDAR_CAPACITY = "no_calendar_capacity"
+    RESOURCE_CAPACITY_EXHAUSTED = "resource_capacity_exhausted"
     BLOCKED = "blocked"
     PREDECESSOR_UNALLOCATED = "predecessor_unallocated"
     HORIZON_EXHAUSTED = "horizon_exhausted"
@@ -408,6 +409,7 @@ class ResourceAwareFields(StrictModel):
     slack_hours: float | None = None
     criticality_label: str = "non_critical"
     allocation_state: AllocationState
+    allocation_diagnostic: str | None = None
 
 
 class ProcessGraphNode(StrictModel):
@@ -504,6 +506,7 @@ class ResourceScheduleRow(StrictModel):
     inferred_duration_hours: float | None = None
     resource_delay_hours: float = 0
     allocation_state: AllocationState
+    allocation_diagnostic: str | None = None
     status: ProcessStatus
     finished_at: AwareDatetime | None = None
     requirement_ids: list[str] = Field(default_factory=list)
@@ -539,10 +542,13 @@ class UnallocatedRequirement(StrictModel):
     role_id: str
     reason: UnallocatedReason
     message: str
+    diagnostic_message: str
+    required_effort_hours: NonNegativeFloat
     remaining_effort_hours: NonNegativeFloat
     allocated_effort_hours: NonNegativeFloat
     eligible_resource_ids: list[str] = Field(default_factory=list)
     first_feasible_starts_at: AwareDatetime | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class CapacityBucket(StrictModel):

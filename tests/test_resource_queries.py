@@ -634,6 +634,7 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
         "slack_hours",
         "criticality_label",
         "allocation_state",
+        "allocation_diagnostic",
     }
     assert build["resource_aware"]["allocation_state"] == "complete"
     assert build["resource_aware"]["ends_at"] < build["dependency_only"]["ef_at"]
@@ -845,6 +846,7 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
         "inferred_duration_hours",
         "resource_delay_hours",
         "allocation_state",
+        "allocation_diagnostic",
         "status",
         "started_at",
         "finished_at",
@@ -909,13 +911,19 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
         "role_id",
         "reason",
         "message",
+        "diagnostic_message",
+        "required_effort_hours",
         "remaining_effort_hours",
         "allocated_effort_hours",
         "eligible_resource_ids",
         "first_feasible_starts_at",
+        "diagnostics",
     }
     assert item["process_id"] == ids["unallocated_id"]
     assert item["reason"] == "no_eligible_resource"
+    assert item["diagnostic_message"]
+    assert item["required_effort_hours"] == 3.0
+    assert item["diagnostics"]["eligible_resource_count"] == 0
 
     utilization = _query(
         service,

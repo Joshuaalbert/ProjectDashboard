@@ -45,6 +45,7 @@ def process_table_rows(graph_data: dict[str, Any]) -> list[dict[str, Any]]:
                 "resource_start": resource.get("starts_at"),
                 "resource_finish": resource.get("ends_at"),
                 "allocation": resource.get("allocation_state"),
+                "allocation_diagnostic": resource.get("allocation_diagnostic"),
                 "blocking": blockers.get("blocking_count", 0),
                 "process_id": node.get("process_id"),
             }

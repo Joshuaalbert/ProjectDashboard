@@ -205,6 +205,10 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     )
     output_slices = all_slices if include_slices else []
     processes_out = list(final_iteration["processes"])
+    _attach_allocation_diagnostics(
+        rows=processes_out,
+        unallocated=unallocated,
+    )
     _attach_resource_schedule_windows(
         rows=processes_out,
         processes=processes,
@@ -547,6 +551,10 @@ def _run_allocation_iteration(
         cpm_by_id=cpm_by_id,
         requirements_by_process=requirements_by_process,
         requirement_states=requirement_states,
+        project_start_at=project_start_at,
+        processes_by_id=processes_by_id,
+        ledger=ledger,
+        horizon_ends_at=horizon_ends_at,
         unallocated=unallocated,
     )
 
@@ -958,6 +966,10 @@ def _finalize_open_processes(
     cpm_by_id: dict[str, _ProcessCpm],
     requirements_by_process: dict[str, list[Mapping[str, object]]],
     requirement_states: dict[str, _RequirementState],
+    project_start_at: dt.datetime,
+    processes_by_id: dict[str, Mapping[str, object]],
+    ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
+    horizon_ends_at: dt.datetime,
     unallocated: list[dict[str, object]],
 ) -> None:
     for process_id in topo_order:
@@ -989,12 +1001,28 @@ def _finalize_open_processes(
             )
             closed_process_ids.add(process_id)
             continue
+        ready_at = _process_ready_at(
+            process_id=process_id,
+            dependencies=dependencies,
+            process_rows=process_rows,
+            completed_process_ids=completed_process_ids,
+            cpm_by_id=cpm_by_id,
+            project_start_at=project_start_at,
+            processes_by_id=processes_by_id,
+        )
         for requirement in requirements:
             state = requirement_states[str(requirement["requirement_id"])]
+            if state.ready_at is None and ready_at is not None:
+                state.ready_at = ready_at
             if state.allocated_hours + EPSILON >= float(requirement["effort_hours"]):
                 continue
             if state.reason is None:
-                state.reason = _incomplete_reason(requirement, state)
+                state.reason = _incomplete_reason(
+                    requirement,
+                    state,
+                    ledger=ledger,
+                    horizon_ends_at=horizon_ends_at,
+                )
         _finalize_process_with_requirements(
             process_id=process_id,
             requirements=requirements,
@@ -1010,6 +1038,8 @@ def _finalize_open_processes(
                         project_id=project_id,
                         requirement=requirement,
                         state=state,
+                        ledger=ledger,
+                        horizon_ends_at=horizon_ends_at,
                     )
                 )
         closed_process_ids.add(process_id)
@@ -1868,10 +1898,19 @@ def _finalize_predecessor_unallocated(
                 "role_id": str(requirement["role_id"]),
                 "reason": "predecessor_unallocated",
                 "message": "A dependency predecessor did not receive a schedule finish.",
+                "diagnostic_message": (
+                    "This requirement was not attempted because at least one "
+                    "dependency predecessor did not finish in the computed schedule."
+                ),
+                "required_effort_hours": float(requirement["effort_hours"]),
                 "remaining_effort_hours": float(requirement["effort_hours"]),
                 "allocated_effort_hours": 0.0,
                 "eligible_resource_ids": [],
                 "first_feasible_starts_at": None,
+                "diagnostics": {
+                    "process_ready_at": None,
+                    "blocking_reason": "predecessor_unallocated",
+                },
             }
         )
 
@@ -1907,10 +1946,19 @@ def _finalize_blocked(
                     "role_id": str(requirement["role_id"]),
                     "reason": "blocked",
                     "message": "The process is blocked by unresolved blockers.",
+                    "diagnostic_message": (
+                        "The query used blocked_policy=exclude, so unresolved "
+                        "blockers prevented this requirement from being scheduled."
+                    ),
+                    "required_effort_hours": float(requirement["effort_hours"]),
                     "remaining_effort_hours": float(requirement["effort_hours"]),
                     "allocated_effort_hours": 0.0,
                     "eligible_resource_ids": [],
                     "first_feasible_starts_at": None,
+                    "diagnostics": {
+                        "process_ready_at": ready_at,
+                        "blocking_reason": "blocked_policy_exclude",
+                    },
                 }
             )
 
@@ -1994,6 +2042,7 @@ def _process_row(
         "dependency_only_ends_at": cpm.earliest_finish_at,
         "resource_delay_hours": round(delay, 6),
         "allocation_state": allocation_state,
+        "allocation_diagnostic": None,
         "status": "planned",
         "finished_at": None,
         "requirement_ids": requirement_ids,
@@ -2005,9 +2054,17 @@ def _unallocated_row(
     project_id: str,
     requirement: Mapping[str, object],
     state: _RequirementState,
+    ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
+    horizon_ends_at: dt.datetime,
 ) -> dict[str, object]:
     remaining = max(0.0, float(requirement["effort_hours"]) - state.allocated_hours)
     reason = state.reason or "horizon_exhausted"
+    diagnostics = _requirement_diagnostics(
+        requirement=requirement,
+        state=state,
+        ledger=ledger,
+        horizon_ends_at=horizon_ends_at,
+    )
     return {
         "project_id": project_id,
         "process_id": str(requirement["process_id"]),
@@ -2015,16 +2072,22 @@ def _unallocated_row(
         "role_id": str(requirement["role_id"]),
         "reason": reason,
         "message": _reason_message(reason),
+        "diagnostic_message": _diagnostic_message(reason, diagnostics),
+        "required_effort_hours": round(float(requirement["effort_hours"]), 6),
         "remaining_effort_hours": round(remaining, 6),
         "allocated_effort_hours": round(state.allocated_hours, 6),
         "eligible_resource_ids": list(state.eligible_resource_ids),
         "first_feasible_starts_at": state.first_feasible_starts_at,
+        "diagnostics": diagnostics,
     }
 
 
 def _incomplete_reason(
     requirement: Mapping[str, object],
     state: _RequirementState,
+    *,
+    ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
+    horizon_ends_at: dt.datetime,
 ) -> str:
     existing = requirement.get("_state")
     if isinstance(existing, _RequirementState) and existing.reason in {
@@ -2034,8 +2097,20 @@ def _incomplete_reason(
         "contiguous_window_unavailable",
     }:
         return existing.reason
+    diagnostics = _requirement_diagnostics(
+        requirement=requirement,
+        state=state,
+        ledger=ledger,
+        horizon_ends_at=horizon_ends_at,
+    )
+    candidate_capacity = float(diagnostics["candidate_capacity_hours"])
+    remaining_capacity = float(diagnostics["remaining_candidate_capacity_hours"])
+    if candidate_capacity <= EPSILON:
+        return "no_calendar_capacity"
     if str(requirement.get("allocation_policy", "split_allowed")) == "contiguous":
         return "contiguous_window_unavailable"
+    if remaining_capacity <= EPSILON:
+        return "resource_capacity_exhausted"
     return "horizon_exhausted"
 
 
@@ -2043,13 +2118,163 @@ def _reason_message(reason: str) -> str:
     return {
         "missing_role": "The requirement references no active role.",
         "no_eligible_resource": "No active resource can fill the required role.",
-        "no_calendar_capacity": "Eligible resources have no calendar capacity in the horizon.",
+        "no_calendar_capacity": (
+            "Eligible resources have no calendar capacity after the process is ready "
+            "and before the horizon ends."
+        ),
+        "resource_capacity_exhausted": (
+            "Eligible resources exist, but their capacity in the horizon was exhausted."
+        ),
         "blocked": "The process is blocked by unresolved blockers.",
         "predecessor_unallocated": "A dependency predecessor did not finish.",
         "horizon_exhausted": "The schedule horizon ended before effort was fulfilled.",
         "contiguous_window_unavailable": "No single resource has a contiguous window.",
         "iteration_not_converged": "The final iteration changed before convergence.",
     }.get(reason, reason)
+
+
+def _requirement_diagnostics(
+    *,
+    requirement: Mapping[str, object],
+    state: _RequirementState,
+    ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
+    horizon_ends_at: dt.datetime,
+) -> dict[str, object]:
+    ready_at = state.ready_at
+    role_id = str(requirement["role_id"])
+    eligible_resource_ids = tuple(state.eligible_resource_ids)
+    required_effort = float(requirement["effort_hours"])
+    resource_rows: dict[str, dict[str, object]] = {}
+    candidate_capacity = 0.0
+    remaining_capacity = 0.0
+    first_candidate_start: dt.datetime | None = None
+    resources_with_remaining: set[str] = set()
+
+    if ready_at is not None:
+        for bucket in sorted(ledger.values(), key=_bucket_sort_key):
+            if bucket.resource_id not in eligible_resource_ids:
+                continue
+            if role_id not in bucket.role_ids:
+                continue
+            if bucket.ends_at <= ready_at or bucket.starts_at >= horizon_ends_at:
+                continue
+            starts_at = max(bucket.starts_at, ready_at)
+            ends_at = min(bucket.ends_at, horizon_ends_at)
+            capacity = _bucket_capacity_between(bucket, starts_at, ends_at)
+            if capacity <= EPSILON:
+                continue
+            remaining = min(bucket.remaining_hours, capacity)
+            candidate_capacity += capacity
+            remaining_capacity += remaining
+            if first_candidate_start is None or starts_at < first_candidate_start:
+                first_candidate_start = starts_at
+            row = resource_rows.setdefault(
+                bucket.resource_id,
+                {
+                    "resource_id": bucket.resource_id,
+                    "candidate_capacity_hours": 0.0,
+                    "remaining_capacity_hours": 0.0,
+                    "first_candidate_starts_at": starts_at,
+                },
+            )
+            row["candidate_capacity_hours"] = round(
+                float(row["candidate_capacity_hours"]) + capacity,
+                6,
+            )
+            row["remaining_capacity_hours"] = round(
+                float(row["remaining_capacity_hours"]) + remaining,
+                6,
+            )
+            if starts_at < row["first_candidate_starts_at"]:
+                row["first_candidate_starts_at"] = starts_at
+            if remaining > EPSILON:
+                resources_with_remaining.add(bucket.resource_id)
+
+    remaining_effort = max(0.0, required_effort - state.allocated_hours)
+    return {
+        "process_ready_at": ready_at,
+        "horizon_ends_at": horizon_ends_at,
+        "allocation_policy": str(requirement.get("allocation_policy", "split_allowed")),
+        "required_effort_hours": round(required_effort, 6),
+        "allocated_effort_hours": round(state.allocated_hours, 6),
+        "remaining_effort_hours": round(remaining_effort, 6),
+        "eligible_resource_count": len(eligible_resource_ids),
+        "eligible_resource_ids": list(eligible_resource_ids),
+        "candidate_capacity_hours": round(candidate_capacity, 6),
+        "remaining_candidate_capacity_hours": round(remaining_capacity, 6),
+        "first_candidate_starts_at": first_candidate_start,
+        "resources_with_remaining_capacity": sorted(resources_with_remaining),
+        "resource_diagnostics": [
+            resource_rows[resource_id]
+            for resource_id in sorted(resource_rows)
+        ],
+    }
+
+
+def _diagnostic_message(reason: str, diagnostics: Mapping[str, object]) -> str:
+    ready_at = diagnostics.get("process_ready_at")
+    horizon_ends_at = diagnostics.get("horizon_ends_at")
+    eligible_count = int(diagnostics.get("eligible_resource_count", 0) or 0)
+    candidate_capacity = float(diagnostics.get("candidate_capacity_hours", 0) or 0)
+    remaining_capacity = float(
+        diagnostics.get("remaining_candidate_capacity_hours", 0) or 0
+    )
+    remaining_effort = float(diagnostics.get("remaining_effort_hours", 0) or 0)
+
+    if reason == "missing_role":
+        return "The required role is missing or inactive, so no resource can be matched."
+    if reason == "no_eligible_resource":
+        return "The role exists, but no active resource currently carries that role."
+    if reason == "no_calendar_capacity":
+        return (
+            f"{eligible_count} eligible resource(s) exist, but they provide 0 schedulable "
+            f"hours after ready_at={_diagnostic_datetime(ready_at)} and before "
+            f"horizon_ends_at={_diagnostic_datetime(horizon_ends_at)}."
+        )
+    if reason == "resource_capacity_exhausted":
+        return (
+            f"{eligible_count} eligible resource(s) exist with "
+            f"{candidate_capacity:g} candidate hour(s), but remaining schedulable "
+            f"capacity is {remaining_capacity:g} hour(s) after prior allocations."
+        )
+    if reason == "horizon_exhausted":
+        return (
+            f"{remaining_effort:g} effort hour(s) remain unfilled before "
+            f"horizon_ends_at={_diagnostic_datetime(horizon_ends_at)}; "
+            f"{remaining_capacity:g} eligible capacity hour(s) remain available."
+        )
+    if reason == "contiguous_window_unavailable":
+        return (
+            f"{eligible_count} eligible resource(s) exist, but no single resource has "
+            "a contiguous remaining window large enough for this requirement."
+        )
+    return _reason_message(reason)
+
+
+def _diagnostic_datetime(value: object) -> str:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    if value is None:
+        return "none"
+    return str(value)
+
+
+def _attach_allocation_diagnostics(
+    *,
+    rows: list[dict[str, object]],
+    unallocated: list[dict[str, object]],
+) -> None:
+    messages_by_process: dict[str, list[str]] = defaultdict(list)
+    for item in unallocated:
+        process_id = str(item["process_id"])
+        requirement_id = str(item.get("requirement_id", "requirement"))
+        message = str(item.get("diagnostic_message") or item.get("message") or "")
+        if not message:
+            continue
+        messages_by_process[process_id].append(f"{requirement_id}: {message}")
+    for row in rows:
+        messages = messages_by_process.get(str(row["process_id"]), [])
+        row["allocation_diagnostic"] = " | ".join(messages) if messages else None
 
 
 def _initial_iteration_state(
@@ -2106,10 +2331,18 @@ def _add_iteration_not_converged_reasons(
                     "role_id": str(requirement["role_id"]),
                     "reason": "iteration_not_converged",
                     "message": _reason_message("iteration_not_converged"),
+                    "diagnostic_message": (
+                        "The resource-aware schedule changed in the final iteration, "
+                        "so this requirement may need a larger max_iterations value."
+                    ),
+                    "required_effort_hours": float(requirement["effort_hours"]),
                     "remaining_effort_hours": 0.0,
                     "allocated_effort_hours": float(requirement["effort_hours"]),
                     "eligible_resource_ids": [],
                     "first_feasible_starts_at": None,
+                    "diagnostics": {
+                        "blocking_reason": "iteration_not_converged",
+                    },
                 }
             )
     return sorted(

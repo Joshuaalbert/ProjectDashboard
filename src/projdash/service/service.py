@@ -1097,6 +1097,7 @@ class ProjectService:
                             else "non_critical"
                         ),
                         "allocation_state": row["allocation_state"],
+                        "allocation_diagnostic": row.get("allocation_diagnostic"),
                     }
             nodes.append(node)
         return {
@@ -1906,6 +1907,7 @@ class ProjectService:
                     "dependency_only_ends_at": row.earliest_finish_at.isoformat(),
                     "resource_delay_hours": delay_hours,
                     "allocation_state": allocation_state,
+                    "allocation_diagnostic": None,
                     "status": row.explicit_status,
                     "finished_at": (
                         process.finished_at.isoformat()
@@ -2030,17 +2032,24 @@ class ProjectService:
             "missing_role": "Required role is inactive or missing.",
             "no_eligible_resource": "No active resource can fill the required role.",
             "no_calendar_capacity": "Eligible resources have no capacity in horizon.",
+            "resource_capacity_exhausted": (
+                "Eligible resources exist but capacity in horizon is exhausted."
+            ),
             "blocked": "Process is blocked as of the query.",
             "predecessor_unallocated": "A dependency predecessor is unallocated.",
             "horizon_exhausted": "Horizon ends before remaining effort can be allocated.",
         }
+        required_effort_hours = remaining_effort_hours + allocated_effort_hours
+        message = messages.get(reason, reason.replace("_", " "))
         return {
             "project_id": project_id,
             "process_id": process_id,
             "requirement_id": requirement.requirement_id or "",
             "role_id": requirement.role_id,
             "reason": reason,
-            "message": messages.get(reason, reason.replace("_", " ")),
+            "message": message,
+            "diagnostic_message": message,
+            "required_effort_hours": self._clean_number(required_effort_hours),
             "remaining_effort_hours": self._clean_number(remaining_effort_hours),
             "allocated_effort_hours": self._clean_number(allocated_effort_hours),
             "eligible_resource_ids": eligible_resource_ids,
@@ -2049,6 +2058,12 @@ class ProjectService:
                 if first_feasible_starts_at is not None
                 else None
             ),
+            "diagnostics": {
+                "eligible_resource_count": len(eligible_resource_ids),
+                "eligible_resource_ids": eligible_resource_ids,
+                "remaining_effort_hours": self._clean_number(remaining_effort_hours),
+                "allocated_effort_hours": self._clean_number(allocated_effort_hours),
+            },
         }
 
     def _resource_critical_path(
@@ -2134,7 +2149,34 @@ class ProjectService:
             },
         )
         self._attach_process_facts_to_schedule(data)
+        self._attach_schedule_diagnostic_defaults(data)
         return data
+
+    def _attach_schedule_diagnostic_defaults(self, data: dict[str, object]) -> None:
+        for row in data.get("processes", []):
+            if not isinstance(row, dict):
+                continue
+            row.setdefault("allocation_diagnostic", None)
+        for item in data.get("unallocated_requirements", []):
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get("message", ""))
+            item.setdefault("diagnostic_message", message)
+            required = float(item.get("remaining_effort_hours", 0) or 0) + float(
+                item.get("allocated_effort_hours", 0) or 0
+            )
+            item.setdefault("required_effort_hours", self._clean_number(required))
+            item.setdefault(
+                "diagnostics",
+                {
+                    "eligible_resource_count": len(
+                        item.get("eligible_resource_ids", []) or []
+                    ),
+                    "eligible_resource_ids": item.get("eligible_resource_ids", []) or [],
+                    "remaining_effort_hours": item.get("remaining_effort_hours", 0),
+                    "allocated_effort_hours": item.get("allocated_effort_hours", 0),
+                },
+            )
 
     def _attach_process_facts_to_schedule(self, data: dict[str, object]) -> None:
         processes = getattr(self._repository, "processes", {})

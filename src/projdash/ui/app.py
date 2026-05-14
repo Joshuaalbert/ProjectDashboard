@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -1857,6 +1858,24 @@ def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
             "their ancestor subgraph."
         ),
     )
+    st.download_button(
+        "Export schedule debug JSON",
+        data=json.dumps(
+            _schedule_debug_payload(controls, context, terminal_symbols),
+            indent=2,
+            sort_keys=True,
+            default=_json_default,
+        ),
+        file_name=_schedule_debug_filename(
+            controls["project_id"],
+            controls["as_of"],
+        ),
+        mime="application/json",
+        help=(
+            "Download the current schedule inputs and computed outputs so the "
+            "schedule can be debugged outside Streamlit."
+        ),
+    )
 
     horizon_start = context.get("horizon_starts_at")
     horizon_end = context.get("horizon_ends_at")
@@ -1920,6 +1939,62 @@ def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
         use_container_width=True,
         hide_index=True,
     )
+
+
+def _schedule_debug_payload(
+    controls: dict[str, Any],
+    context: dict[str, Any],
+    terminal_symbols: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    """Build a JSON-safe debug payload for the current schedule view."""
+    scoped_query = {"scope": context["scope"]} if context.get("scope") else {}
+    return {
+        "debug_schema": 1,
+        "project_id": controls["project_id"],
+        "timezone": controls["timezone"],
+        "as_of": controls["as_of"],
+        "now": context.get("now") or controls["now"],
+        "terminal_process_symbols": list(terminal_symbols),
+        "horizon_starts_at": context.get("horizon_starts_at"),
+        "horizon_ends_at": context.get("horizon_ends_at"),
+        "resource_schedule_query": {
+            "action": "query_resource_schedule",
+            "project_id": controls["project_id"],
+            "as_of": controls["as_of"],
+            "now": context.get("now") or controls["now"],
+            **scoped_query,
+            "horizon_starts_at": context.get("horizon_starts_at"),
+            "horizon_ends_at": context.get("horizon_ends_at"),
+            "planning_granularity": "hour",
+            "include_allocation_slices": True,
+        },
+        "project": context.get("project"),
+        "catalog": context.get("catalog"),
+        "graph": context.get("graph"),
+        "full_graph": context.get("full_graph"),
+        "blockers": context.get("blockers"),
+        "resource_schedule": context.get("resource_schedule"),
+        "capacity": context.get("capacity"),
+        "utilization": context.get("utilization"),
+        "costs": context.get("costs"),
+    }
+
+
+def _schedule_debug_filename(project_id: str, as_of: dt.datetime) -> str:
+    timestamp = as_of.astimezone(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    safe_project_id = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in project_id
+    )
+    return f"projdash_schedule_debug_{safe_project_id}_{timestamp}.json"
+
+
+def _json_default(value: object) -> str:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    return str(value)
 
 
 def _render_gantt_chart(

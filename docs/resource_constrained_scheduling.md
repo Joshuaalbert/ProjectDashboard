@@ -27,7 +27,7 @@ available bucket capacity. The collapsed schedule evidence records:
 - process ready/start/end datetimes
 - allocation state
 - allocation slices by process, role, resource, and bucket
-- unallocated requirements and structured reasons
+- unallocated requirements, structured reasons, and diagnostics
 - utilization by resource, role, and time
 - costs by resource, role, process, and time
 
@@ -53,6 +53,11 @@ Resource-aware completion is authoritative for committed slippage points.
 - `canceled` preserves an existing start anchor but does not create completion.
 - Blockers do not change computed schedule timing; they mark processes as blocked
   for status, review, and prioritization.
+- `unallocated` means required role effort could not be placed into eligible
+  resource calendar capacity for the query horizon. Diagnostics distinguish
+  missing roles/resources from capacity that exists but is already consumed,
+  capacity that exists only before the process is ready, contiguous-window
+  constraints, and predecessor failures.
 
 ## Slippage
 

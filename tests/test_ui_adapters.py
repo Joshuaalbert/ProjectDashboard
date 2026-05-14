@@ -136,7 +136,10 @@ def test_process_table_rows_and_role_defaults_include_pm_description_and_effort(
                 "process_symbol": "A",
                 "name": "Design",
                 "description": "Definition of design completion",
-                "resource_aware": {"inferred_duration_hours": 6.5},
+                "resource_aware": {
+                    "inferred_duration_hours": 6.5,
+                    "allocation_diagnostic": "Needs more calendar capacity.",
+                },
                 "role_requirements": [
                     {"role_id": "role_eng", "effort_hours": 2},
                     {"role_id": "role_eng", "effort_hours": 3},
@@ -150,6 +153,7 @@ def test_process_table_rows_and_role_defaults_include_pm_description_and_effort(
 
     assert rows[0]["description"] == "Definition of design completion"
     assert rows[0]["inferred_duration_hours"] == 6.5
+    assert rows[0]["allocation_diagnostic"] == "Needs more calendar capacity."
     assert _role_effort_defaults(graph["nodes"][0]) == {
         "role_eng": 5.0,
         "role_qa": 1.0,
