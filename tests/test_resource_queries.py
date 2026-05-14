@@ -536,6 +536,7 @@ def test_process_graph_dependency_only_contract_includes_cpm_status_and_blockers
         "name",
         "description",
         "duration_hours",
+        "inferred_duration_hours",
         "earliest_start_at",
         "status",
         "started_at",
@@ -593,7 +594,6 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
             "include_resource_fields": True,
             "include_allocation_slices": True,
             "planning_granularity": "hour",
-            "blocked_policy": "exclude",
         },
     )
 
@@ -629,6 +629,7 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
         "ef_at",
         "ls_at",
         "lf_at",
+        "inferred_duration_hours",
         "resource_delay_hours",
         "slack_hours",
         "criticality_label",
@@ -639,6 +640,10 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
     assert build["resource_aware"]["es_at"] == build["resource_aware"]["starts_at"]
     assert build["resource_aware"]["ef_at"] == build["resource_aware"]["ends_at"]
     assert build["resource_aware"]["lf_at"] >= build["resource_aware"]["ef_at"]
+    assert build["resource_aware"]["inferred_duration_hours"] > 0
+    assert build["inferred_duration_hours"] == (
+        build["resource_aware"]["inferred_duration_hours"]
+    )
 
 
 def test_process_graph_resource_aware_status_uses_role_effort_windows():
@@ -726,6 +731,65 @@ def test_process_graph_resource_aware_status_uses_role_effort_windows():
     assert node["late_risk_window"]["active"] is False
 
 
+def test_blockers_mark_process_without_changing_resource_schedule():
+    service = ProjectService(InMemoryProjectRepository())
+    ids = _seed_resource_project(service)
+    query = {
+        "action": "query_resource_schedule",
+        "project_id": ids["project_id"],
+        **_resource_horizon(),
+        "include_allocation_slices": True,
+        "planning_granularity": "hour",
+    }
+    baseline = _query(service, query)
+    _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": ids["project_id"],
+            "process_id": ids["build_id"],
+            "summary": "Waiting on decision",
+            "severity": "blocking",
+            "created_at": _iso(13, 11),
+        },
+    )
+
+    blocked_schedule = _query(service, query)
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": ids["project_id"],
+            **_resource_horizon(),
+            "include_resource_fields": True,
+            "include_allocation_slices": True,
+            "planning_granularity": "hour",
+        },
+    )
+    baseline_row = next(
+        row for row in baseline["processes"] if row["process_id"] == ids["build_id"]
+    )
+    blocked_row = next(
+        row
+        for row in blocked_schedule["processes"]
+        if row["process_id"] == ids["build_id"]
+    )
+    blocked_node = next(
+        node for node in graph["nodes"] if node["process_id"] == ids["build_id"]
+    )
+
+    assert blocked_row["allocation_state"] == "complete"
+    assert blocked_row["starts_at"] == baseline_row["starts_at"]
+    assert blocked_row["ends_at"] == baseline_row["ends_at"]
+    assert blocked_row["inferred_duration_hours"] == (
+        baseline_row["inferred_duration_hours"]
+    )
+    assert blocked_node["computed_status"] == "blocked"
+    assert blocked_node["resource_aware"]["inferred_duration_hours"] == (
+        baseline_row["inferred_duration_hours"]
+    )
+
+
 def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
     service = ProjectService(InMemoryProjectRepository())
     ids = _seed_resource_project(service)
@@ -778,6 +842,7 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
         "resource_ls_at",
         "resource_lf_at",
         "resource_slack_hours",
+        "inferred_duration_hours",
         "resource_delay_hours",
         "allocation_state",
         "status",
@@ -791,6 +856,7 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
     assert row["resource_es_at"] == row["starts_at"]
     assert row["resource_ef_at"] == row["ends_at"]
     assert row["resource_lf_at"] >= row["resource_ef_at"]
+    assert row["inferred_duration_hours"] > 0
 
     capacity = _query(
         service,

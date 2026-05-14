@@ -51,7 +51,8 @@ Resource-aware completion is authoritative for committed slippage points.
 - `done` sets `finished_at`; if no start anchor exists, finish time also anchors
   start.
 - `canceled` preserves an existing start anchor but does not create completion.
-- Blockers can exclude work from scheduling depending on the query policy.
+- Blockers do not change computed schedule timing; they mark processes as blocked
+  for status, review, and prioritization.
 
 ## Slippage
 

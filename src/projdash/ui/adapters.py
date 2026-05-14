@@ -36,6 +36,8 @@ def process_table_rows(graph_data: dict[str, Any]) -> list[dict[str, Any]]:
                 "status": node.get("status"),
                 "computed": node.get("computed_status"),
                 "duration_hours": node.get("duration_hours"),
+                "inferred_duration_hours": node.get("inferred_duration_hours")
+                or resource.get("inferred_duration_hours"),
                 "started_at": node.get("started_at"),
                 "dep_start": dependency.get("es_at"),
                 "dep_finish": dependency.get("ef_at"),
@@ -674,8 +676,19 @@ def _node_label(node: dict[str, Any], *, collapsed: bool) -> str:
     symbol = node.get("process_symbol") or node.get("process_id")
     name = node.get("name") or ""
     status = node.get("computed_status") or node.get("status") or ""
+    resource = node.get("resource_aware") or {}
+    inferred_duration = (
+        resource.get("inferred_duration_hours")
+        if resource.get("inferred_duration_hours") is not None
+        else node.get("inferred_duration_hours")
+    )
+    duration = (
+        f"{float(inferred_duration):g}h"
+        if inferred_duration is not None
+        else "duration unknown"
+    )
     prefix = "[+]" if collapsed else ""
-    label = f"{prefix}{symbol}\\n{name}\\n{status}"
+    label = f"{prefix}{symbol}\\n{name}\\n{status}\\n{duration}"
     return label[:180]
 
 

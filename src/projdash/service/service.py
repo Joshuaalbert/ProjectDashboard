@@ -1043,6 +1043,8 @@ class ProjectService:
                     resource_ls_at = self._parse_datetime(row.get("resource_ls_at"))
                     resource_lf_at = self._parse_datetime(row.get("resource_lf_at"))
                     allocation_state = str(row["allocation_state"])
+                    inferred_duration_hours = row.get("inferred_duration_hours")
+                    node["inferred_duration_hours"] = inferred_duration_hours
                     node["computed_status"] = self._resource_allocation_status(
                         explicit_status=str(node["status"]),
                         allocation_state=allocation_state,
@@ -1086,6 +1088,7 @@ class ProjectService:
                         "ef_at": row.get("resource_ef_at"),
                         "ls_at": row.get("resource_ls_at"),
                         "lf_at": row.get("resource_lf_at"),
+                        "inferred_duration_hours": inferred_duration_hours,
                         "resource_delay_hours": row["resource_delay_hours"],
                         "slack_hours": row.get("resource_slack_hours"),
                         "criticality_label": (
@@ -1188,6 +1191,7 @@ class ProjectService:
                 "name": row.name,
                 "description": revision.description if revision else "",
                 "duration_hours": duration_hours,
+                "inferred_duration_hours": None,
                 "earliest_start_at": (
                     input_by_id[row.process_id].earliest_start_at.isoformat()
                     if input_by_id[row.process_id].earliest_start_at

@@ -1006,7 +1006,7 @@ def test_resource_query_defaults_are_applied():
     )
 
     assert schedule.query.planning_granularity == "hour"
-    assert schedule.query.blocked_policy == "exclude"
+    assert schedule.query.blocked_policy == "include_normally"
     assert schedule.query.max_iterations == 20
     assert schedule.query.convergence_tolerance_hours == 0
     assert schedule.query.include_allocation_slices is False

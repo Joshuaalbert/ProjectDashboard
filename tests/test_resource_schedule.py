@@ -357,7 +357,7 @@ def _base_input(
         "horizon_ends_at": horizon_ends_at or _at(16, 17),
         "max_iterations": 20,
         "convergence_tolerance_hours": 0,
-        "blocked_policy": "exclude",
+        "blocked_policy": "include_normally",
         "include_allocation_slices": True,
     }
     if options:

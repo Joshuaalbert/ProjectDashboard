@@ -403,6 +403,7 @@ class ResourceAwareFields(StrictModel):
     ef_at: AwareDatetime | None = None
     ls_at: AwareDatetime | None = None
     lf_at: AwareDatetime | None = None
+    inferred_duration_hours: float | None = None
     resource_delay_hours: float = 0
     slack_hours: float | None = None
     criticality_label: str = "non_critical"
@@ -418,6 +419,7 @@ class ProcessGraphNode(StrictModel):
     name: str
     description: str = ""
     duration_hours: float = Field(ge=0)
+    inferred_duration_hours: float | None = None
     earliest_start_at: AwareDatetime | None = None
     status: ProcessStatus
     started_at: AwareDatetime | None = None
@@ -499,6 +501,7 @@ class ResourceScheduleRow(StrictModel):
     resource_ls_at: AwareDatetime | None = None
     resource_lf_at: AwareDatetime | None = None
     resource_slack_hours: float | None = None
+    inferred_duration_hours: float | None = None
     resource_delay_hours: float = 0
     allocation_state: AllocationState
     status: ProcessStatus

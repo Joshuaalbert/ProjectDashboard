@@ -98,7 +98,7 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     planning_granularity = str(options.get("planning_granularity", "hour"))
     max_iterations = int(options.get("max_iterations", 20))
     tolerance_hours = float(options.get("convergence_tolerance_hours", 0))
-    blocked_policy = str(options.get("blocked_policy", "exclude"))
+    blocked_policy = str(options.get("blocked_policy", "include_normally"))
     include_slices = bool(options.get("include_allocation_slices", False))
 
     processes = [_mapping(item, "process") for item in _sequence(input_data["processes"])]
@@ -2189,6 +2189,7 @@ def _attach_resource_schedule_windows(
         row["resource_ls_at"] = None
         row["resource_lf_at"] = None
         row["resource_slack_hours"] = None
+        row["inferred_duration_hours"] = None
     if not complete_ids:
         return
 
@@ -2209,6 +2210,7 @@ def _attach_resource_schedule_windows(
         starts_at = _as_utc(row["starts_at"])
         ends_at = _as_utc(row["ends_at"])
         duration = max(ends_at - starts_at, dt.timedelta())
+        row["inferred_duration_hours"] = round(duration.total_seconds() / 3600, 6)
         process = process_by_id.get(process_id, {})
         if process.get("started_at") is not None:
             ls_at = _as_utc(process["started_at"])

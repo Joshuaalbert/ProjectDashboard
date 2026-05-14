@@ -136,6 +136,7 @@ def test_process_table_rows_and_role_defaults_include_pm_description_and_effort(
                 "process_symbol": "A",
                 "name": "Design",
                 "description": "Definition of design completion",
+                "resource_aware": {"inferred_duration_hours": 6.5},
                 "role_requirements": [
                     {"role_id": "role_eng", "effort_hours": 2},
                     {"role_id": "role_eng", "effort_hours": 3},
@@ -148,6 +149,7 @@ def test_process_table_rows_and_role_defaults_include_pm_description_and_effort(
     rows = process_table_rows(graph)
 
     assert rows[0]["description"] == "Definition of design completion"
+    assert rows[0]["inferred_duration_hours"] == 6.5
     assert _role_effort_defaults(graph["nodes"][0]) == {
         "role_eng": 5.0,
         "role_qa": 1.0,
@@ -631,6 +633,7 @@ def test_graph_adapter_marks_critical_path_and_collapsed_nodes():
                     "process_symbol": "A",
                     "name": "Start",
                     "computed_status": "work_now",
+                    "resource_aware": {"inferred_duration_hours": 2},
                 },
                 {
                     "process_id": "p2",
@@ -651,6 +654,7 @@ def test_graph_adapter_marks_critical_path_and_collapsed_nodes():
 
     assert "penwidth=3" in dot
     assert "[+]B" in dot
+    assert "2h" in dot
     assert "p1 -> p2" in dot
 
 

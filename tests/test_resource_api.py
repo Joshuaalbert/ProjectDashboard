@@ -2274,6 +2274,7 @@ def test_resource_schedule_query_returns_documented_output_contract():
         "resource_ls_at",
         "resource_lf_at",
         "resource_slack_hours",
+        "inferred_duration_hours",
         "resource_delay_hours",
         "allocation_state",
         "status",

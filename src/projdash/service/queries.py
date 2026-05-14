@@ -57,7 +57,7 @@ class ResourceOptionsMixin(StrictModel):
     planning_granularity: PlanningGranularity = PlanningGranularity.HOUR
     max_iterations: PositiveInt = 20
     convergence_tolerance_hours: NonNegativeFloat = 0
-    blocked_policy: BlockedPolicy = BlockedPolicy.EXCLUDE
+    blocked_policy: BlockedPolicy = BlockedPolicy.INCLUDE_NORMALLY
 
 
 class HorizonMixin(StrictModel):
