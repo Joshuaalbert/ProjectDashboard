@@ -17,6 +17,9 @@ snapshots.
   switch process context between adjacent hour buckets.
 - `allocation_policy: "contiguous"` is the explicit exception: that requirement
   must use one uninterrupted sequence on a selected resource's working calendar.
+- When multiple ready role requirements can use the same resource bucket, cup
+  filling prioritizes the role with the least remaining eligible capacity, then
+  passes residual bucket capacity to the next least constrained role.
 - `earliest_start_at` is a valid not-before constraint.
 - `started_at` pins a process start: `ES == LS == started_at`.
 - `commit_project_state` records a point in slippage history. Exploration before

@@ -37,6 +37,11 @@ available bucket capacity or assign the same resource bucket to more than one
 process. The capacity search window is internal: if required work does not fit
 in the current window, the solver extends the recurring calendars forward and
 retries until the work is complete or a permanent configuration error is found.
+When a resource can fill multiple ready role requirements, cup filling plans the
+role with the least remaining eligible capacity first. Roles tied on remaining
+capacity continue to share the bucket by the water-fill policy. If scarce-role
+demand does not consume the full bucket, remaining capacity continues to the
+next least available role for the same focused process.
 
 The collapsed schedule evidence records:
 

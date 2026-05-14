@@ -1921,6 +1921,123 @@ def test_multi_role_resource_breadth_first_slices_share_one_bucket_ledger():
     _assert_resource_utilization_never_exceeds_capacity(data)
 
 
+def test_cup_filling_prioritizes_least_available_role_for_multirole_resource():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[_process("release")],
+                role_requirements=[
+                    _requirement(
+                        "release",
+                        2,
+                        requirement_id="req_release_dev",
+                        role_id="role_dev",
+                    ),
+                    _requirement(
+                        "release",
+                        2,
+                        requirement_id="req_release_qa",
+                        role_id="role_qa",
+                    ),
+                ],
+                roles=[
+                    _role("role_dev", "Developer"),
+                    _role("role_qa", "QA"),
+                ],
+                resources=[
+                    _resource("res_alex", role_ids=["role_dev", "role_qa"]),
+                    _resource("res_blair", role_ids=["role_dev"]),
+                ],
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    assert _value(rows["release"], "allocation_state") == "complete"
+    assert _iso(_value(rows["release"], "ends_at")) == "2026-05-13T11:00:00+00:00"
+    assert _allocated_effort_for_requirement_in_window(
+        data,
+        requirement_id="req_release_qa",
+        starts_at=_at(13),
+        ends_at=_at(13, 10),
+    ) == pytest.approx(1.0)
+    assert _allocated_effort_for_requirement_in_window(
+        data,
+        requirement_id="req_release_dev",
+        starts_at=_at(13),
+        ends_at=_at(13, 10),
+    ) == pytest.approx(1.0)
+    assert not any(
+        str(_value(allocation, "resource_id")) == "res_alex"
+        and str(_value(allocation, "requirement_id")) == "req_release_dev"
+        and _overlap_hours(
+            _as_datetime(_value(allocation, "starts_at")),
+            _as_datetime(_value(allocation, "ends_at")),
+            _at(13),
+            _at(13, 10),
+        )
+        > 0
+        for allocation in data["allocation_slices"]
+    )
+    _assert_resource_utilization_never_exceeds_capacity(data)
+
+
+def test_cup_filling_reuses_residual_capacity_after_scarce_role_is_filled():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[_process("release")],
+                role_requirements=[
+                    _requirement(
+                        "release",
+                        1.5,
+                        requirement_id="req_release_dev",
+                        role_id="role_dev",
+                        required_resource_count=2,
+                    ),
+                    _requirement(
+                        "release",
+                        0.5,
+                        requirement_id="req_release_qa",
+                        role_id="role_qa",
+                    ),
+                ],
+                roles=[
+                    _role("role_dev", "Developer"),
+                    _role("role_qa", "QA"),
+                ],
+                resources=[
+                    _resource("res_alex", role_ids=["role_dev", "role_qa"]),
+                    _resource("res_blair", role_ids=["role_dev"]),
+                ],
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    assert _value(rows["release"], "allocation_state") == "complete"
+    assert _iso(_value(rows["release"], "ends_at")) == "2026-05-13T10:00:00+00:00"
+    assert _allocated_effort_for_requirement_in_window(
+        data,
+        requirement_id="req_release_qa",
+        starts_at=_at(13),
+        ends_at=_at(13, 10),
+    ) == pytest.approx(0.5)
+    assert _allocated_effort_for_requirement_in_window(
+        data,
+        requirement_id="req_release_dev",
+        starts_at=_at(13),
+        ends_at=_at(13, 10),
+    ) == pytest.approx(1.5)
+    assert _allocated_effort_in_window(
+        data,
+        resource_id="res_alex",
+        starts_at=_at(13),
+        ends_at=_at(13, 10),
+    ) == pytest.approx(1.0)
+    _assert_resource_utilization_never_exceeds_capacity(data)
+
+
 def test_missing_role_fails_validation_instead_of_returning_unallocated_rows():
     with pytest.raises(ValueError, match="missing_role"):
         _compute_resource_schedule(

@@ -74,6 +74,7 @@ class _RequirementCandidate:
     resource: Mapping[str, object]
     ready_at: dt.datetime
     headroom_hours: float
+    role_availability_hours: float
     sort_key: tuple[object, ...]
 
 
@@ -760,6 +761,7 @@ def _ready_split_candidates_for_bucket(
     bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
 ) -> list[_RequirementCandidate]:
     candidates = []
+    role_availability_by_key: dict[tuple[str, str, dt.datetime], float] = {}
     focused_process_id = bucket_focus.get(_bucket_focus_key(bucket))
     for process_id in cpm_by_id:
         if focused_process_id is not None and process_id != focused_process_id:
@@ -844,6 +846,19 @@ def _ready_split_candidates_for_bucket(
                 state.first_feasible_starts_at = feasible_start
             state.ready_at = ready_at
             cpm = cpm_by_id[process_id]
+            availability_key = (process_id, role_id, feasible_start)
+            if availability_key not in role_availability_by_key:
+                role_availability_by_key[availability_key] = (
+                    _role_remaining_capacity_hours(
+                        role_id=role_id,
+                        process_id=process_id,
+                        resources=resources,
+                        ledger=ledger,
+                        bucket_focus=bucket_focus,
+                        starts_at=feasible_start,
+                    )
+                )
+            role_availability = role_availability_by_key[availability_key]
             candidates.append(
                 _RequirementCandidate(
                     requirement=requirement,
@@ -852,7 +867,9 @@ def _ready_split_candidates_for_bucket(
                     resource=resource_by_id[bucket.resource_id],
                     ready_at=ready_at,
                     headroom_hours=headroom,
+                    role_availability_hours=role_availability,
                     sort_key=(
+                        role_availability,
                         ready_at,
                         cpm.topo_index,
                         process_id,
@@ -884,12 +901,57 @@ def _water_fill_requirement_candidates(
 ) -> list[tuple[_RequirementCandidate, float]]:
     if not candidates or capacity_hours <= EPSILON:
         return []
-    demand = min(capacity_hours, sum(item.headroom_hours for item in candidates))
+    remaining_capacity = capacity_hours
+    assignments = {id(candidate): 0.0 for candidate in candidates}
+    for tier in _role_availability_tiers(candidates):
+        if remaining_capacity <= EPSILON:
+            break
+        demand = min(remaining_capacity, sum(item.headroom_hours for item in tier))
+        tier_assignments = _water_fill_candidate_tier(tier, demand)
+        consumed = 0.0
+        for candidate, amount in tier_assignments:
+            assignments[id(candidate)] += amount
+            consumed += amount
+        if consumed <= EPSILON:
+            break
+        remaining_capacity -= consumed
+    return [
+        (candidate, assignments[id(candidate)])
+        for candidate in candidates
+        if assignments[id(candidate)] > EPSILON
+    ]
+
+
+def _role_availability_tiers(
+    candidates: list[_RequirementCandidate],
+) -> list[list[_RequirementCandidate]]:
+    """Group candidates by increasing remaining eligible role capacity."""
+    tiers: list[list[_RequirementCandidate]] = []
+    for candidate in sorted(candidates, key=lambda item: item.sort_key):
+        if (
+            tiers
+            and abs(
+                tiers[-1][0].role_availability_hours
+                - candidate.role_availability_hours
+            )
+            <= EPSILON
+        ):
+            tiers[-1].append(candidate)
+        else:
+            tiers.append([candidate])
+    return tiers
+
+
+def _water_fill_candidate_tier(
+    candidates: list[_RequirementCandidate],
+    capacity_hours: float,
+) -> list[tuple[_RequirementCandidate, float]]:
     assignments = {index: 0.0 for index in range(len(candidates))}
     unfrozen = [
         (index, candidate, candidate.headroom_hours)
         for index, candidate in enumerate(candidates)
     ]
+    demand = capacity_hours
     while demand > EPSILON and unfrozen:
         share = demand / len(unfrozen)
         consumed = 0.0
@@ -2124,6 +2186,38 @@ def _resource_sort_key(
         _resource_cost(resource),
         str(resource["resource_id"]),
     )
+
+
+def _role_remaining_capacity_hours(
+    *,
+    role_id: str,
+    process_id: str,
+    resources: list[Mapping[str, object]],
+    ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
+    bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
+    starts_at: dt.datetime,
+) -> float:
+    """Measure remaining schedulable capacity for a role from a point in time."""
+    eligible_resource_ids = {
+        str(resource["resource_id"])
+        for resource in resources
+        if bool(resource.get("active", True))
+        and role_id in {str(value) for value in resource.get("role_ids", ())}
+    }
+    total = 0.0
+    for bucket in ledger.values():
+        if (
+            bucket.resource_id not in eligible_resource_ids
+            or role_id not in bucket.role_ids
+            or bucket.ends_at <= starts_at
+        ):
+            continue
+        focused_process_id = bucket_focus.get(_bucket_focus_key(bucket))
+        if focused_process_id is not None and focused_process_id != process_id:
+            continue
+        capacity = _bucket_capacity_between(bucket, starts_at, bucket.ends_at)
+        total += min(bucket.remaining_hours, capacity)
+    return round(total, 6)
 
 
 def _resource_cost(resource: Mapping[str, object]) -> Decimal:

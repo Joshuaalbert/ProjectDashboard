@@ -32,6 +32,9 @@ defined by role effort hours and resource capacity, not target-date facts.
 - A resource may switch process context between adjacent hour buckets.
 - Explicit contiguous allocation requirements still require an uninterrupted
   sequence through the selected resource's working calendar.
+- Cup filling prioritizes ready role requirements with the least remaining
+  eligible role capacity before less constrained roles, then passes residual
+  bucket capacity to the next least constrained role for the same process.
 - Role and resource utilization must reconcile with allocation slices.
 - Costs use the project currency.
 
