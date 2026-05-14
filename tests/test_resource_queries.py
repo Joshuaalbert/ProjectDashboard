@@ -791,6 +791,129 @@ def test_blockers_mark_process_without_changing_resource_schedule():
     )
 
 
+def test_resource_schedule_without_public_horizon_extends_to_required_work():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _handle(
+        service,
+        {
+            "action": "create_project",
+            "project_id": "project-new-project",
+            "name": "New project",
+            "start_at": "2026-05-14T13:42:00+00:00",
+        },
+    )["project_id"]
+    design_id = _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-design",
+            "name": "Design",
+        },
+    )["role_id"]
+    lead_id = _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-lead",
+            "name": "Lead",
+        },
+    )["role_id"]
+    calendar_id = _handle(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-weekday",
+            "name": "Weekday calendar",
+            "timezone": "UTC",
+            "weekly_windows": _weekday_windows(),
+        },
+    )["calendar_id"]
+    _handle(
+        service,
+        {
+            "action": "upsert_resource",
+            "project_id": project_id,
+            "resource_id": "res-josh",
+            "name": "Josh",
+            "role_ids": [design_id, lead_id],
+            "calendar_id": calendar_id,
+            "available_from_at": "2026-05-14T13:42:00+00:00",
+            "cost_rate": "0",
+            "cost_unit": "hour",
+            "cost_currency": "USD",
+        },
+    )
+    first_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_symbol": "first-step",
+            "name": "first step",
+            "effective_at": "2026-05-14T13:42:00+00:00",
+            "duration_business_days": 1,
+            "role_requirements": [
+                {"role_id": design_id, "effort_hours": 2},
+                {"role_id": lead_id, "effort_hours": 1},
+            ],
+        },
+    )["process_id"]
+    second_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_symbol": "2nd-step",
+            "name": "2nd step",
+            "effective_at": "2026-05-14T13:42:00+00:00",
+            "duration_business_days": 1,
+            "dependencies": [first_id],
+            "role_requirements": [
+                {"role_id": design_id, "effort_hours": 30},
+                {"role_id": lead_id, "effort_hours": 10},
+            ],
+        },
+    )["process_id"]
+
+    schedule = _query(
+        service,
+        {
+            "action": "query_resource_schedule",
+            "project_id": project_id,
+            "as_of": "2026-05-14T15:06:00+00:00",
+            "now": "2026-05-14T15:06:00+00:00",
+            "include_allocation_slices": True,
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": "2026-05-14T15:06:00+00:00",
+            "now": "2026-05-14T15:06:00+00:00",
+            "include_resource_fields": True,
+        },
+    )
+
+    rows = {row["process_id"]: row for row in schedule["processes"]}
+    assert rows[second_id]["allocation_state"] == "complete"
+    assert rows[second_id]["starts_at"] > rows[first_id]["ends_at"]
+    assert rows[second_id]["ends_at"] is not None
+    assert not [
+        item
+        for item in schedule["unallocated_requirements"]
+        if item["process_id"] == second_id
+    ]
+    second_node = next(
+        node for node in graph["nodes"] if node["process_symbol"] == "2nd-step"
+    )
+    assert second_node["resource_aware"]["allocation_state"] == "complete"
+
+
 def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
     service = ProjectService(InMemoryProjectRepository())
     ids = _seed_resource_project(service)

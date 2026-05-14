@@ -742,8 +742,8 @@ class ProjectService:
             data = {
                 "project_id": query.project_id,
                 "as_of": query.as_of.isoformat(),
-                "horizon_starts_at": query.horizon_starts_at.isoformat(),
-                "horizon_ends_at": query.horizon_ends_at.isoformat(),
+                "horizon_starts_at": schedule["horizon_starts_at"],
+                "horizon_ends_at": schedule["horizon_ends_at"],
                 "planning_granularity": self._enum_value(query.planning_granularity),
                 "unallocated_requirements": schedule["unallocated_requirements"],
             }
@@ -807,21 +807,16 @@ class ProjectService:
     ) -> ScheduleSnapshotRecord:
         terminal_symbols = sorted(command.terminal_process_symbols)
         scope = self._terminal_scope_data(terminal_symbols)
-        horizon_starts_at, horizon_ends_at = self._snapshot_horizon(
-            command.project_id,
-            command.committed_at,
-            scope,
-        )
         schedule_query = QueryResourceSchedule(
             project_id=command.project_id,
             as_of=command.committed_at,
             now=command.committed_at,
             scope=scope,
-            horizon_starts_at=horizon_starts_at,
-            horizon_ends_at=horizon_ends_at,
             include_allocation_slices=False,
         )
         schedule, _warnings = self._resource_schedule_data(schedule_query)
+        horizon_starts_at = self._parse_datetime(schedule["horizon_starts_at"])
+        horizon_ends_at = self._parse_datetime(schedule["horizon_ends_at"])
         process_rows = list(schedule["processes"])
         terminal_process_ids = self._terminal_process_ids(
             command.project_id,
@@ -1664,6 +1659,10 @@ class ProjectService:
                 True,
             )
         ]
+        horizon_starts_at, horizon_ends_at = self._resource_schedule_window(
+            query,
+            scope,
+        )
         return {
             "project_id": query.project_id,
             "project_start_at": project.start_at,
@@ -1684,8 +1683,8 @@ class ProjectService:
             "calendars": calendars,
             "blockers": blockers,
             "options": {
-                "horizon_starts_at": query.horizon_starts_at,
-                "horizon_ends_at": query.horizon_ends_at,
+                "horizon_starts_at": horizon_starts_at,
+                "horizon_ends_at": horizon_ends_at,
                 "planning_granularity": self._enum_value(query.planning_granularity),
                 "max_iterations": query.max_iterations,
                 "convergence_tolerance_hours": query.convergence_tolerance_hours,
@@ -1694,16 +1693,31 @@ class ProjectService:
             },
         }
 
+    def _resource_schedule_window(
+        self,
+        query,
+        scope: dict[str, object] | None,
+    ) -> tuple[dt.datetime, dt.datetime]:
+        starts_at = getattr(query, "horizon_starts_at", None)
+        ends_at = getattr(query, "horizon_ends_at", None)
+        if starts_at is not None and ends_at is not None:
+            return starts_at, ends_at
+        return self._snapshot_horizon(query.project_id, query.as_of, scope)
+
     def _fallback_resource_schedule(self, query) -> dict[str, object]:
         schedule_input = self._repository.get_project_schedule_input(
             query.project_id,
             query.as_of,
         )
         projection = compute_schedule(schedule_input, query.now)
+        horizon_starts_at, horizon_ends_at = self._resource_schedule_window(
+            query,
+            getattr(query, "scope", None),
+        )
         buckets = self._expanded_capacity(
             query.project_id,
-            query.horizon_starts_at,
-            query.horizon_ends_at,
+            horizon_starts_at,
+            horizon_ends_at,
             None,
             None,
         )
@@ -1763,8 +1777,8 @@ class ProjectService:
                     ready_at = max(f for f in predecessor_finishes if f is not None)
                 else:
                     ready_at = row.earliest_start_at
-                if ready_at < query.horizon_starts_at:
-                    ready_at = query.horizon_starts_at
+                if ready_at < horizon_starts_at:
+                    ready_at = horizon_starts_at
                 is_blocked = bool(blockers.get(row.process_id, {}).get("blocking_count"))
                 blocked_policy = self._enum_value(query.blocked_policy)
                 if is_blocked and blocked_policy != "include_normally":
@@ -1931,8 +1945,8 @@ class ProjectService:
             "project_id": query.project_id,
             "as_of": query.as_of.isoformat(),
             "now": query.now.isoformat(),
-            "horizon_starts_at": query.horizon_starts_at.isoformat(),
-            "horizon_ends_at": query.horizon_ends_at.isoformat(),
+            "horizon_starts_at": horizon_starts_at.isoformat(),
+            "horizon_ends_at": horizon_ends_at.isoformat(),
             "planning_granularity": self._enum_value(query.planning_granularity),
             "processes": schedule_rows,
             "allocation_slices": allocation_slices,
@@ -2230,10 +2244,12 @@ class ProjectService:
             include_allocation_slices=True,
         )
         warnings = self._resource_warnings(schedule, query.max_iterations)
+        horizon_starts_at = self._parse_datetime(schedule["horizon_starts_at"])
+        horizon_ends_at = self._parse_datetime(schedule["horizon_ends_at"])
         buckets = self._expanded_capacity(
             query.project_id,
-            query.horizon_starts_at,
-            query.horizon_ends_at,
+            horizon_starts_at,
+            horizon_ends_at,
             None,
             None,
         )
@@ -2355,8 +2371,8 @@ class ProjectService:
             {
                 "project_id": query.project_id,
                 "as_of": query.as_of.isoformat(),
-                "horizon_starts_at": query.horizon_starts_at.isoformat(),
-                "horizon_ends_at": query.horizon_ends_at.isoformat(),
+                "horizon_starts_at": horizon_starts_at.isoformat(),
+                "horizon_ends_at": horizon_ends_at.isoformat(),
                 "planning_granularity": self._enum_value(query.planning_granularity),
                 "by_resource": by_resource,
                 "by_role": by_role,
@@ -2403,6 +2419,8 @@ class ProjectService:
             include_allocation_slices=True,
         )
         warnings = self._resource_warnings(schedule, query.max_iterations)
+        horizon_starts_at = self._parse_datetime(schedule["horizon_starts_at"])
+        horizon_ends_at = self._parse_datetime(schedule["horizon_ends_at"])
         scoped_ids, _scope_data, _target_id = self._cost_scope_process_ids(query)
         resource_filter = set(query.resource_ids) if query.resource_ids else None
         role_filter = set(query.role_ids) if query.role_ids else None
@@ -2417,8 +2435,8 @@ class ProjectService:
                 continue
             clipped = self._clip_slice(
                 slice_data,
-                query.horizon_starts_at,
-                query.horizon_ends_at,
+                horizon_starts_at,
+                horizon_ends_at,
             )
             if clipped is not None:
                 slices.append(clipped)
@@ -2451,7 +2469,13 @@ class ProjectService:
                 },
             )
         group_by = {self._enum_value(value) for value in query.group_by}
-        cost_entries = self._cost_entries_for_slices(slices, currency, query)
+        cost_entries = self._cost_entries_for_slices(
+            slices,
+            currency,
+            query,
+            horizon_starts_at,
+            horizon_ends_at,
+        )
         total_cost = sum((entry["cost"] for entry in cost_entries), Decimal("0"))
         by_resource = []
         if "resource" in group_by:
@@ -2549,8 +2573,8 @@ class ProjectService:
             {
                 "project_id": query.project_id,
                 "as_of": query.as_of.isoformat(),
-                "horizon_starts_at": query.horizon_starts_at.isoformat(),
-                "horizon_ends_at": query.horizon_ends_at.isoformat(),
+                "horizon_starts_at": horizon_starts_at.isoformat(),
+                "horizon_ends_at": horizon_ends_at.isoformat(),
                 "currency": currency,
                 "total_cost": self._money(total_cost),
                 "by_resource": by_resource,
@@ -2646,10 +2670,17 @@ class ProjectService:
         slices: list[dict[str, Any]],
         currency: str,
         query: QueryCosts,
+        horizon_starts_at: dt.datetime,
+        horizon_ends_at: dt.datetime,
     ) -> list[dict[str, Any]]:
         resources = getattr(self._repository, "resources", {})
         entries: list[dict[str, Any]] = []
-        atoms = self._cost_atoms_for_slices(slices, query)
+        atoms = self._cost_atoms_for_slices(
+            slices,
+            query,
+            horizon_starts_at,
+            horizon_ends_at,
+        )
         slices_by_resource: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for slice_data in atoms:
             slices_by_resource[slice_data["resource_id"]].append(slice_data)
@@ -2699,13 +2730,15 @@ class ProjectService:
         self,
         slices: list[dict[str, Any]],
         query: QueryCosts,
+        horizon_starts_at: dt.datetime,
+        horizon_ends_at: dt.datetime,
     ) -> list[dict[str, Any]]:
         if not slices:
             return []
         buckets = self._expanded_capacity(
             query.project_id,
-            query.horizon_starts_at,
-            query.horizon_ends_at,
+            horizon_starts_at,
+            horizon_ends_at,
             sorted({slice_data["resource_id"] for slice_data in slices}),
             None,
         )

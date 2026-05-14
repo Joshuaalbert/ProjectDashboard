@@ -54,7 +54,7 @@ Resource-aware completion is authoritative for committed slippage points.
 - Blockers do not change computed schedule timing; they mark processes as blocked
   for status, review, and prioritization.
 - `unallocated` means required role effort could not be placed into eligible
-  resource calendar capacity for the query horizon. Diagnostics distinguish
+  resource calendar capacity while solving the schedule. Diagnostics distinguish
   missing roles/resources from capacity that exists but is already consumed,
   capacity that exists only before the process is ready, contiguous-window
   constraints, and predecessor failures.
@@ -63,9 +63,8 @@ Resource-aware completion is authoritative for committed slippage points.
 
 `commit_project_state` persists a schedule snapshot only when the operator
 commits. Each snapshot stores the commit timestamp, selected terminal symbols,
-schedule basis, completion datetime, resource horizon, convergence state,
-unallocated count, and optional note. The UI plots these snapshots as slippage
-history.
+schedule basis, completion datetime, convergence state, unallocated count, and
+optional note. The UI plots these snapshots as slippage history.
 
 ## Topology
 

@@ -18,7 +18,6 @@ from projdash.ui.adapters import (
     allowed_dependency_symbols,
     allowed_shared_dependency_symbols,
     allowed_successor_symbols,
-    auto_horizon_from_graph,
     build_process_graph_dot,
     catalog_from_query_data,
     cost_time_series_rows,
@@ -374,8 +373,6 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         "scope": None,
         "terminal_symbols": [],
         "now": controls["now"],
-        "horizon_starts_at": None,
-        "horizon_ends_at": None,
     }
     if base["project"] is None:
         return base
@@ -401,18 +398,8 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         dependency_graph or {},
     )
     scope = _terminal_scope(terminal_symbols)
-    horizon_starts_at, horizon_ends_at = auto_horizon_from_graph(
-        base["project"],
-        dependency_graph or {},
-        controls["as_of"],
-        terminal_symbols=terminal_symbols,
-    )
-    controls["horizon_starts_at"] = horizon_starts_at
-    controls["horizon_ends_at"] = horizon_ends_at
     base["scope"] = scope
     base["terminal_symbols"] = terminal_symbols
-    base["horizon_starts_at"] = horizon_starts_at
-    base["horizon_ends_at"] = horizon_ends_at
     scoped_query = {"scope": scope} if scope else {}
     base["graph"] = _query(
         service,
@@ -423,8 +410,6 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "now": controls["now"],
             **scoped_query,
             "include_resource_fields": True,
-            "horizon_starts_at": horizon_starts_at,
-            "horizon_ends_at": horizon_ends_at,
             "include_allocation_slices": True,
         },
     )
@@ -451,8 +436,6 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         "as_of": controls["as_of"],
         "now": controls["now"],
         **scoped_query,
-        "horizon_starts_at": horizon_starts_at,
-        "horizon_ends_at": horizon_ends_at,
     }
     base["resource_schedule"] = _query(
         service,
@@ -462,16 +445,20 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "include_allocation_slices": True,
         },
     )
-    base["capacity"] = _query(
-        service,
-        {
-            "action": "query_resource_capacity",
-            "project_id": project_id,
-            "as_of": controls["as_of"],
-            "horizon_starts_at": horizon_starts_at,
-            "horizon_ends_at": horizon_ends_at,
-        },
-    )
+    schedule_data = base.get("resource_schedule") or {}
+    schedule_starts_at = schedule_data.get("horizon_starts_at")
+    schedule_ends_at = schedule_data.get("horizon_ends_at")
+    if schedule_starts_at and schedule_ends_at:
+        base["capacity"] = _query(
+            service,
+            {
+                "action": "query_resource_capacity",
+                "project_id": project_id,
+                "as_of": controls["as_of"],
+                "horizon_starts_at": schedule_starts_at,
+                "horizon_ends_at": schedule_ends_at,
+            },
+        )
     base["utilization"] = _query(
         service,
         {"action": "query_utilization", **resource_query},
@@ -1877,14 +1864,6 @@ def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
         ),
     )
 
-    horizon_start = context.get("horizon_starts_at")
-    horizon_end = context.get("horizon_ends_at")
-    if horizon_start and horizon_end:
-        st.caption(
-            "Query horizon: "
-            f"{format_display_datetime(horizon_start, controls['timezone'])} to "
-            f"{format_display_datetime(horizon_end, controls['timezone'])}"
-        )
     st.metric("Converged", str(schedule.get("converged", "-")))
     _render_gantt_chart(
         graph,
@@ -1955,16 +1934,12 @@ def _schedule_debug_payload(
         "as_of": controls["as_of"],
         "now": context.get("now") or controls["now"],
         "terminal_process_symbols": list(terminal_symbols),
-        "horizon_starts_at": context.get("horizon_starts_at"),
-        "horizon_ends_at": context.get("horizon_ends_at"),
         "resource_schedule_query": {
             "action": "query_resource_schedule",
             "project_id": controls["project_id"],
             "as_of": controls["as_of"],
             "now": context.get("now") or controls["now"],
             **scoped_query,
-            "horizon_starts_at": context.get("horizon_starts_at"),
-            "horizon_ends_at": context.get("horizon_ends_at"),
             "planning_granularity": "hour",
             "include_allocation_slices": True,
         },
@@ -2077,7 +2052,7 @@ def _render_heatmap(
     timezone_name: str,
 ) -> None:
     if not labels or not times or not matrix:
-        st.info(f"No {title.lower()} data for the inferred horizon.")
+        st.info(f"No {title.lower()} data for the computed schedule span.")
         return
     step = times[1] - times[0] if len(times) > 1 else dt.timedelta(hours=1)
     time_edges = [*times, times[-1] + step]

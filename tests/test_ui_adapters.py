@@ -9,7 +9,6 @@ from projdash.ui.adapters import (
     allowed_shared_dependency_symbols,
     allowed_successor_symbols,
     ancestor_scope_symbols,
-    auto_horizon_from_graph,
     build_process_graph_dot,
     catalog_from_query_data,
     cost_time_series_rows,
@@ -496,8 +495,7 @@ def test_process_aggregation_and_priority_rows_use_schedule_windows():
     ]
 
 
-def test_auto_horizon_and_gantt_rows_use_terminal_ancestor_scope():
-    as_of = dt.datetime(2026, 5, 13, 10, tzinfo=dt.UTC)
+def test_gantt_rows_use_terminal_ancestor_scope():
     graph = {
         "critical_path_process_ids": ["p1", "p2"],
         "nodes": [
@@ -549,16 +547,8 @@ def test_auto_horizon_and_gantt_rows_use_terminal_ancestor_scope():
         ],
     }
 
-    starts_at, ends_at = auto_horizon_from_graph(
-        {"project": {"start_at": "2026-05-13T09:00:00+00:00"}},
-        graph,
-        as_of,
-        terminal_symbols=["B"],
-    )
     rows = gantt_rows(graph, terminal_symbols=["B"])
 
-    assert starts_at.isoformat() == "2026-05-13T00:00:00+00:00"
-    assert ends_at.isoformat() == "2026-05-16T00:00:00+00:00"
     assert [row["symbol"] for row in rows] == ["A", "B"]
     assert all(row["critical"] for row in rows)
 

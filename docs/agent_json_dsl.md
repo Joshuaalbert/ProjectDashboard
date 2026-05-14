@@ -127,9 +127,11 @@ Supported query actions are:
 - `query_unallocated_requirements`
 
 `query_process_graph` returns process nodes with dependency-only schedule fields
-and, when requested, resource-aware fields plus allocation slices. `query_*`
-resource calls require an explicit timezone-aware horizon; the UI infers this
-from the project graph and selected completion targets.
+and, when requested, resource-aware fields plus allocation slices. Resource-aware
+schedule, graph, utilization, cost, and unallocated queries do not require an
+operator-supplied schedule horizon; the service computes the capacity search
+span from project anchors, terminal scope, dependencies, role effort, and
+resource calendars.
 
 ## Slippage
 
@@ -140,7 +142,6 @@ terminal symbols and persists an immutable snapshot with:
 - terminal symbols
 - schedule basis
 - completion datetime
-- horizon
 - convergence status
 - unallocated requirement count
 - optional note

@@ -119,8 +119,6 @@ def test_schedule_debug_payload_contains_query_and_schedule_context():
         {
             "scope": {"type": "project"},
             "now": as_of,
-            "horizon_starts_at": as_of,
-            "horizon_ends_at": as_of + dt.timedelta(hours=8),
             "project": {"project": {"project_id": "project-alpha"}},
             "catalog": {"roles": [], "resources": [], "calendars": []},
             "graph": {"nodes": []},
@@ -137,5 +135,7 @@ def test_schedule_debug_payload_contains_query_and_schedule_context():
     assert payload["debug_schema"] == 1
     assert payload["terminal_process_symbols"] == ["A"]
     assert payload["resource_schedule_query"]["action"] == "query_resource_schedule"
+    assert "horizon_starts_at" not in payload["resource_schedule_query"]
+    assert "horizon_ends_at" not in payload["resource_schedule_query"]
     assert payload["resource_schedule"]["unallocated_requirements"] == []
     json.dumps(payload, default=str)

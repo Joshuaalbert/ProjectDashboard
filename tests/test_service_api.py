@@ -1948,18 +1948,6 @@ def test_new_query_payloads_round_trip(case):
             ),
         ),
         ApiCase(
-            "resource_graph_requires_horizon",
-            _query_payload(
-                {
-                    "action": "query_process_graph",
-                    "project_id": "project-alpha",
-                    "as_of": _at(13, 12).isoformat(),
-                    "now": _at(13, 12).isoformat(),
-                    "include_resource_fields": True,
-                }
-            ),
-        ),
-        ApiCase(
             "costs_reject_empty_resource_filter",
             _query_payload(
                 {

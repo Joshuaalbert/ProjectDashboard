@@ -73,6 +73,25 @@ class HorizonMixin(StrictModel):
         return self
 
 
+class OptionalHorizonMixin(StrictModel):
+    """Optional internal capacity search bounds for resource projections."""
+
+    horizon_starts_at: AwareDatetime | None = None
+    horizon_ends_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def _validate_optional_horizon(self):
+        if self.horizon_starts_at is None and self.horizon_ends_at is None:
+            return self
+        if self.horizon_starts_at is None or self.horizon_ends_at is None:
+            raise ValueError(
+                "horizon_starts_at and horizon_ends_at must be supplied together."
+            )
+        if self.horizon_ends_at <= self.horizon_starts_at:
+            raise ValueError("horizon_ends_at must be after horizon_starts_at.")
+        return self
+
+
 class ScopedProcessQuery(QueryModel):
     """Base query with an optional process scope."""
 
@@ -94,7 +113,7 @@ class QueryCriticalPath(ScopedProcessQuery):
     action: Literal["query_critical_path"] = "query_critical_path"
 
 
-class QueryProcessGraph(QueryModel, ResourceOptionsMixin):
+class QueryProcessGraph(QueryModel, ResourceOptionsMixin, OptionalHorizonMixin):
     """Fetch process graph with dependency-only and optional resource fields."""
 
     action: Literal["query_process_graph"] = "query_process_graph"
@@ -103,30 +122,18 @@ class QueryProcessGraph(QueryModel, ResourceOptionsMixin):
     now: AwareDatetime
     scope: Scope | None = None
     include_resource_fields: bool = False
-    horizon_starts_at: AwareDatetime | None = None
-    horizon_ends_at: AwareDatetime | None = None
     include_allocation_slices: bool = False
 
     @model_validator(mode="after")
     def _validate_resource_options(self) -> QueryProcessGraph:
-        has_horizon = (
+        if not self.include_resource_fields and (
             self.horizon_starts_at is not None or self.horizon_ends_at is not None
-        )
-        if self.include_resource_fields:
-            if self.horizon_starts_at is None or self.horizon_ends_at is None:
-                raise ValueError(
-                    "horizon_starts_at and horizon_ends_at are required when "
-                    "include_resource_fields is true."
-                )
-            if self.horizon_ends_at <= self.horizon_starts_at:
-                raise ValueError("horizon_ends_at must be after horizon_starts_at.")
-            return self
-        if has_horizon:
+        ):
             raise ValueError(
                 "Resource horizon fields are only accepted when "
                 "include_resource_fields is true."
             )
-        if self.include_allocation_slices:
+        if self.include_allocation_slices and not self.include_resource_fields:
             raise ValueError(
                 "include_allocation_slices is only accepted when "
                 "include_resource_fields is true."
@@ -168,7 +175,7 @@ class QueryScheduleSnapshots(QueryModel):
         return validate_unique_non_empty(value, "terminal_process_symbols")
 
 
-class QueryResourceSchedule(QueryModel, HorizonMixin, ResourceOptionsMixin):
+class QueryResourceSchedule(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
     """Compute resource-constrained schedule projection."""
 
     action: Literal["query_resource_schedule"] = "query_resource_schedule"
@@ -179,7 +186,7 @@ class QueryResourceSchedule(QueryModel, HorizonMixin, ResourceOptionsMixin):
     include_allocation_slices: bool = False
 
 
-class QueryUtilization(QueryModel, HorizonMixin, ResourceOptionsMixin):
+class QueryUtilization(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
     """Compute resource utilization aggregates."""
 
     action: Literal["query_utilization"] = "query_utilization"
@@ -189,7 +196,7 @@ class QueryUtilization(QueryModel, HorizonMixin, ResourceOptionsMixin):
     scope: Scope | None = None
 
 
-class QueryCosts(QueryModel, HorizonMixin, ResourceOptionsMixin):
+class QueryCosts(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
     """Compute cost aggregates from resource allocation evidence."""
 
     action: Literal["query_costs"] = "query_costs"
@@ -265,7 +272,7 @@ class QueryResourceCapacity(QueryModel, HorizonMixin):
         return validate_unique_non_empty(value, "filter")
 
 
-class QueryUnallocatedRequirements(QueryModel, HorizonMixin, ResourceOptionsMixin):
+class QueryUnallocatedRequirements(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
     """Return unallocated role requirements for a resource schedule."""
 
     action: Literal["query_unallocated_requirements"] = "query_unallocated_requirements"

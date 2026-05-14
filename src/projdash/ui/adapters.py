@@ -269,55 +269,6 @@ def ancestor_scope_symbols(
     ]
 
 
-def auto_horizon_from_graph(
-    project_data: dict[str, Any],
-    graph_data: dict[str, Any],
-    as_of: dt.datetime,
-    *,
-    terminal_symbols: list[str] | tuple[str, ...] | None = None,
-) -> tuple[dt.datetime, dt.datetime]:
-    """Infer a query horizon from project dates and selected graph endpoints."""
-    scoped_symbols = set(ancestor_scope_symbols(graph_data, terminal_symbols or ()))
-    project = project_data.get("project", project_data)
-    candidates = [_parse_datetime(project.get("start_at")), as_of]
-    finish_candidates = [as_of + dt.timedelta(hours=1)]
-
-    for node in graph_data.get("nodes", []):
-        if scoped_symbols and node.get("process_symbol") not in scoped_symbols:
-            continue
-        dependency = node.get("dependency_only") or {}
-        resource = node.get("resource_aware") or {}
-        for key in ("ls_at",):
-            candidates.append(_parse_datetime(resource.get(key)))
-        for key in ("lf_at",):
-            finish_candidates.append(_parse_datetime(resource.get(key)))
-        for key in ("es_at", "ls_at"):
-            candidates.append(_parse_datetime(dependency.get(key)))
-        for key in ("ready_at", "starts_at"):
-            candidates.append(_parse_datetime(resource.get(key)))
-        for key in ("ef_at", "lf_at"):
-            finish_candidates.append(_parse_datetime(dependency.get(key)))
-        for key in ("ends_at",):
-            finish_candidates.append(_parse_datetime(resource.get(key)))
-        for key in ("finished_at", "earliest_start_at"):
-            value = _parse_datetime(node.get(key))
-            candidates.append(value)
-            finish_candidates.append(value)
-
-    start = min(value for value in candidates if value is not None)
-    finish = max(value for value in finish_candidates if value is not None)
-    horizon_start = start.replace(hour=0, minute=0, second=0, microsecond=0)
-    horizon_end = (finish + dt.timedelta(days=1)).replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-    if horizon_end <= horizon_start:
-        horizon_end = horizon_start + dt.timedelta(days=1)
-    return horizon_start, horizon_end
-
-
 def gantt_rows(
     graph_data: dict[str, Any],
     *,
