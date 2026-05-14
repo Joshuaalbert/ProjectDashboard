@@ -277,7 +277,7 @@ def _seed_resource_project(service: ProjectService) -> dict[str, str]:
             ],
         },
     )["process_id"]
-    unallocated_id = _handle(
+    brand_id = _handle(
         service,
         {
             "action": "upsert_process_revision",
@@ -286,13 +286,7 @@ def _seed_resource_project(service: ProjectService) -> dict[str, str]:
             "name": "Brand Review",
             "effective_at": _iso(13, 9),
             "duration_business_days": 1,
-            "role_requirements": [
-                {
-                    "requirement_id": "req-brand-design",
-                    "role_id": designer_id,
-                    "effort_hours": 3,
-                }
-            ],
+            "role_requirements": [],
         },
     )["process_id"]
     return {
@@ -303,7 +297,7 @@ def _seed_resource_project(service: ProjectService) -> dict[str, str]:
         "engineer_resource_id": engineer_resource_id,
         "design_id": design_id,
         "build_id": build_id,
-        "unallocated_id": unallocated_id,
+        "brand_id": brand_id,
     }
 
 
@@ -461,6 +455,11 @@ def _resource_horizon() -> dict[str, str]:
     return {
         "as_of": _iso(13, 12),
         "now": _iso(13, 12),
+    }
+
+
+def _capacity_horizon() -> dict[str, str]:
+    return {
         "horizon_starts_at": _iso(13, 13),
         "horizon_ends_at": _iso(20, 0),
     }
@@ -603,7 +602,7 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
     assert {
         allocation["process_id"]
         for allocation in data["allocation_slices"]
-    } <= {ids["design_id"], ids["build_id"], ids["unallocated_id"]}
+    } <= {ids["design_id"], ids["build_id"], ids["brand_id"]}
 
     for edge in data["edges"]:
         assert set(edge) == {
@@ -717,8 +716,6 @@ def test_process_graph_resource_aware_status_uses_role_effort_windows():
             "project_id": project_id,
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 13),
-            "horizon_ends_at": _iso(16, 0),
             "include_resource_fields": True,
             "planning_granularity": "hour",
         },
@@ -903,18 +900,13 @@ def test_resource_schedule_without_public_horizon_extends_to_required_work():
     assert rows[second_id]["allocation_state"] == "complete"
     assert rows[second_id]["starts_at"] > rows[first_id]["ends_at"]
     assert rows[second_id]["ends_at"] is not None
-    assert not [
-        item
-        for item in schedule["unallocated_requirements"]
-        if item["process_id"] == second_id
-    ]
     second_node = next(
         node for node in graph["nodes"] if node["process_symbol"] == "2nd-step"
     )
     assert second_node["resource_aware"]["allocation_state"] == "complete"
 
 
-def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
+def test_resource_schedule_capacity_and_utilization_contracts():
     service = ProjectService(InMemoryProjectRepository())
     ids = _seed_resource_project(service)
 
@@ -932,13 +924,10 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
         "project_id",
         "as_of",
         "now",
-        "horizon_starts_at",
-        "horizon_ends_at",
         "planning_granularity",
         "processes",
         "allocation_slices",
         "critical_path_process_ids",
-        "unallocated_requirements",
         "converged",
         "iteration_count",
         "convergence",
@@ -1014,40 +1003,6 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
     assert bucket["role_ids"] == [ids["engineer_id"]]
     assert bucket["allocated_hours"] <= bucket["capacity_hours"] + 0.0001
 
-    unallocated = _query(
-        service,
-        {
-            "action": "query_unallocated_requirements",
-            "project_id": ids["project_id"],
-            **_resource_horizon(),
-            "planning_granularity": "hour",
-        },
-    )
-    assert unallocated["unallocated_requirements"] == (
-        schedule["unallocated_requirements"]
-    )
-    item = unallocated["unallocated_requirements"][0]
-    assert set(item) == {
-        "project_id",
-        "process_id",
-        "requirement_id",
-        "role_id",
-        "reason",
-        "message",
-        "diagnostic_message",
-        "required_effort_hours",
-        "remaining_effort_hours",
-        "allocated_effort_hours",
-        "eligible_resource_ids",
-        "first_feasible_starts_at",
-        "diagnostics",
-    }
-    assert item["process_id"] == ids["unallocated_id"]
-    assert item["reason"] == "no_eligible_resource"
-    assert item["diagnostic_message"]
-    assert item["required_effort_hours"] == 3.0
-    assert item["diagnostics"]["eligible_resource_count"] == 0
-
     utilization = _query(
         service,
         {
@@ -1060,8 +1015,6 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
     assert set(utilization) == {
         "project_id",
         "as_of",
-        "horizon_starts_at",
-        "horizon_ends_at",
         "planning_granularity",
         "by_resource",
         "by_role",
@@ -1132,7 +1085,6 @@ def test_terminal_topology_scope_filters_resource_schedule_and_utilization():
         ids["design_id"],
         ids["build_id"],
     }
-    assert schedule["unallocated_requirements"] == []
     assert {
         allocation["process_id"] for allocation in schedule["allocation_slices"]
     } == {ids["design_id"], ids["build_id"]}
@@ -1141,7 +1093,6 @@ def test_terminal_topology_scope_filters_resource_schedule_and_utilization():
             "role_id": ids["engineer_id"],
             "demanded_effort_hours": 12,
             "fulfilled_effort_hours": 12,
-            "unallocated_effort_hours": 0,
         }
     ]
 
@@ -1246,7 +1197,7 @@ def test_query_critical_path_remains_dependency_only_under_resource_delay():
     assert delayed_row["ends_at"] > delayed_row["dependency_only_ends_at"]
 
 
-def test_resource_schedule_row_nullability_for_partial_and_unallocated_rows():
+def test_resource_schedule_rejects_missing_role_capacity_with_structured_error():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)
     engineer_id = _handle(
@@ -1311,13 +1262,13 @@ def test_resource_schedule_row_nullability_for_partial_and_unallocated_rows():
             ],
         },
     )["process_id"]
-    partial_id = _handle(
+    _handle(
         service,
         {
             "action": "upsert_process_revision",
             "project_id": project_id,
-            "process_id": "process-partial",
-            "name": "Partial Build",
+            "process_id": "process-build",
+            "name": "Build",
             "effective_at": _iso(13, 9),
             "duration_business_days": 1,
             "dependencies": [setup_id],
@@ -1329,13 +1280,13 @@ def test_resource_schedule_row_nullability_for_partial_and_unallocated_rows():
                 }
             ],
         },
-    )["process_id"]
-    unallocated_id = _handle(
+    )
+    _handle(
         service,
         {
             "action": "upsert_process_revision",
             "project_id": project_id,
-            "process_id": "process-unallocated",
+            "process_id": "process-design",
             "name": "Dependency-Ready Design",
             "effective_at": _iso(13, 9),
             "duration_business_days": 1,
@@ -1348,62 +1299,27 @@ def test_resource_schedule_row_nullability_for_partial_and_unallocated_rows():
                 }
             ],
         },
-    )["process_id"]
+    )
 
-    schedule = _query(
+    result = _query_result(
         service,
         {
             "action": "query_resource_schedule",
             "project_id": project_id,
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 13),
-            "horizon_ends_at": _iso(13, 16),
             "include_allocation_slices": True,
             "planning_granularity": "hour",
         },
     )
 
-    rows = {row["process_id"]: row for row in schedule["processes"]}
-    setup = rows[setup_id]
-    assert setup["allocation_state"] == "complete"
-    assert setup["ends_at"] is not None
-
-    partial = rows[partial_id]
-    assert partial["allocation_state"] == "partial"
-    assert partial["ready_at"] is not None
-    assert partial["starts_at"] is not None
-    assert partial["ends_at"] is None
-    assert partial["resource_delay_hours"] == 0
-    partial_slices = [
-        allocation
-        for allocation in schedule["allocation_slices"]
-        if allocation["process_id"] == partial_id
-    ]
-    assert partial_slices
-    assert partial["starts_at"] == min(
-        allocation["starts_at"] for allocation in partial_slices
-    )
-    assert partial["starts_at"] >= partial["ready_at"]
-
-    unallocated = rows[unallocated_id]
-    assert unallocated["allocation_state"] == "unallocated"
-    assert unallocated["ready_at"] is not None
-    assert unallocated["ready_at"] >= setup["ends_at"]
-    assert unallocated["starts_at"] is None
-    assert unallocated["ends_at"] is None
-    assert unallocated["resource_delay_hours"] == 0
-    unallocated_item = next(
-        item
-        for item in schedule["unallocated_requirements"]
-        if item["process_id"] == unallocated_id
-    )
-    assert unallocated_item["requirement_id"] == "req-ready-design"
-    assert unallocated_item["reason"] == "no_eligible_resource"
-    assert unallocated_item["message"]
+    assert result.ok is False
+    assert result.error.code == "resource_schedule_unsatisfiable"
+    assert "no_eligible_resource" in result.error.message
+    assert result.error.details == {}
 
 
-def test_cost_queries_cover_filters_grouping_totals_and_horizon_clipping():
+def test_cost_queries_cover_filters_grouping_and_totals():
     service = ProjectService(InMemoryProjectRepository())
     ids = _seed_resource_project(service)
 
@@ -1420,8 +1336,6 @@ def test_cost_queries_cover_filters_grouping_totals_and_horizon_clipping():
     assert set(project_costs) == {
         "project_id",
         "as_of",
-        "horizon_starts_at",
-        "horizon_ends_at",
         "currency",
         "total_cost",
         "by_resource",
@@ -1477,8 +1391,6 @@ def test_cost_queries_cover_filters_grouping_totals_and_horizon_clipping():
             "project_id": ids["project_id"],
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 14),
-            "horizon_ends_at": _iso(13, 16),
             "scope": {
                 "type": "topo_filter",
                 "root_process_symbols": ["process-design"],
@@ -1494,8 +1406,6 @@ def test_cost_queries_cover_filters_grouping_totals_and_horizon_clipping():
     assert topology_costs["time_series"]
     first_bucket = topology_costs["time_series"][0]
     _assert_cost_bucket_shape(first_bucket)
-    assert first_bucket["starts_at"] >= _iso(13, 14)
-    assert first_bucket["ends_at"] <= _iso(13, 16)
     assert first_bucket["resource_id"] is None
     assert first_bucket["process_id"] is None
     assert first_bucket["role_id"] is None
@@ -1531,7 +1441,6 @@ def test_cost_query_recomputes_authoritative_costs_from_resource_facts():
                 }
             ],
             "critical_path_process_ids": ["process-cost"],
-            "unallocated_requirements": [],
             "converged": True,
             "iteration_count": 1,
             "convergence": {},
@@ -1599,8 +1508,6 @@ def test_cost_query_recomputes_authoritative_costs_from_resource_facts():
             "project_id": project_id,
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 13),
-            "horizon_ends_at": _iso(13, 15),
             "currency": "USD",
             "group_by": ["resource", "process", "role", "time"],
         },
@@ -1651,8 +1558,6 @@ def test_cost_queries_cover_all_cost_units():
             "project_id": ids["project_id"],
             "as_of": _iso(18, 12),
             "now": _iso(18, 12),
-            "horizon_starts_at": _iso(18, 13),
-            "horizon_ends_at": _iso(23, 0),
             "currency": "USD",
             "group_by": ["resource"],
         },
@@ -1697,8 +1602,6 @@ def test_cost_queries_cover_all_cost_units():
             "project_id": ids["project_id"],
             "as_of": _iso(18, 12),
             "now": _iso(18, 12),
-            "horizon_starts_at": _iso(18, 15),
-            "horizon_ends_at": _iso(18, 17),
             "resource_ids": [ids["day_resource_id"]],
             "role_ids": [ids["day_role_id"]],
             "currency": "USD",
@@ -1710,7 +1613,7 @@ def test_cost_queries_cover_all_cost_units():
         {
             "resource_id": ids["day_resource_id"],
             "cost_unit": "day",
-            "allocated_hours": 2,
+            "allocated_hours": 8,
             "currency": "USD",
             "cost_amount": "400.00",
         }
@@ -1728,28 +1631,18 @@ def test_cost_queries_cover_all_cost_units():
         for bucket in daily_buckets["time_series"]
     ] == [
         (
-            _iso(18, 15),
-            _iso(18, 16),
+            _iso(18, hour),
+            _iso(18, hour + 1),
             ids["day_resource_id"],
             None,
             None,
             1,
-            "200.00",
-        ),
-        (
-            _iso(18, 16),
-            _iso(18, 17),
-            ids["day_resource_id"],
-            None,
-            None,
-            1,
-            "200.00",
-        ),
+            "50.00",
+        )
+        for hour in range(13, 21)
     ]
     for bucket in daily_buckets["time_series"]:
         _assert_cost_bucket_shape(bucket)
-        assert bucket["starts_at"] >= _iso(18, 15)
-        assert bucket["ends_at"] <= _iso(18, 17)
     _assert_cost_buckets_sum_to_total(daily_buckets)
 
     weekly_buckets = _query(
@@ -1759,8 +1652,6 @@ def test_cost_queries_cover_all_cost_units():
             "project_id": ids["project_id"],
             "as_of": _iso(18, 12),
             "now": _iso(18, 12),
-            "horizon_starts_at": _iso(18, 13),
-            "horizon_ends_at": _iso(23, 0),
             "resource_ids": [ids["week_resource_id"]],
             "role_ids": [ids["week_role_id"]],
             "currency": "USD",
@@ -1784,41 +1675,6 @@ def test_cost_queries_cover_all_cost_units():
         assert bucket["role_id"] is None
     _assert_cost_buckets_sum_to_total(weekly_buckets)
 
-    weekly_clipped_buckets = _query(
-        service,
-        {
-            "action": "query_costs",
-            "project_id": ids["project_id"],
-            "as_of": _iso(18, 12),
-            "now": _iso(18, 12),
-            "horizon_starts_at": _iso(18, 13),
-            "horizon_ends_at": _iso(18, 15),
-            "resource_ids": [ids["week_resource_id"]],
-            "role_ids": [ids["week_role_id"]],
-            "currency": "USD",
-            "group_by": ["resource", "time"],
-        },
-    )
-    assert weekly_clipped_buckets["total_cost"] == "2000.00"
-    assert [
-        (
-            bucket["starts_at"],
-            bucket["ends_at"],
-            bucket["allocated_hours"],
-            bucket["cost_amount"],
-        )
-        for bucket in weekly_clipped_buckets["time_series"]
-    ] == [
-        (_iso(18, 13), _iso(18, 14), 1, "1000.00"),
-        (_iso(18, 14), _iso(18, 15), 1, "1000.00"),
-    ]
-    for bucket in weekly_clipped_buckets["time_series"]:
-        _assert_cost_bucket_shape(bucket)
-        assert bucket["resource_id"] == ids["week_resource_id"]
-        assert bucket["process_id"] is None
-        assert bucket["role_id"] is None
-    _assert_cost_buckets_sum_to_total(weekly_clipped_buckets)
-
     fixed_buckets = _query(
         service,
         {
@@ -1826,8 +1682,6 @@ def test_cost_queries_cover_all_cost_units():
             "project_id": ids["project_id"],
             "as_of": _iso(18, 12),
             "now": _iso(18, 12),
-            "horizon_starts_at": _iso(18, 13),
-            "horizon_ends_at": _iso(18, 16),
             "resource_ids": [ids["fixed_resource_id"]],
             "role_ids": [ids["fixed_role_id"]],
             "currency": "USD",
@@ -1839,7 +1693,7 @@ def test_cost_queries_cover_all_cost_units():
         {
             "resource_id": ids["fixed_resource_id"],
             "cost_unit": "fixed",
-            "allocated_hours": 3,
+            "allocated_hours": 6,
             "currency": "USD",
             "cost_amount": "300.00",
         }
@@ -1853,9 +1707,8 @@ def test_cost_queries_cover_all_cost_units():
         )
         for bucket in fixed_buckets["time_series"]
     ] == [
-        (_iso(18, 13), _iso(18, 14), 1, "100.00"),
-        (_iso(18, 14), _iso(18, 15), 1, "100.00"),
-        (_iso(18, 15), _iso(18, 16), 1, "100.00"),
+        (_iso(18, hour), _iso(18, hour + 1), 1, "50.00")
+        for hour in range(13, 19)
     ]
     for bucket in fixed_buckets["time_series"]:
         _assert_cost_bucket_shape(bucket)
@@ -1928,15 +1781,12 @@ def test_cost_time_series_uses_requested_cross_product_dimensions():
             "cost_amount": "1500.00",
         }
     ]
-    horizon = _resource_horizon()
     assert role_time_costs["time_series"]
     for bucket in role_time_costs["time_series"]:
         _assert_cost_bucket_shape(bucket)
         assert bucket["resource_id"] is None
         assert bucket["process_id"] is None
         assert bucket["role_id"] == ids["engineer_id"]
-        assert bucket["starts_at"] >= horizon["horizon_starts_at"]
-        assert bucket["ends_at"] <= horizon["horizon_ends_at"]
     assert {bucket["role_id"] for bucket in role_time_costs["time_series"]} == {
         ids["engineer_id"]
     }
@@ -1960,8 +1810,6 @@ def test_cost_time_series_uses_requested_cross_product_dimensions():
         assert bucket["resource_id"] == ids["engineer_resource_id"]
         assert bucket["process_id"] in {ids["design_id"], ids["build_id"]}
         assert bucket["role_id"] == ids["engineer_id"]
-        assert bucket["starts_at"] >= horizon["horizon_starts_at"]
-        assert bucket["ends_at"] <= horizon["horizon_ends_at"]
     full_bucket_keys = [
         (
             bucket["resource_id"],
@@ -1977,7 +1825,7 @@ def test_cost_time_series_uses_requested_cross_product_dimensions():
     _assert_cost_buckets_sum_to_total(full_cross_product_costs)
 
 
-def test_cost_filters_accept_inactive_resource_and_role_ids_as_empty_scope():
+def test_cost_filters_reject_inactive_resource_and_role_capacity():
     service = ProjectService(InMemoryProjectRepository())
     ids = _seed_resource_project(service)
     _handle(
@@ -1999,7 +1847,7 @@ def test_cost_filters_accept_inactive_resource_and_role_ids_as_empty_scope():
         },
     )
 
-    costs = _query(
+    result = _query_result(
         service,
         {
             "action": "query_costs",
@@ -2012,11 +1860,9 @@ def test_cost_filters_accept_inactive_resource_and_role_ids_as_empty_scope():
         },
     )
 
-    assert costs["total_cost"] == "0.00"
-    assert costs["by_resource"] == []
-    assert costs["by_process"] == []
-    assert costs["by_role"] == []
-    assert costs["time_series"] == []
+    assert result.ok is False
+    assert result.error.code == "resource_schedule_unsatisfiable"
+    assert "missing_role" in result.error.message
 
 
 def test_cost_filters_reject_unknown_resource_ids_with_structured_error():
@@ -2108,30 +1954,34 @@ def test_utilization_does_not_multiply_multi_role_resource_capacity():
             "project_id": ids["project_id"],
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 13),
-            "horizon_ends_at": _iso(14, 0),
             "planning_granularity": "hour",
         },
     )
 
     resource_row = utilization["by_resource"][0]
     assert resource_row["resource_id"] == ids["resource_id"]
-    assert resource_row["capacity_hours"] == 8
     assert resource_row["allocated_hours"] == 8
-    assert resource_row["remaining_hours"] == 0
-    assert resource_row["utilization_ratio"] == 1
+    assert resource_row["capacity_hours"] >= resource_row["allocated_hours"]
+    assert resource_row["remaining_hours"] == (
+        resource_row["capacity_hours"] - resource_row["allocated_hours"]
+    )
+    assert resource_row["utilization_ratio"] == pytest.approx(
+        resource_row["allocated_hours"] / resource_row["capacity_hours"],
+        abs=1e-6,
+    )
+    assert resource_row["capacity_hours"] == sum(
+        bucket["capacity_hours"] for bucket in utilization["time_series"]
+    )
     assert sorted(utilization["by_role"], key=lambda row: row["role_id"]) == [
         {
             "role_id": ids["dev_role_id"],
             "demanded_effort_hours": 4,
             "fulfilled_effort_hours": 4,
-            "unallocated_effort_hours": 0,
         },
         {
             "role_id": ids["qa_role_id"],
             "demanded_effort_hours": 4,
             "fulfilled_effort_hours": 4,
-            "unallocated_effort_hours": 0,
         },
     ]
     assert utilization["overallocated_buckets"] == []

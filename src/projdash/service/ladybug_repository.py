@@ -197,10 +197,7 @@ SCHEMA_STATEMENTS = (
         terminal_process_symbols STRING[],
         schedule_basis STRING,
         completion_at STRING,
-        horizon_starts_at STRING,
-        horizon_ends_at STRING,
         converged BOOL,
-        unallocated_count INT64,
         note STRING
     )
     """,
@@ -1497,12 +1494,7 @@ class LadybugProjectRepository:
                     "terminal_process_symbols": snapshot.terminal_process_symbols,
                     "schedule_basis": _value_or_enum_value(snapshot.schedule_basis),
                     "completion_at": _isoformat_or_none(snapshot.completion_at),
-                    "horizon_starts_at": _isoformat_or_string(
-                        snapshot.horizon_starts_at,
-                    ),
-                    "horizon_ends_at": _isoformat_or_string(snapshot.horizon_ends_at),
                     "converged": snapshot.converged,
-                    "unallocated_count": snapshot.unallocated_count,
                     "note": snapshot.note,
                 },
             )
@@ -1795,9 +1787,7 @@ class LadybugProjectRepository:
             MATCH (snapshot:ScheduleSnapshot)
             RETURN snapshot.snapshot_id, snapshot.project_id, snapshot.committed_at,
                    snapshot.terminal_process_symbols, snapshot.schedule_basis,
-                   snapshot.completion_at, snapshot.horizon_starts_at,
-                   snapshot.horizon_ends_at,
-                   snapshot.converged, snapshot.unallocated_count, snapshot.note
+                   snapshot.completion_at, snapshot.converged, snapshot.note
             ORDER BY snapshot.project_id, snapshot.committed_at, snapshot.snapshot_id
             """
         ):
@@ -1809,11 +1799,8 @@ class LadybugProjectRepository:
                     terminal_process_symbols=list(row[3] or []),
                     schedule_basis=row[4] or "resource_aware",
                     completion_at=_datetime_or_none(row[5]),
-                    horizon_starts_at=_datetime_from_storage(row[6]),
-                    horizon_ends_at=_datetime_from_storage(row[7]),
-                    converged=row[8],
-                    unallocated_count=row[9] or 0,
-                    note=row[10],
+                    converged=row[6],
+                    note=row[7],
                 )
             )
 

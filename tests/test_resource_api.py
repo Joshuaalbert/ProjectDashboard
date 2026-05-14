@@ -128,8 +128,6 @@ def _resource_schedule_query(
         "project_id": project_id,
         "as_of": _iso(13, 12),
         "now": _iso(13, 12),
-        "horizon_starts_at": _iso(13, 0),
-        "horizon_ends_at": _iso(20, 0),
         "include_allocation_slices": include_allocation_slices,
     }
 
@@ -1053,21 +1051,12 @@ def test_deactivate_role_force_true_preserves_requirements_and_reports_missing_r
         service,
         _resource_schedule_query(project_id, include_allocation_slices=False),
     )
-    data = schedule.data
-    process_row = next(
-        row for row in data["processes"] if row["process_id"] == process_id
-    )
-    unallocated = next(
-        item
-        for item in data["unallocated_requirements"]
-        if item["requirement_id"] == "req-api-eng"
-    )
 
-    assert process_row["requirement_ids"] == ["req-api-eng"]
-    assert process_row["allocation_state"] == "unallocated"
-    assert unallocated["process_id"] == process_id
-    assert unallocated["role_id"] == role_id
-    assert unallocated["reason"] == "missing_role"
+    assert process_id == "process-api"
+    assert schedule.ok is False
+    assert schedule.error.code == "resource_schedule_unsatisfiable"
+    assert "missing_role" in schedule.error.message
+    assert "req-api-eng" in schedule.error.message
 
 
 def test_calendar_deactivation_requires_force_and_cannot_be_bypassed_by_upsert():
@@ -1139,16 +1128,6 @@ def test_set_calendar_active_force_true_preserves_references_and_removes_capacit
         service,
         _resource_schedule_query(project_id, include_allocation_slices=False),
     )
-    unallocated = next(
-        item
-        for item in schedule.data["unallocated_requirements"]
-        if item["requirement_id"] == "req-api-eng"
-    )
-    process_row = next(
-        row
-        for row in schedule.data["processes"]
-        if row["process_id"] == process_id
-    )
     capacity = _query(
         service,
         {
@@ -1163,12 +1142,12 @@ def test_set_calendar_active_force_true_preserves_references_and_removes_capacit
         },
     )
 
-    assert process_row["requirement_ids"] == ["req-api-eng"]
-    assert process_row["allocation_state"] == "unallocated"
-    assert unallocated["process_id"] == process_id
-    assert unallocated["role_id"] == role_id
-    assert unallocated["eligible_resource_ids"] == [resource_id]
-    assert unallocated["reason"] == "no_calendar_capacity"
+    assert process_id == "process-api"
+    assert schedule.ok is False
+    assert schedule.error.code == "resource_schedule_unsatisfiable"
+    assert "no_calendar_capacity" in schedule.error.message
+    assert "req-api-eng" in schedule.error.message
+    assert resource_id == "resource-ada"
     assert capacity.data["buckets"] == []
 
 
@@ -2232,13 +2211,10 @@ def test_resource_schedule_query_returns_documented_output_contract():
         "project_id",
         "as_of",
         "now",
-        "horizon_starts_at",
-        "horizon_ends_at",
         "planning_granularity",
         "processes",
         "allocation_slices",
         "critical_path_process_ids",
-        "unallocated_requirements",
         "converged",
         "iteration_count",
         "convergence",
@@ -2246,7 +2222,6 @@ def test_resource_schedule_query_returns_documented_output_contract():
     assert data["project_id"] == project_id
     assert data["planning_granularity"] == "hour"
     assert data["critical_path_process_ids"] == [process_id]
-    assert data["unallocated_requirements"] == []
     assert data["converged"] is True
     assert data["iteration_count"] >= 1
     assert data["convergence"] == {
@@ -2380,84 +2355,18 @@ def test_resource_capacity_query_returns_bucket_contract():
     assert bucket["role_ids"] == [role_id]
 
 
-def test_unallocated_requirements_query_matches_resource_schedule_contract():
-    service = ProjectService(InMemoryProjectRepository())
-    project_id = _create_project(service)
-    role_id = _handle(
-        service,
-        {
-            "action": "create_role",
-            "project_id": project_id,
-            "role_id": "role-engineer",
-            "name": "Engineer",
-        },
-    ).entity_ids["role_id"]
-    _handle(
-        service,
-        {
-            "action": "upsert_process_revision",
-            "project_id": project_id,
-            "process_id": "process-api",
-            "name": "Build API",
-            "effective_at": _iso(13),
-            "duration_business_days": 1,
-            "role_requirements": [
-                {
-                    "requirement_id": "req-api-eng",
-                    "role_id": role_id,
-                    "effort_hours": 8,
+def test_unallocated_requirements_query_is_not_a_public_action():
+    with pytest.raises(ValueError):
+        QueryEnvelope.model_validate(
+            {
+                "query": {
+                    "action": "query_unallocated_requirements",
+                    "project_id": "project-api",
+                    "as_of": _iso(13, 12),
+                    "now": _iso(13, 12),
                 }
-            ],
-        },
-    )
-
-    schedule_data = _query(service, _resource_schedule_query(project_id)).data
-    unallocated_data = _query(
-        service,
-        {
-            "action": "query_unallocated_requirements",
-            "project_id": project_id,
-            "as_of": _iso(13, 12),
-            "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 0),
-            "horizon_ends_at": _iso(20, 0),
-        },
-    ).data
-
-    _assert_no_nested_warnings(unallocated_data)
-    assert set(unallocated_data) == {
-        "project_id",
-        "as_of",
-        "horizon_starts_at",
-        "horizon_ends_at",
-        "planning_granularity",
-        "unallocated_requirements",
-    }
-    assert unallocated_data["unallocated_requirements"] == (
-        schedule_data["unallocated_requirements"]
-    )
-    item = unallocated_data["unallocated_requirements"][0]
-    assert set(item) == {
-        "project_id",
-        "process_id",
-        "requirement_id",
-        "role_id",
-        "reason",
-        "message",
-        "diagnostic_message",
-        "required_effort_hours",
-        "remaining_effort_hours",
-        "allocated_effort_hours",
-        "eligible_resource_ids",
-        "first_feasible_starts_at",
-        "diagnostics",
-    }
-    assert item["reason"] == "no_eligible_resource"
-    assert item["diagnostic_message"]
-    assert item["required_effort_hours"] == 8
-    assert item["remaining_effort_hours"] == 8
-    assert item["allocated_effort_hours"] == 0
-    assert item["diagnostics"]["eligible_resource_count"] == 0
+            }
+        )
 
 
 def test_utilization_query_returns_aggregate_contract():
@@ -2471,8 +2380,6 @@ def test_utilization_query_returns_aggregate_contract():
             "project_id": project_id,
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 0),
-            "horizon_ends_at": _iso(20, 0),
         },
     )
     data = result.data
@@ -2481,8 +2388,6 @@ def test_utilization_query_returns_aggregate_contract():
     assert set(data) == {
         "project_id",
         "as_of",
-        "horizon_starts_at",
-        "horizon_ends_at",
         "planning_granularity",
         "by_resource",
         "by_role",
@@ -2506,12 +2411,10 @@ def test_utilization_query_returns_aggregate_contract():
         "role_id",
         "demanded_effort_hours",
         "fulfilled_effort_hours",
-        "unallocated_effort_hours",
     }
     assert by_role["role_id"] == role_id
     assert by_role["demanded_effort_hours"] == 8
     assert by_role["fulfilled_effort_hours"] == 8
-    assert by_role["unallocated_effort_hours"] == 0
     assert data["overallocated_buckets"] == []
 
 
@@ -2526,8 +2429,6 @@ def test_cost_query_returns_decimal_string_contract_and_default_currency():
             "project_id": project_id,
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 0),
-            "horizon_ends_at": _iso(20, 0),
         },
     )
     data = result.data
@@ -2536,8 +2437,6 @@ def test_cost_query_returns_decimal_string_contract_and_default_currency():
     assert set(data) == {
         "project_id",
         "as_of",
-        "horizon_starts_at",
-        "horizon_ends_at",
         "currency",
         "total_cost",
         "by_resource",
@@ -2581,8 +2480,6 @@ def test_cost_query_group_by_time_serializes_omitted_dimensions_as_null():
             "project_id": project_id,
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 13),
-            "horizon_ends_at": _iso(13, 21),
             "currency": "USD",
             "group_by": ["time"],
         },
@@ -2624,8 +2521,6 @@ def test_cost_query_group_by_resource_process_time_has_stable_bucket_shape():
             "project_id": project_id,
             "as_of": _iso(13, 12),
             "now": _iso(13, 12),
-            "horizon_starts_at": _iso(13, 13),
-            "horizon_ends_at": _iso(13, 21),
             "currency": "USD",
             "group_by": ["resource", "process", "time"],
         },

@@ -435,8 +435,6 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
             "as_of": _iso(15, 17),
             "now": _iso(15, 17),
             "include_resource_fields": True,
-            "horizon_starts_at": _iso(13, 0),
-            "horizon_ends_at": _iso(25, 0),
         },
     ).data
     inferred_done_node = next(
@@ -464,8 +462,6 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
             "as_of": _iso(16, 13),
             "now": _iso(16, 13),
             "include_resource_fields": True,
-            "horizon_starts_at": _iso(13, 0),
-            "horizon_ends_at": _iso(25, 0),
         },
     ).data
     explicit_done_node = next(
@@ -492,8 +488,6 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
             "as_of": _iso(17, 10),
             "now": _iso(17, 10),
             "include_resource_fields": True,
-            "horizon_starts_at": _iso(13, 0),
-            "horizon_ends_at": _iso(25, 0),
         },
     ).data
     reopened_node = next(
@@ -550,8 +544,6 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
             "as_of": _iso(18, 10),
             "now": _iso(18, 10),
             "include_resource_fields": True,
-            "horizon_starts_at": _iso(13, 0),
-            "horizon_ends_at": _iso(25, 0),
         },
     ).data
     node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
@@ -575,7 +567,7 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
     assert node["finished_at"] == _iso(17, 13)
     assert "ends_at" not in node
     assert node["resource_aware"]["ends_at"] is not None
-    assert node["finished_at"] != node["resource_aware"]["ends_at"]
+    assert node["finished_at"] == node["resource_aware"]["ends_at"]
 
 
 def test_started_process_anchors_dependency_schedule_windows():
@@ -814,8 +806,7 @@ def test_commit_project_state_extends_horizon_to_sparse_resource_capacity():
 
     assert committed.ok is True
     assert snapshots[0]["completion_at"] is not None
-    assert snapshots[0]["unallocated_count"] == 0
-    assert snapshots[0]["horizon_ends_at"] > "2026-06-30T00:00:00+00:00"
+    assert snapshots[0]["completion_at"] > "2026-06-30T00:00:00+00:00"
 
 
 def test_done_terminal_snapshot_uses_actual_finished_at():

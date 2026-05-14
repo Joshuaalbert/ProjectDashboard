@@ -13,7 +13,8 @@ defined by role effort hours and resource capacity, not target-date facts.
   and committed schedule snapshots.
 - Compute dependency-only CPM windows as diagnostic graph metadata.
 - Compute resource-aware schedules from role effort and resource capacity.
-- Expose allocation slices, utilization, costs, and unallocated requirements.
+- Expose allocation slices, utilization, costs, capacity inspection, and
+  structured infeasibility errors.
 - Commit immutable schedule snapshots for slippage history only on explicit
   operator command.
 
@@ -25,6 +26,10 @@ defined by role effort hours and resource capacity, not target-date facts.
 - Calendar windows are local to each calendar timezone.
 - Resource holidays use the resource calendar timezone.
 - Allocation must not exceed resource bucket capacity.
+- Calendars recur indefinitely; schedule computations do not accept public
+  horizon bounds.
+- Resource-process assignments are continuous through each resource's working
+  calendar time once started.
 - Role and resource utilization must reconcile with allocation slices.
 - Costs use the project currency.
 

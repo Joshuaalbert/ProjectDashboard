@@ -565,6 +565,98 @@ def test_resource_allocation_uses_global_contention_ledger_without_overbooking()
     _assert_resource_utilization_never_exceeds_capacity(data)
 
 
+def test_done_process_does_not_require_current_resource_capacity():
+    process = _process("legacy_review")
+    process["explicit_status"] = "done"
+    process["started_at"] = _at(13, 10)
+    process["finished_at"] = _at(13, 12)
+
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[process],
+                role_requirements=[
+                    _requirement(
+                        "legacy_review",
+                        8,
+                        requirement_id="req_legacy_role",
+                        role_id="role_archived",
+                    )
+                ],
+                roles=[{**_role("role_archived"), "active": False}],
+                resources=[],
+                calendars=[],
+            )
+        )
+    )
+
+    row = _rows_by_id(data)["legacy_review"]
+    assert _value(row, "allocation_state") == "complete"
+    assert _iso(_value(row, "starts_at")) == "2026-05-13T10:00:00+00:00"
+    assert _iso(_value(row, "ends_at")) == "2026-05-13T12:00:00+00:00"
+    assert data["allocation_slices"] == []
+
+
+def test_duplicate_requirement_ids_are_scoped_by_process():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[_process("dev_task"), _process("qa_task")],
+                role_requirements=[
+                    _requirement(
+                        "dev_task",
+                        2,
+                        requirement_id="req_shared",
+                        role_id="role_dev",
+                    ),
+                    _requirement(
+                        "qa_task",
+                        2,
+                        requirement_id="req_shared",
+                        role_id="role_qa",
+                    ),
+                ],
+                roles=[_role("role_dev"), _role("role_qa")],
+                resources=[
+                    _resource("res_dev", role_ids=["role_dev"]),
+                    _resource("res_qa", role_ids=["role_qa"]),
+                ],
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    assert _value(rows["dev_task"], "allocation_state") == "complete"
+    assert _value(rows["qa_task"], "allocation_state") == "complete"
+    assert {
+        (
+            _value(allocation, "process_id"),
+            _value(allocation, "requirement_id"),
+            _value(allocation, "role_id"),
+            _value(allocation, "resource_id"),
+        )
+        for allocation in data["allocation_slices"]
+    } == {
+        ("dev_task", "req_shared", "role_dev", "res_dev"),
+        ("qa_task", "req_shared", "role_qa", "res_qa"),
+    }
+
+
+def test_internal_capacity_search_extension_can_grow_beyond_initial_cap():
+    next_capacity_search_end = getattr(
+        _resource_schedule_module(),
+        "_next_capacity_search_end",
+        None,
+    )
+    if next_capacity_search_end is None:
+        pytest.fail("expected _next_capacity_search_end helper")
+
+    starts_at = _at(13)
+    ends_at = starts_at + dt.timedelta(days=3650)
+
+    assert next_capacity_search_end(starts_at, ends_at) > ends_at
+
+
 def test_ready_requirements_allocate_breadth_first_by_project_hour_bucket():
     data = _data(
         _compute_resource_schedule(
@@ -999,10 +1091,9 @@ def test_required_resource_count_is_concurrency_ceiling_not_staffing_minimum():
     assert _iso(_value(rows["build"], "starts_at")) == "2026-05-13T09:00:00+00:00"
     assert _iso(_value(rows["build"], "ends_at")) == "2026-05-13T11:00:00+00:00"
     assert _allocation_effort_by_resource(data) == {"res_only": 2.0}
-    assert data["unallocated_requirements"] == []
 
 
-def test_no_calendar_capacity_reports_structured_unallocated_reason():
+def test_recurring_calendar_capacity_extends_until_work_can_finish():
     data = _data(
         _compute_resource_schedule(
             _base_input(
@@ -1021,24 +1112,14 @@ def test_no_calendar_capacity_reports_structured_unallocated_reason():
     )
 
     rows = _rows_by_id(data)
-    unallocated = _unallocated_by_process(data)
-    item = unallocated["build"]
-    assert _value(rows["build"], "allocation_state") == "unallocated"
+    assert _value(rows["build"], "allocation_state") == "complete"
     assert _iso(_value(rows["build"], "ready_at")) == "2026-05-13T09:00:00+00:00"
-    assert _value(rows["build"], "starts_at") is None
-    assert _value(rows["build"], "ends_at") is None
-    assert _value(item, "reason") == "no_calendar_capacity"
-    assert _value(item, "eligible_resource_ids") == ["res_alex"]
-    assert _value(item, "first_feasible_starts_at") is None
-    assert _value(item, "required_effort_hours") == 2.0
-    assert _value(item, "diagnostic_message")
-    assert _value(_value(item, "diagnostics"), "candidate_capacity_hours") == 0.0
-    assert _value(_value(item, "diagnostics"), "eligible_resource_count") == 1
-    assert _value(item, "message")
-    assert data["allocation_slices"] == []
+    assert _iso(_value(rows["build"], "starts_at")) == "2026-05-17T09:00:00+00:00"
+    assert _iso(_value(rows["build"], "ends_at")) == "2026-05-17T11:00:00+00:00"
+    assert _allocation_effort_by_resource(data) == {"res_alex": 2.0}
 
 
-def test_no_capacity_after_ready_reports_actionable_diagnostic():
+def test_capacity_after_ready_is_found_by_expanding_recurring_calendars():
     data = _data(
         _compute_resource_schedule(
             _base_input(
@@ -1056,23 +1137,14 @@ def test_no_capacity_after_ready_reports_actionable_diagnostic():
     )
 
     rows = _rows_by_id(data)
-    item = _unallocated_by_process(data)["build"]
-    diagnostics = _value(item, "diagnostics")
-
     assert _value(rows["setup"], "allocation_state") == "complete"
     assert _iso(_value(rows["build"], "ready_at")) == "2026-05-13T11:00:00+00:00"
-    assert _value(rows["build"], "allocation_state") == "unallocated"
-    assert _value(rows["build"], "allocation_diagnostic")
-    assert _value(item, "reason") == "no_calendar_capacity"
-    assert "eligible resource" in _value(item, "diagnostic_message")
-    assert _value(diagnostics, "eligible_resource_ids") == ["res_alex"]
-    assert _value(diagnostics, "candidate_capacity_hours") == 0.0
-    assert _value(diagnostics, "remaining_candidate_capacity_hours") == 0.0
-    assert _iso(_value(diagnostics, "process_ready_at")) == "2026-05-13T11:00:00+00:00"
-    assert _iso(_value(diagnostics, "horizon_ends_at")) == "2026-05-13T11:00:00+00:00"
+    assert _value(rows["build"], "allocation_state") == "complete"
+    assert _iso(_value(rows["build"], "starts_at")) == "2026-05-13T11:00:00+00:00"
+    assert _iso(_value(rows["build"], "ends_at")) == "2026-05-13T12:00:00+00:00"
 
 
-def test_exhausted_resource_capacity_is_distinct_from_missing_roles():
+def test_capacity_contention_extends_schedule_instead_of_partial_allocation():
     data = _data(
         _compute_resource_schedule(
             _base_input(
@@ -1090,30 +1162,14 @@ def test_exhausted_resource_capacity_is_distinct_from_missing_roles():
     )
 
     rows = _rows_by_id(data)
-    item = _unallocated_by_process(data)["late"]
-    diagnostics = _value(item, "diagnostics")
-
-    assert _value(rows["late"], "allocation_state") == "partial"
-    assert _value(item, "reason") == "resource_capacity_exhausted"
-    assert _value(item, "allocated_effort_hours") > 0
-    assert _value(diagnostics, "eligible_resource_count") == 1
-    assert _value(diagnostics, "candidate_capacity_hours") == 1.0
-    assert _value(diagnostics, "remaining_candidate_capacity_hours") == 0.0
-    assert _value(diagnostics, "resources_with_remaining_capacity") == []
-    assert "capacity" in _value(item, "diagnostic_message")
+    assert _value(rows["early"], "allocation_state") == "complete"
+    assert _value(rows["late"], "allocation_state") == "complete"
+    assert _iso(_value(rows["late"], "starts_at")) == "2026-05-13T10:00:00+00:00"
+    assert _iso(_value(rows["late"], "ends_at")) == "2026-05-13T12:00:00+00:00"
 
 
-@pytest.mark.parametrize(
-    ("blocked_policy", "blocked_state"),
-    [
-        ("exclude", "unallocated"),
-        ("include_as_zero_capacity", "blocked_zero_capacity"),
-    ],
-)
-def test_blocked_or_null_predecessor_prevents_successor_allocation(
-    blocked_policy: str,
-    blocked_state: str,
-):
+@pytest.mark.parametrize("blocked_policy", ["exclude", "include_as_zero_capacity"])
+def test_blockers_do_not_change_resource_schedule_timing(blocked_policy: str):
     data = _data(
         _compute_resource_schedule(
             _base_input(
@@ -1140,26 +1196,12 @@ def test_blocked_or_null_predecessor_prevents_successor_allocation(
     )
 
     rows = _rows_by_id(data)
-    unallocated = _unallocated_by_process(data)
-
-    assert _value(rows["blocked"], "allocation_state") == blocked_state
-    if blocked_policy == "include_as_zero_capacity":
-        assert _iso(_value(rows["blocked"], "ready_at")) == "2026-05-13T09:00:00+00:00"
-    assert _value(rows["blocked"], "starts_at") is None
-    assert _value(rows["blocked"], "ends_at") is None
-    assert _value(rows["successor"], "allocation_state") == "unallocated"
-    assert _value(rows["successor"], "ready_at") is None
-    assert _value(rows["successor"], "starts_at") is None
-    assert _value(rows["successor"], "ends_at") is None
-    assert _value(unallocated["successor"], "reason") == "predecessor_unallocated"
-    assert _value(unallocated["successor"], "first_feasible_starts_at") is None
-    assert not [
-        allocation
-        for allocation in data["allocation_slices"]
-        if _value(allocation, "process_id") == "blocked"
-    ]
-    if blocked_policy == "exclude":
-        assert _value(unallocated["blocked"], "reason") == "blocked"
+    assert _value(rows["blocked"], "allocation_state") == "complete"
+    assert _iso(_value(rows["blocked"], "starts_at")) == "2026-05-13T09:00:00+00:00"
+    assert _iso(_value(rows["blocked"], "ends_at")) == "2026-05-13T11:00:00+00:00"
+    assert _value(rows["successor"], "allocation_state") == "complete"
+    assert _iso(_value(rows["successor"], "ready_at")) == "2026-05-13T11:00:00+00:00"
+    assert _iso(_value(rows["successor"], "ends_at")) == "2026-05-13T12:00:00+00:00"
 
 
 def test_include_normally_schedules_blocked_process_and_successor():
@@ -1202,7 +1244,6 @@ def test_include_normally_schedules_blocked_process_and_successor():
     assert _iso(_value(rows["successor"], "ready_at")) == "2026-05-13T11:00:00+00:00"
     assert _iso(_value(rows["successor"], "starts_at")) == "2026-05-13T11:00:00+00:00"
     assert _iso(_value(rows["successor"], "ends_at")) == "2026-05-13T12:00:00+00:00"
-    assert data["unallocated_requirements"] == []
     assert {"blocked", "successor"}.issubset(allocated_process_ids)
 
 
@@ -1573,8 +1614,8 @@ def test_min_allocation_schedules_final_remaining_effort_below_minimum():
     ) == pytest.approx(1.0)
 
 
-def test_min_allocation_respects_max_daily_cap_and_resource_availability():
-    data = _data(
+def test_max_daily_cap_that_creates_working_gap_violates_continuity():
+    with pytest.raises(ValueError, match="resource-process continuity"):
         _compute_resource_schedule(
             _base_input(
                 processes=[_process("build")],
@@ -1591,30 +1632,6 @@ def test_min_allocation_respects_max_daily_cap_and_resource_availability():
                 ],
             )
         )
-    )
-
-    rows = _rows_by_id(data)
-    assert _value(rows["build"], "allocation_state") == "complete"
-    assert _iso(_value(rows["build"], "starts_at")) == "2026-05-13T11:00:00+00:00"
-    assert _iso(_value(rows["build"], "ends_at")) == "2026-05-14T11:00:00+00:00"
-    assert _allocated_effort_in_window(
-        data,
-        resource_id="res_alex",
-        starts_at=_at(13, 11),
-        ends_at=_at(13, 14),
-    ) == pytest.approx(3.0)
-    assert _allocated_effort_in_window(
-        data,
-        resource_id="res_alex",
-        starts_at=_at(13, 14),
-        ends_at=_at(13, 17),
-    ) == pytest.approx(0.0)
-    assert _allocated_effort_in_window(
-        data,
-        resource_id="res_alex",
-        starts_at=_at(14),
-        ends_at=_at(14, 11),
-    ) == pytest.approx(2.0)
 
 
 def test_split_allowed_can_combine_resources_but_contiguous_requires_one_sequence():
@@ -1683,15 +1700,10 @@ def test_split_allowed_can_combine_resources_but_contiguous_requires_one_sequenc
     )
 
     contiguous_rows = _rows_by_id(contiguous)
-    contiguous_unallocated = _unallocated_by_process(contiguous)
-    assert _value(contiguous_rows["build"], "allocation_state") == "unallocated"
-    assert _value(contiguous_rows["build"], "starts_at") is None
-    assert _value(contiguous_rows["build"], "ends_at") is None
-    assert (
-        _value(contiguous_unallocated["build"], "reason")
-        == "contiguous_window_unavailable"
-    )
-    assert contiguous["allocation_slices"] == []
+    assert _value(contiguous_rows["build"], "allocation_state") == "complete"
+    assert _iso(_value(contiguous_rows["build"], "starts_at")) == "2026-05-13T09:00:00+00:00"
+    assert _iso(_value(contiguous_rows["build"], "ends_at")) == "2026-05-14T13:00:00+00:00"
+    assert _allocation_effort_by_resource(contiguous) == {"res_alex": 8.0}
 
 
 def test_contiguous_policy_does_not_reserve_future_buckets_ahead_of_ready_split_work():
@@ -1714,7 +1726,7 @@ def test_contiguous_policy_does_not_reserve_future_buckets_ahead_of_ready_split_
 
     rows = _rows_by_id(data)
     assert _iso(_value(rows["split"], "ends_at")) == "2026-05-13T10:00:00+00:00"
-    assert _iso(_value(rows["contiguous"], "ends_at")) == "2026-05-14T17:00:00+00:00"
+    assert _iso(_value(rows["contiguous"], "ends_at")) == "2026-05-14T10:00:00+00:00"
 
 
 def test_multi_role_resource_uses_one_capacity_ledger_across_roles():
@@ -1815,8 +1827,8 @@ def test_multi_role_resource_breadth_first_slices_share_one_bucket_ledger():
     _assert_resource_utilization_never_exceeds_capacity(data)
 
 
-def test_successor_ready_at_is_null_when_predecessor_is_unallocated():
-    data = _data(
+def test_missing_role_fails_validation_instead_of_returning_unallocated_rows():
+    with pytest.raises(ValueError, match="missing_role"):
         _compute_resource_schedule(
             _base_input(
                 processes=[
@@ -1836,19 +1848,9 @@ def test_successor_ready_at_is_null_when_predecessor_is_unallocated():
                 ],
             )
         )
-    )
-
-    rows = _rows_by_id(data)
-    unallocated = _unallocated_by_process(data)
-    assert _value(rows["blocked_by_missing_role"], "ends_at") is None
-    assert _value(rows["successor"], "ready_at") is None
-    assert _value(rows["successor"], "starts_at") is None
-    assert _value(rows["successor"], "ends_at") is None
-    assert _value(unallocated["successor"], "reason") == "predecessor_unallocated"
-    assert _value(unallocated["successor"], "first_feasible_starts_at") is None
 
 
-def test_partial_row_keeps_ready_at_and_first_allocation_start_with_null_finish():
+def test_finite_initial_capacity_window_extends_until_process_finishes():
     data = _data(
         _compute_resource_schedule(
             _base_input(
@@ -1860,22 +1862,18 @@ def test_partial_row_keeps_ready_at_and_first_allocation_start_with_null_finish(
     )
 
     rows = _rows_by_id(data)
-    unallocated = _unallocated_by_process(data)
-
-    assert _value(rows["build"], "allocation_state") == "partial"
+    assert _value(rows["build"], "allocation_state") == "complete"
     assert _iso(_value(rows["build"], "ready_at")) == "2026-05-13T09:00:00+00:00"
     assert _iso(_value(rows["build"], "starts_at")) == "2026-05-13T09:00:00+00:00"
-    assert _value(rows["build"], "ends_at") is None
-    assert _value(unallocated["build"], "reason") == "resource_capacity_exhausted"
-    assert _value(rows["build"], "allocation_diagnostic")
+    assert _iso(_value(rows["build"], "ends_at")) == "2026-05-13T15:00:00+00:00"
     assert sum(
         float(_value(allocation, "effort_hours"))
         for allocation in data["allocation_slices"]
-    ) == 4.0
+    ) == 6.0
 
 
-def test_fully_unallocated_row_keeps_ready_at_when_dependencies_are_feasible():
-    data = _data(
+def test_unknown_required_role_fails_validation():
+    with pytest.raises(ValueError, match="missing_role"):
         _compute_resource_schedule(
             _base_input(
                 processes=[_process("build")],
@@ -1884,18 +1882,6 @@ def test_fully_unallocated_row_keeps_ready_at_when_dependencies_are_feasible():
                 ],
             )
         )
-    )
-
-    rows = _rows_by_id(data)
-    unallocated = _unallocated_by_process(data)
-
-    assert _value(rows["build"], "allocation_state") == "unallocated"
-    assert _iso(_value(rows["build"], "ready_at")) == "2026-05-13T09:00:00+00:00"
-    assert _value(rows["build"], "starts_at") is None
-    assert _value(rows["build"], "ends_at") is None
-    assert _value(unallocated["build"], "reason") == "missing_role"
-    assert _value(unallocated["build"], "message")
-    assert data["allocation_slices"] == []
 
 
 def test_convergence_fingerprint_ignores_slice_id_iteration_and_cost_amount():
@@ -2289,11 +2275,6 @@ def test_max_iteration_cap_returns_final_engine_output():
 
     rows = _rows_by_id(data)
     convergence = _optional_value(data, "convergence", {})
-    iteration_not_converged_requirement_ids = {
-        str(_value(unallocated, "requirement_id"))
-        for unallocated in data["unallocated_requirements"]
-        if _value(unallocated, "reason") == "iteration_not_converged"
-    }
 
     assert data["processes"]
     assert data["allocation_slices"]
@@ -2305,7 +2286,6 @@ def test_max_iteration_cap_returns_final_engine_output():
     assert "build" in _value(convergence, "changed_process_ids")
     assert _value(rows["design"], "allocation_state") == "complete"
     assert _value(rows["docs"], "allocation_state") == "complete"
-    assert iteration_not_converged_requirement_ids == {"req_build"}
 
 
 def test_resource_critical_path_uses_hour_bucket_finish_not_business_day_duration():
@@ -2472,7 +2452,6 @@ def test_resource_critical_path_can_differ_from_dependency_only_cpm():
 
     rows = _rows_by_id(data)
     assert data["converged"] is True
-    assert data["unallocated_requirements"] == []
     assert (
         _as_datetime(_value(rows["chain_b"], "dependency_only_ends_at"))
         > _as_datetime(_value(rows["solo_heavy"], "dependency_only_ends_at"))

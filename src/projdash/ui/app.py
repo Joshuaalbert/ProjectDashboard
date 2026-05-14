@@ -236,6 +236,24 @@ def _format_datetime_axis(axis: Any, timezone_name: str) -> None:
     axis.set_tick_params(labelrotation=30, labelsize=8)
 
 
+def _allocation_slice_span(
+    slices: list[dict[str, Any]],
+) -> tuple[str | None, str | None]:
+    starts = [
+        str(slice_data["starts_at"])
+        for slice_data in slices
+        if slice_data.get("starts_at")
+    ]
+    ends = [
+        str(slice_data["ends_at"])
+        for slice_data in slices
+        if slice_data.get("ends_at")
+    ]
+    if not starts or not ends:
+        return None, None
+    return min(starts), max(ends)
+
+
 def _role_effort_defaults(node: dict[str, Any]) -> dict[str, float]:
     defaults: dict[str, float] = {}
     for requirement in node.get("role_requirements") or []:
@@ -446,8 +464,9 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         },
     )
     schedule_data = base.get("resource_schedule") or {}
-    schedule_starts_at = schedule_data.get("horizon_starts_at")
-    schedule_ends_at = schedule_data.get("horizon_ends_at")
+    schedule_starts_at, schedule_ends_at = _allocation_slice_span(
+        schedule_data.get("allocation_slices", []),
+    )
     if schedule_starts_at and schedule_ends_at:
         base["capacity"] = _query(
             service,
@@ -1291,7 +1310,7 @@ def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]
     _render_heatmap(
         "Role utilization",
         *role_utilization_heatmap(
-            context.get("capacity") or {},
+            context.get("utilization") or {},
             context.get("resource_schedule") or {},
         ),
         timezone_name=controls["timezone"],
@@ -1900,15 +1919,6 @@ def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
     )
     st.dataframe(
         format_display_datetimes(schedule.get("processes", []), controls["timezone"]),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.subheader("Unallocated requirements")
-    st.dataframe(
-        format_display_datetimes(
-            schedule.get("unallocated_requirements", []),
-            controls["timezone"],
-        ),
         use_container_width=True,
         hide_index=True,
     )

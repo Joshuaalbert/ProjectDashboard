@@ -29,8 +29,6 @@ DISPLAY_DATETIME_KEYS = {
     "ef_at",
     "ends_at",
     "finished_at",
-    "horizon_ends_at",
-    "horizon_starts_at",
     "lf_at",
     "ls_at",
     "opened_at",

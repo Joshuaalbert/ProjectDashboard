@@ -15,7 +15,6 @@ from pydantic import (
 )
 
 from projdash.service.models import (
-    BlockedPolicy,
     CostGroupBy,
     PlanningGranularity,
     ProjectScope,
@@ -57,7 +56,6 @@ class ResourceOptionsMixin(StrictModel):
     planning_granularity: PlanningGranularity = PlanningGranularity.HOUR
     max_iterations: PositiveInt = 20
     convergence_tolerance_hours: NonNegativeFloat = 0
-    blocked_policy: BlockedPolicy = BlockedPolicy.INCLUDE_NORMALLY
 
 
 class HorizonMixin(StrictModel):
@@ -68,25 +66,6 @@ class HorizonMixin(StrictModel):
 
     @model_validator(mode="after")
     def _validate_horizon(self):
-        if self.horizon_ends_at <= self.horizon_starts_at:
-            raise ValueError("horizon_ends_at must be after horizon_starts_at.")
-        return self
-
-
-class OptionalHorizonMixin(StrictModel):
-    """Optional internal capacity search bounds for resource projections."""
-
-    horizon_starts_at: AwareDatetime | None = None
-    horizon_ends_at: AwareDatetime | None = None
-
-    @model_validator(mode="after")
-    def _validate_optional_horizon(self):
-        if self.horizon_starts_at is None and self.horizon_ends_at is None:
-            return self
-        if self.horizon_starts_at is None or self.horizon_ends_at is None:
-            raise ValueError(
-                "horizon_starts_at and horizon_ends_at must be supplied together."
-            )
         if self.horizon_ends_at <= self.horizon_starts_at:
             raise ValueError("horizon_ends_at must be after horizon_starts_at.")
         return self
@@ -113,7 +92,7 @@ class QueryCriticalPath(ScopedProcessQuery):
     action: Literal["query_critical_path"] = "query_critical_path"
 
 
-class QueryProcessGraph(QueryModel, ResourceOptionsMixin, OptionalHorizonMixin):
+class QueryProcessGraph(QueryModel, ResourceOptionsMixin):
     """Fetch process graph with dependency-only and optional resource fields."""
 
     action: Literal["query_process_graph"] = "query_process_graph"
@@ -126,13 +105,6 @@ class QueryProcessGraph(QueryModel, ResourceOptionsMixin, OptionalHorizonMixin):
 
     @model_validator(mode="after")
     def _validate_resource_options(self) -> QueryProcessGraph:
-        if not self.include_resource_fields and (
-            self.horizon_starts_at is not None or self.horizon_ends_at is not None
-        ):
-            raise ValueError(
-                "Resource horizon fields are only accepted when "
-                "include_resource_fields is true."
-            )
         if self.include_allocation_slices and not self.include_resource_fields:
             raise ValueError(
                 "include_allocation_slices is only accepted when "
@@ -175,7 +147,7 @@ class QueryScheduleSnapshots(QueryModel):
         return validate_unique_non_empty(value, "terminal_process_symbols")
 
 
-class QueryResourceSchedule(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
+class QueryResourceSchedule(QueryModel, ResourceOptionsMixin):
     """Compute resource-constrained schedule projection."""
 
     action: Literal["query_resource_schedule"] = "query_resource_schedule"
@@ -186,7 +158,7 @@ class QueryResourceSchedule(QueryModel, OptionalHorizonMixin, ResourceOptionsMix
     include_allocation_slices: bool = False
 
 
-class QueryUtilization(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
+class QueryUtilization(QueryModel, ResourceOptionsMixin):
     """Compute resource utilization aggregates."""
 
     action: Literal["query_utilization"] = "query_utilization"
@@ -196,7 +168,7 @@ class QueryUtilization(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
     scope: Scope | None = None
 
 
-class QueryCosts(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
+class QueryCosts(QueryModel, ResourceOptionsMixin):
     """Compute cost aggregates from resource allocation evidence."""
 
     action: Literal["query_costs"] = "query_costs"
@@ -272,16 +244,6 @@ class QueryResourceCapacity(QueryModel, HorizonMixin):
         return validate_unique_non_empty(value, "filter")
 
 
-class QueryUnallocatedRequirements(QueryModel, OptionalHorizonMixin, ResourceOptionsMixin):
-    """Return unallocated role requirements for a resource schedule."""
-
-    action: Literal["query_unallocated_requirements"] = "query_unallocated_requirements"
-    project_id: str = Field(min_length=1)
-    as_of: AwareDatetime
-    now: AwareDatetime
-    scope: Scope | None = None
-
-
 Query = Annotated[
     GetProject
     | QueryProjects
@@ -294,8 +256,7 @@ Query = Annotated[
     | QueryResourceSchedule
     | QueryUtilization
     | QueryCosts
-    | QueryResourceCapacity
-    | QueryUnallocatedRequirements,
+    | QueryResourceCapacity,
     Field(discriminator="action"),
 ]
 
@@ -321,7 +282,6 @@ __all__ = [
     "QueryResourceCapacity",
     "QueryResourceSchedule",
     "QuerySchedule",
-    "QueryUnallocatedRequirements",
     "QueryUtilization",
     "TargetProcessScope",
     "TopologyFilterScope",

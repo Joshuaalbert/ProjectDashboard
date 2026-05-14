@@ -33,14 +33,6 @@ def _at(day: int, hour: int = 9) -> dt.datetime:
     return dt.datetime(2026, 5, day, hour, tzinfo=UTC)
 
 
-def _resource_horizon() -> tuple[str, str, str]:
-    return (
-        _at(13, 0).isoformat(),
-        _at(20, 0).isoformat(),
-        _at(13, 12).isoformat(),
-    )
-
-
 def _result_model(name: str):
     model = getattr(result_models, name, None)
     assert model is not None, f"{name} result model is required by the DSL"
@@ -902,13 +894,10 @@ def test_resource_command_validation_rejects_invalid_values(payload):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "include_allocation_slices": True,
                     "planning_granularity": "hour",
                     "max_iterations": 5,
                     "convergence_tolerance_hours": 0.25,
-                    "blocked_policy": "include_normally",
                 }
             },
             "query_resource_schedule",
@@ -920,8 +909,6 @@ def test_resource_command_validation_rejects_invalid_values(payload):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                 }
             },
             "query_utilization",
@@ -933,8 +920,6 @@ def test_resource_command_validation_rejects_invalid_values(payload):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "currency": "USD",
                 }
             },
@@ -954,19 +939,6 @@ def test_resource_command_validation_rejects_invalid_values(payload):
             },
             "query_resource_capacity",
         ),
-        (
-            {
-                "query": {
-                    "action": "query_unallocated_requirements",
-                    "project_id": "project-alpha",
-                    "as_of": _at(13, 12).isoformat(),
-                    "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
-                }
-            },
-            "query_unallocated_requirements",
-        ),
     ],
 )
 def test_resource_query_envelopes_json_round_trip(payload, expected_action):
@@ -978,7 +950,7 @@ def test_resource_query_envelopes_json_round_trip(payload, expected_action):
 
 
 def test_resource_query_defaults_are_applied():
-    horizon_starts_at, horizon_ends_at, as_of = _resource_horizon()
+    as_of = _at(13, 12).isoformat()
 
     schedule = QueryEnvelope.model_validate(
         {
@@ -987,8 +959,6 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": as_of,
                 "now": as_of,
-                "horizon_starts_at": horizon_starts_at,
-                "horizon_ends_at": horizon_ends_at,
             }
         }
     )
@@ -999,14 +969,11 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": as_of,
                 "now": as_of,
-                "horizon_starts_at": horizon_starts_at,
-                "horizon_ends_at": horizon_ends_at,
             }
         }
     )
 
     assert schedule.query.planning_granularity == "hour"
-    assert schedule.query.blocked_policy == "include_normally"
     assert schedule.query.max_iterations == 20
     assert schedule.query.convergence_tolerance_hours == 0
     assert schedule.query.include_allocation_slices is False
@@ -1022,16 +989,13 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": "2026-05-13T12:00:00",
                 "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
             }
         },
         {
             "query": {
-                "action": "query_resource_schedule",
+                "action": "query_resource_capacity",
                 "project_id": "project-alpha",
                 "as_of": _at(13, 12).isoformat(),
-                "now": _at(13, 12).isoformat(),
                 "horizon_starts_at": _at(20, 0).isoformat(),
                 "horizon_ends_at": _at(13, 0).isoformat(),
             }
@@ -1042,8 +1006,6 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": _at(13, 12).isoformat(),
                 "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
                 "bucket_size": "hour",
             }
         },
@@ -1053,8 +1015,6 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": _at(13, 12).isoformat(),
                 "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
                 "planning_granularity": "day",
             }
         },
@@ -1064,8 +1024,6 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": _at(13, 12).isoformat(),
                 "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
                 "max_iterations": 0,
             }
         },
@@ -1075,20 +1033,7 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": _at(13, 12).isoformat(),
                 "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
                 "convergence_tolerance_hours": -0.1,
-            }
-        },
-        {
-            "query": {
-                "action": "query_resource_schedule",
-                "project_id": "project-alpha",
-                "as_of": _at(13, 12).isoformat(),
-                "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
-                "blocked_policy": "ignore",
             }
         },
         {
@@ -1097,8 +1042,6 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": _at(13, 12).isoformat(),
                 "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
                 "include_allocation_slices": True,
             }
         },
@@ -1108,8 +1051,6 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": _at(13, 12).isoformat(),
                 "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
                 "include_allocation_slices": True,
             }
         },
@@ -1119,8 +1060,6 @@ def test_resource_query_defaults_are_applied():
                 "project_id": "project-alpha",
                 "as_of": _at(13, 12).isoformat(),
                 "now": _at(13, 12).isoformat(),
-                "horizon_starts_at": _at(13, 0).isoformat(),
-                "horizon_ends_at": _at(20, 0).isoformat(),
                 "include_allocation_slices": True,
             }
         },
@@ -1822,10 +1761,7 @@ def test_new_command_envelopes_reject_strict_extra_fields(case):
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
                     "include_resource_fields": True,
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "include_allocation_slices": True,
-                    "blocked_policy": "include_as_zero_capacity",
                 }
             ),
         ),
@@ -1837,8 +1773,6 @@ def test_new_command_envelopes_reject_strict_extra_fields(case):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "scope": {
                         "type": "target_process",
                         "process_symbol": "build-api",
@@ -1896,26 +1830,24 @@ def test_new_query_payloads_round_trip(case):
             ),
         ),
         ApiCase(
-            "resource_schedule_naive_horizon_starts_at",
+            "resource_capacity_naive_horizon_starts_at",
             _query_payload(
                 {
-                    "action": "query_resource_schedule",
+                    "action": "query_resource_capacity",
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
-                    "now": _at(13, 12).isoformat(),
                     "horizon_starts_at": "2026-05-13T00:00:00",
                     "horizon_ends_at": _at(20, 0).isoformat(),
                 }
             ),
         ),
         ApiCase(
-            "resource_schedule_naive_horizon_ends_at",
+            "resource_capacity_naive_horizon_ends_at",
             _query_payload(
                 {
-                    "action": "query_resource_schedule",
+                    "action": "query_resource_capacity",
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
-                    "now": _at(13, 12).isoformat(),
                     "horizon_starts_at": _at(13, 0).isoformat(),
                     "horizon_ends_at": "2026-05-20T00:00:00",
                 }
@@ -1955,8 +1887,6 @@ def test_new_query_payloads_round_trip(case):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "resource_ids": [],
                 }
             ),
@@ -1969,8 +1899,6 @@ def test_new_query_payloads_round_trip(case):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "scope": {"type": "project"},
                     "target_process_id": "process-api",
                 }
@@ -1984,8 +1912,6 @@ def test_new_query_payloads_round_trip(case):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "unexpected": True,
                 }
             ),
@@ -2026,10 +1952,9 @@ def test_new_query_payloads_reject_invalid_inputs(case):
             "horizon_starts_at",
             _query_payload(
                 {
-                    "action": "query_resource_schedule",
+                    "action": "query_resource_capacity",
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
-                    "now": _at(13, 12).isoformat(),
                     "horizon_starts_at": "2026-05-13T00:00:00",
                     "horizon_ends_at": _at(20, 0).isoformat(),
                 }
@@ -2039,10 +1964,9 @@ def test_new_query_payloads_reject_invalid_inputs(case):
             "horizon_ends_at",
             _query_payload(
                 {
-                    "action": "query_resource_schedule",
+                    "action": "query_resource_capacity",
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
-                    "now": _at(13, 12).isoformat(),
                     "horizon_starts_at": _at(13, 0).isoformat(),
                     "horizon_ends_at": "2026-05-20T00:00:00",
                 }
@@ -2082,8 +2006,6 @@ def test_new_query_moments_reject_naive_datetimes(field_name, payload):
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
                     "include_resource_fields": True,
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "unexpected": True,
                 }
             ),
@@ -2096,8 +2018,6 @@ def test_new_query_moments_reject_naive_datetimes(field_name, payload):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "unexpected": True,
                 }
             ),
@@ -2110,8 +2030,6 @@ def test_new_query_moments_reject_naive_datetimes(field_name, payload):
                     "project_id": "project-alpha",
                     "as_of": _at(13, 12).isoformat(),
                     "now": _at(13, 12).isoformat(),
-                    "horizon_starts_at": _at(13, 0).isoformat(),
-                    "horizon_ends_at": _at(20, 0).isoformat(),
                     "unexpected": True,
                 }
             ),

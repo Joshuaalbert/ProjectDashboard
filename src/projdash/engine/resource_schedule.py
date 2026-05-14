@@ -86,7 +86,7 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
 
     Returns:
         Resource schedule data with process rows, optional allocation slices,
-        unallocated requirement reasons, critical path, and convergence metadata.
+        critical path, and convergence metadata.
     """
     options = dict(_mapping(input_data.get("options", {}), "options"))
     project_id = str(input_data["project_id"])
@@ -95,10 +95,12 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     now = _as_utc(input_data["now"])
     horizon_starts_at = _as_utc(options["horizon_starts_at"])
     horizon_ends_at = _as_utc(options["horizon_ends_at"])
+    capacity_search_attempt = int(options.get("_capacity_search_attempt", 0))
+    max_capacity_search_days = int(options.get("capacity_search_max_days", 36500))
     planning_granularity = str(options.get("planning_granularity", "hour"))
     max_iterations = int(options.get("max_iterations", 20))
     tolerance_hours = float(options.get("convergence_tolerance_hours", 0))
-    blocked_policy = str(options.get("blocked_policy", "include_normally"))
+    blocked_policy = "include_normally"
     include_slices = bool(options.get("include_allocation_slices", False))
 
     processes = [_mapping(item, "process") for item in _sequence(input_data["processes"])]
@@ -124,6 +126,13 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     active_role_ids = {
         str(role["role_id"]) for role in roles if bool(role.get("active", True))
     }
+    _validate_recurring_capacity_sources(
+        requirements=requirements,
+        processes_by_id={str(process["process_id"]): process for process in processes},
+        roles=roles,
+        resources=resources,
+        calendars=calendars,
+    )
     active_blocked_process_ids = _blocked_process_ids(blockers, as_of)
     resource_by_id = {str(resource["resource_id"]): resource for resource in resources}
     expanded_buckets = _expand_capacity_buckets(
@@ -177,6 +186,24 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     converged = bool(final_comparison["converged"])
     iteration_count = int(final_iteration["iteration_count"])
     unallocated = list(final_iteration["unallocated_requirements"])
+    if unallocated:
+        _raise_for_permanent_capacity_failures(unallocated)
+        next_horizon_ends_at = _next_capacity_search_end(
+            horizon_starts_at,
+            horizon_ends_at,
+        )
+        if (next_horizon_ends_at - horizon_starts_at).days > max_capacity_search_days:
+            raise ValueError(
+                "resource schedule did not finish after expanding recurring "
+                "calendar capacity over the internal safety limit"
+            )
+        extended_input = dict(input_data)
+        extended_options = dict(options)
+        extended_options["horizon_ends_at"] = next_horizon_ends_at
+        extended_options["_capacity_search_attempt"] = capacity_search_attempt + 1
+        extended_input["options"] = extended_options
+        return compute_resource_schedule(extended_input)
+
     warnings: list[dict[str, object]] = []
     if not converged:
         warnings.append(
@@ -202,6 +229,10 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
         horizon_starts_at=horizon_starts_at,
         horizon_ends_at=horizon_ends_at,
         options=options,
+    )
+    _validate_resource_process_continuity(
+        slices=all_slices,
+        buckets=expanded_buckets,
     )
     output_slices = all_slices if include_slices else []
     processes_out = list(final_iteration["processes"])
@@ -232,7 +263,6 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
         "processes": processes_out,
         "allocation_slices": output_slices,
         "critical_path_process_ids": critical_path,
-        "unallocated_requirements": unallocated,
         "converged": converged,
         "iteration_count": iteration_count,
         "convergence": {
@@ -369,10 +399,11 @@ def _run_allocation_iteration(
     iteration: int,
 ) -> dict[str, object]:
     ledger = _fresh_ledger(expanded_buckets)
-    daily_allocated: dict[tuple[str, str, str], float] = defaultdict(float)
+    daily_allocated: dict[tuple[str, str, str, str], float] = defaultdict(float)
+    active_streams: set[tuple[str, str, str]] = set()
     process_rows: dict[str, dict[str, object]] = {}
     requirement_states = {
-        str(requirement["requirement_id"]): _RequirementState(requirement=requirement)
+        _requirement_state_key(requirement): _RequirementState(requirement=requirement)
         for requirement in requirements_by_process.values()
         for requirement in requirement
     }
@@ -411,7 +442,10 @@ def _run_allocation_iteration(
             processes_by_id=processes_by_id,
             unallocated=unallocated,
         )
-        resources_used_by_requirement: dict[tuple[str, dt.datetime, dt.datetime], set[str]]
+        resources_used_by_requirement: dict[
+            tuple[str, str, dt.datetime, dt.datetime],
+            set[str],
+        ]
         resources_used_by_requirement = defaultdict(set)
         for bucket in sorted(
             (
@@ -440,6 +474,7 @@ def _run_allocation_iteration(
                 processes_by_id=processes_by_id,
                 ledger=ledger,
                 resources_used_by_requirement=resources_used_by_requirement,
+                active_streams=active_streams,
             )
             assignments = _water_fill_requirement_candidates(
                 candidates,
@@ -454,9 +489,16 @@ def _run_allocation_iteration(
                     daily_allocated,
                     candidate.requirement,
                 )
+                active_streams.add(
+                    _requirement_resource_key(candidate.requirement, bucket.resource_id)
+                )
+                process_id, requirement_id = _requirement_state_key(
+                    candidate.requirement
+                )
                 resources_used_by_requirement[
                     (
-                        str(candidate.requirement["requirement_id"]),
+                        process_id,
+                        requirement_id,
                         bucket.starts_at,
                         bucket.ends_at,
                     )
@@ -572,7 +614,7 @@ def _run_allocation_iteration(
 
 def _initialize_requirement_eligibility(
     *,
-    requirement_states: dict[str, _RequirementState],
+    requirement_states: dict[tuple[str, str], _RequirementState],
     active_role_ids: set[str],
     resources: list[Mapping[str, object]],
     expanded_buckets: tuple[_LedgerBucket, ...],
@@ -610,7 +652,7 @@ def _settle_ready_processes(
     closed_process_ids: set[str],
     cpm_by_id: dict[str, _ProcessCpm],
     requirements_by_process: dict[str, list[Mapping[str, object]]],
-    requirement_states: dict[str, _RequirementState],
+    requirement_states: dict[tuple[str, str], _RequirementState],
     blocked_process_ids: set[str],
     blocked_policy: str,
     project_start_at: dt.datetime,
@@ -636,6 +678,26 @@ def _settle_ready_processes(
                 continue
 
             process_requirements = requirements_by_process.get(process_id, [])
+            process = processes_by_id[process_id]
+            if (
+                str(process.get("explicit_status", "")) == "done"
+                or process.get("finished_at") is not None
+            ):
+                _finalize_done_process(
+                    process_id=process_id,
+                    ready_at=ready_at,
+                    process_rows=process_rows,
+                    cpm_by_id=cpm_by_id,
+                    processes_by_id=processes_by_id,
+                    requirement_ids=[
+                        str(requirement["requirement_id"])
+                        for requirement in process_requirements
+                    ],
+                )
+                completed_process_ids.add(process_id)
+                closed_process_ids.add(process_id)
+                made_progress = True
+                continue
             if process_id in blocked_process_ids and blocked_policy != "include_normally":
                 state = (
                     "blocked_zero_capacity"
@@ -671,7 +733,7 @@ def _settle_ready_processes(
                 continue
 
             for requirement in process_requirements:
-                state = requirement_states[str(requirement["requirement_id"])]
+                state = requirement_states[_requirement_state_key(requirement)]
                 state.ready_at = ready_at
 
 
@@ -681,21 +743,22 @@ def _ready_split_candidates_for_bucket(
     active_role_ids: set[str],
     resources: list[Mapping[str, object]],
     resource_by_id: dict[str, Mapping[str, object]],
-    daily_allocated: dict[tuple[str, str, str], float],
+    daily_allocated: dict[tuple[str, str, str, str], float],
     dependencies: dict[str, tuple[str, ...]],
     process_rows: dict[str, dict[str, object]],
     completed_process_ids: set[str],
     cpm_by_id: dict[str, _ProcessCpm],
     requirements_by_process: dict[str, list[Mapping[str, object]]],
-    requirement_states: dict[str, _RequirementState],
+    requirement_states: dict[tuple[str, str], _RequirementState],
     closed_process_ids: set[str],
     project_start_at: dt.datetime,
     processes_by_id: dict[str, Mapping[str, object]],
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
     resources_used_by_requirement: dict[
-        tuple[str, dt.datetime, dt.datetime],
+        tuple[str, str, dt.datetime, dt.datetime],
         set[str],
     ],
+    active_streams: set[tuple[str, str, str]],
 ) -> list[_RequirementCandidate]:
     candidates = []
     for process_id in cpm_by_id:
@@ -715,7 +778,8 @@ def _ready_split_candidates_for_bucket(
         for requirement in requirements_by_process.get(process_id, []):
             if str(requirement.get("allocation_policy", "split_allowed")) != "split_allowed":
                 continue
-            state = requirement_states[str(requirement["requirement_id"])]
+            requirement_key = _requirement_state_key(requirement)
+            state = requirement_states[requirement_key]
             if state.reason is not None:
                 continue
             remaining = float(requirement["effort_hours"]) - state.allocated_hours
@@ -728,12 +792,24 @@ def _ready_split_candidates_for_bucket(
             if bucket.resource_id not in eligible_resource_ids:
                 continue
             concurrency_key = (
-                str(requirement["requirement_id"]),
+                requirement_key[0],
+                requirement_key[1],
                 bucket.starts_at,
                 bucket.ends_at,
             )
             used_resources = resources_used_by_requirement[concurrency_key]
             required_count = max(1, int(requirement.get("required_resource_count", 1)))
+            active_resources = {
+                resource_id
+                for process_id, requirement_id, resource_id in active_streams
+                if (process_id, requirement_id) == requirement_key
+            }
+            if (
+                active_resources
+                and bucket.resource_id not in active_resources
+                and len(active_resources) >= required_count
+            ):
+                continue
             if (
                 bucket.resource_id not in used_resources
                 and len(used_resources) >= required_count
@@ -758,8 +834,8 @@ def _ready_split_candidates_for_bucket(
                     remaining=remaining,
                     ready_at=ready_at,
                 )
-                daily_key = (
-                    str(requirement["requirement_id"]),
+                daily_key = _daily_allocation_key(
+                    requirement,
                     bucket.resource_id,
                     bucket.local_date,
                 )
@@ -777,6 +853,7 @@ def _ready_split_candidates_for_bucket(
                 state.first_feasible_starts_at = feasible_start
             state.ready_at = ready_at
             cpm = cpm_by_id[process_id]
+            stream_key = _requirement_resource_key(requirement, bucket.resource_id)
             candidates.append(
                 _RequirementCandidate(
                     requirement=requirement,
@@ -786,6 +863,7 @@ def _ready_split_candidates_for_bucket(
                     ready_at=ready_at,
                     headroom_hours=headroom,
                     sort_key=(
+                        0 if stream_key in active_streams else 1,
                         ready_at,
                         cpm.topo_index,
                         process_id,
@@ -859,13 +937,13 @@ def _allocate_contiguous_ready_requirements(
     resources: list[Mapping[str, object]],
     resource_by_id: dict[str, Mapping[str, object]],
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
-    daily_allocated: dict[tuple[str, str, str], float],
+    daily_allocated: dict[tuple[str, str, str, str], float],
     dependencies: dict[str, tuple[str, ...]],
     process_rows: dict[str, dict[str, object]],
     completed_process_ids: set[str],
     cpm_by_id: dict[str, _ProcessCpm],
     requirements_by_process: dict[str, list[Mapping[str, object]]],
-    requirement_states: dict[str, _RequirementState],
+    requirement_states: dict[tuple[str, str], _RequirementState],
     project_start_at: dt.datetime,
     processes_by_id: dict[str, Mapping[str, object]],
     horizon_ends_at: dt.datetime,
@@ -891,7 +969,7 @@ def _allocate_contiguous_ready_requirements(
         for requirement in requirements_by_process.get(process_id, []):
             if str(requirement.get("allocation_policy", "split_allowed")) != "contiguous":
                 continue
-            state = requirement_states[str(requirement["requirement_id"])]
+            state = requirement_states[_requirement_state_key(requirement)]
             if state.reason is not None:
                 continue
             if state.allocated_hours + EPSILON >= float(requirement["effort_hours"]):
@@ -926,7 +1004,7 @@ def _complete_fulfilled_processes(
     completed_process_ids: set[str],
     closed_process_ids: set[str],
     requirements_by_process: dict[str, list[Mapping[str, object]]],
-    requirement_states: dict[str, _RequirementState],
+    requirement_states: dict[tuple[str, str], _RequirementState],
     cpm_by_id: dict[str, _ProcessCpm],
     process_rows: dict[str, dict[str, object]],
 ) -> None:
@@ -937,7 +1015,7 @@ def _complete_fulfilled_processes(
         if not requirements:
             continue
         if not all(
-            requirement_states[str(requirement["requirement_id"])].allocated_hours
+            requirement_states[_requirement_state_key(requirement)].allocated_hours
             + EPSILON
             >= float(requirement["effort_hours"])
             for requirement in requirements
@@ -965,7 +1043,7 @@ def _finalize_open_processes(
     closed_process_ids: set[str],
     cpm_by_id: dict[str, _ProcessCpm],
     requirements_by_process: dict[str, list[Mapping[str, object]]],
-    requirement_states: dict[str, _RequirementState],
+    requirement_states: dict[tuple[str, str], _RequirementState],
     project_start_at: dt.datetime,
     processes_by_id: dict[str, Mapping[str, object]],
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
@@ -990,17 +1068,6 @@ def _finalize_open_processes(
             )
             closed_process_ids.add(process_id)
             continue
-        if not requirements:
-            process_rows[process_id] = _process_row(
-                cpm=cpm_by_id[process_id],
-                ready_at=cpm_by_id[process_id].earliest_start_at,
-                starts_at=None,
-                ends_at=None,
-                allocation_state="unallocated",
-                requirement_ids=[],
-            )
-            closed_process_ids.add(process_id)
-            continue
         ready_at = _process_ready_at(
             process_id=process_id,
             dependencies=dependencies,
@@ -1010,8 +1077,39 @@ def _finalize_open_processes(
             project_start_at=project_start_at,
             processes_by_id=processes_by_id,
         )
+        if ready_at is None:
+            continue
+        process = processes_by_id[process_id]
+        if (
+            str(process.get("explicit_status", "")) == "done"
+            or process.get("finished_at") is not None
+        ):
+            _finalize_done_process(
+                process_id=process_id,
+                ready_at=ready_at,
+                process_rows=process_rows,
+                cpm_by_id=cpm_by_id,
+                processes_by_id=processes_by_id,
+                requirement_ids=[
+                    str(requirement["requirement_id"]) for requirement in requirements
+                ],
+            )
+            completed_process_ids.add(process_id)
+            closed_process_ids.add(process_id)
+            continue
+        if not requirements:
+            _finalize_no_requirement_process(
+                process_id=process_id,
+                ready_at=ready_at,
+                process_rows=process_rows,
+                cpm_by_id=cpm_by_id,
+                processes_by_id=processes_by_id,
+            )
+            completed_process_ids.add(process_id)
+            closed_process_ids.add(process_id)
+            continue
         for requirement in requirements:
-            state = requirement_states[str(requirement["requirement_id"])]
+            state = requirement_states[_requirement_state_key(requirement)]
             if state.ready_at is None and ready_at is not None:
                 state.ready_at = ready_at
             if state.allocated_hours + EPSILON >= float(requirement["effort_hours"]):
@@ -1031,7 +1129,7 @@ def _finalize_open_processes(
             process_rows=process_rows,
         )
         for requirement in requirements:
-            state = requirement_states[str(requirement["requirement_id"])]
+            state = requirement_states[_requirement_state_key(requirement)]
             if state.allocated_hours + EPSILON < float(requirement["effort_hours"]):
                 unallocated.append(
                     _unallocated_row(
@@ -1054,7 +1152,7 @@ def _allocate_requirement(
     resources: list[Mapping[str, object]],
     resource_by_id: dict[str, Mapping[str, object]],
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
-    daily_allocated: dict[tuple[str, str, str], float],
+    daily_allocated: dict[tuple[str, str, str, str], float],
     horizon_ends_at: dt.datetime,
     iteration: int,
 ) -> list[dict[str, object]]:
@@ -1127,7 +1225,7 @@ def _allocate_split(
     eligible: list[Mapping[str, object]],
     resource_by_id: dict[str, Mapping[str, object]],
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
-    daily_allocated: dict[tuple[str, str, str], float],
+    daily_allocated: dict[tuple[str, str, str, str], float],
     iteration: int,
 ) -> list[dict[str, object]]:
     remaining = float(requirement["effort_hours"])
@@ -1176,7 +1274,11 @@ def _allocate_split(
             if (
                 minimum
                 and daily_allocated[
-                    (str(requirement["requirement_id"]), bucket.resource_id, bucket.local_date)
+                    _daily_allocation_key(
+                        requirement,
+                        bucket.resource_id,
+                        bucket.local_date,
+                    )
                 ]
                 <= EPSILON
                 and block_headroom + EPSILON < minimum
@@ -1222,7 +1324,7 @@ def _allocate_contiguous(
     eligible: list[Mapping[str, object]],
     resource_by_id: dict[str, Mapping[str, object]],
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
-    daily_allocated: dict[tuple[str, str, str], float],
+    daily_allocated: dict[tuple[str, str, str, str], float],
     iteration: int,
 ) -> list[dict[str, object]]:
     effort = float(requirement["effort_hours"])
@@ -1244,7 +1346,12 @@ def _allocate_contiguous(
             sequence: list[tuple[_LedgerBucket, float]] = []
             previous_ends_at: dt.datetime | None = None
             for bucket in buckets[index:]:
-                if previous_ends_at is not None and bucket.starts_at != previous_ends_at:
+                if previous_ends_at is not None and _has_working_gap(
+                    resource_id=resource_id,
+                    buckets=buckets,
+                    previous_end=previous_ends_at,
+                    current_start=bucket.starts_at,
+                ):
                     break
                 headroom = _candidate_headroom(
                     requirement=requirement,
@@ -1283,6 +1390,22 @@ def _allocate_contiguous(
     return []
 
 
+def _has_working_gap(
+    *,
+    resource_id: str,
+    buckets: list[_LedgerBucket],
+    previous_end: dt.datetime,
+    current_start: dt.datetime,
+) -> bool:
+    return any(
+        bucket.resource_id == resource_id
+        and bucket.capacity_hours > EPSILON
+        and bucket.starts_at < current_start
+        and bucket.ends_at > previous_end
+        for bucket in buckets
+    )
+
+
 def _current_requirement_state(requirement: Mapping[str, object]) -> _RequirementState:
     state = requirement.get("_state")
     if isinstance(state, _RequirementState):
@@ -1319,14 +1442,14 @@ def _candidate_headroom(
     *,
     requirement: Mapping[str, object],
     bucket: _LedgerBucket,
-    daily_allocated: dict[tuple[str, str, str], float],
+    daily_allocated: dict[tuple[str, str, str, str], float],
     remaining: float,
     ready_at: dt.datetime,
 ) -> float:
     cap = requirement.get("max_allocation_hours_per_day")
     daily_residual = math.inf
     if cap is not None:
-        key = (str(requirement["requirement_id"]), bucket.resource_id, bucket.local_date)
+        key = _daily_allocation_key(requirement, bucket.resource_id, bucket.local_date)
         daily_residual = max(0.0, float(cap) - daily_allocated[key])
     available_after_ready = _bucket_capacity_after(bucket, ready_at)
     return max(
@@ -1340,7 +1463,7 @@ def _block_headroom(
     requirement: Mapping[str, object],
     bucket: _LedgerBucket,
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
-    daily_allocated: dict[tuple[str, str, str], float],
+    daily_allocated: dict[tuple[str, str, str, str], float],
     remaining: float,
     ready_at: dt.datetime,
 ) -> float:
@@ -1368,13 +1491,13 @@ def _block_headroom(
 def _consume_bucket(
     bucket: _LedgerBucket,
     amount: float,
-    daily_allocated: dict[tuple[str, str, str], float],
+    daily_allocated: dict[tuple[str, str, str, str], float],
     requirement: Mapping[str, object],
 ) -> None:
     bucket.remaining_hours = max(0.0, bucket.remaining_hours - amount)
     if bucket.remaining_hours < EPSILON:
         bucket.remaining_hours = 0.0
-    key = (str(requirement["requirement_id"]), bucket.resource_id, bucket.local_date)
+    key = _daily_allocation_key(requirement, bucket.resource_id, bucket.local_date)
     daily_allocated[key] += amount
 
 
@@ -1476,6 +1599,18 @@ def _with_slice_ids(
     horizon_ends_at: dt.datetime,
     options: Mapping[str, object],
 ) -> list[dict[str, object]]:
+    del horizon_starts_at, horizon_ends_at
+    stable_options = {
+        key: value
+        for key, value in options.items()
+        if key
+        not in {
+            "horizon_starts_at",
+            "horizon_ends_at",
+            "_capacity_search_attempt",
+            "capacity_search_max_days",
+        }
+    }
     ordinal_by_material_key: dict[tuple[object, ...], int] = defaultdict(int)
     output = []
     for item in slices:
@@ -1494,9 +1629,7 @@ def _with_slice_ids(
             "schema": 1,
             "project_id": project_id,
             "as_of": as_of.isoformat(),
-            "horizon_starts_at": horizon_starts_at.isoformat(),
-            "horizon_ends_at": horizon_ends_at.isoformat(),
-            "options": _json_safe(options),
+            "options": _json_safe(stable_options),
             "iteration": item["iteration"],
             "process_id": item["process_id"],
             "requirement_id": item["requirement_id"],
@@ -1513,6 +1646,54 @@ def _with_slice_ids(
         row["slice_id"] = f"slice_{digest}"
         output.append(row)
     return output
+
+
+def _validate_resource_process_continuity(
+    *,
+    slices: list[dict[str, object]],
+    buckets: tuple[_LedgerBucket, ...],
+) -> None:
+    """Ensure resource/process streams do not stop during working capacity."""
+    slices_by_stream: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
+    for allocation in slices:
+        slices_by_stream[
+            (
+                str(allocation["process_id"]),
+                str(allocation["requirement_id"]),
+                str(allocation["resource_id"]),
+            )
+        ].append(allocation)
+
+    buckets_by_resource: dict[str, list[_LedgerBucket]] = defaultdict(list)
+    for bucket in buckets:
+        if bucket.capacity_hours > EPSILON:
+            buckets_by_resource[bucket.resource_id].append(bucket)
+
+    for (process_id, requirement_id, resource_id), stream_slices in slices_by_stream.items():
+        ordered = sorted(
+            stream_slices,
+            key=lambda item: (
+                _as_utc(item["starts_at"]),
+                _as_utc(item["ends_at"]),
+            ),
+        )
+        for previous, current in zip(ordered, ordered[1:], strict=False):
+            previous_end = _as_utc(previous["ends_at"])
+            current_start = _as_utc(current["starts_at"])
+            if current_start <= previous_end:
+                continue
+            has_working_gap = any(
+                bucket.starts_at < current_start
+                and bucket.ends_at > previous_end
+                for bucket in buckets_by_resource.get(resource_id, [])
+            )
+            if has_working_gap:
+                raise ValueError(
+                    "resource schedule violates resource-process continuity: "
+                    f"{process_id}:{requirement_id}:{resource_id} has a working "
+                    f"calendar gap between {previous_end.isoformat()} and "
+                    f"{current_start.isoformat()}"
+                )
 
 
 def _collect_dependencies(
@@ -1592,10 +1773,13 @@ def _compute_cpm(
                 constraints.append(add_business_days(dependency_finish, delay_days))
             start = max(constraints)
         earliest_start[process_id] = start
-        earliest_finish[process_id] = add_business_days(
-            start,
-            int(process.get("duration_business_days", 0) or 0),
-        )
+        if process.get("finished_at") is not None:
+            earliest_finish[process_id] = _as_utc(process["finished_at"])
+        else:
+            earliest_finish[process_id] = add_business_days(
+                start,
+                int(process.get("duration_business_days", 0) or 0),
+            )
 
     completion_at = max(earliest_finish.values(), default=project_start)
     successors: dict[str, list[str]] = {process_id: [] for process_id in topo_order}
@@ -1608,6 +1792,11 @@ def _compute_cpm(
     slack: dict[str, int] = {}
     for process_id in reversed(topo_order):
         process = process_by_id[process_id]
+        if process.get("finished_at") is not None:
+            latest_start[process_id] = earliest_start[process_id]
+            latest_finish[process_id] = earliest_finish[process_id]
+            slack[process_id] = 0
+            continue
         if process.get("started_at") is not None:
             latest_start[process_id] = _as_utc(process["started_at"])
             latest_finish[process_id] = earliest_finish[process_id]
@@ -1682,6 +1871,98 @@ def _requirements_by_process(
     for process_requirements in grouped.values():
         process_requirements.sort(key=lambda item: str(item["requirement_id"]))
     return grouped
+
+
+def _requirement_state_key(requirement: Mapping[str, object]) -> tuple[str, str]:
+    return (
+        str(requirement["process_id"]),
+        str(requirement["requirement_id"]),
+    )
+
+
+def _requirement_resource_key(
+    requirement: Mapping[str, object],
+    resource_id: str,
+) -> tuple[str, str, str]:
+    process_id, requirement_id = _requirement_state_key(requirement)
+    return process_id, requirement_id, resource_id
+
+
+def _daily_allocation_key(
+    requirement: Mapping[str, object],
+    resource_id: str,
+    local_date: str,
+) -> tuple[str, str, str, str]:
+    process_id, requirement_id = _requirement_state_key(requirement)
+    return process_id, requirement_id, resource_id, local_date
+
+
+def _validate_recurring_capacity_sources(
+    *,
+    requirements: list[Mapping[str, object]],
+    processes_by_id: Mapping[str, Mapping[str, object]],
+    roles: list[Mapping[str, object]],
+    resources: list[Mapping[str, object]],
+    calendars: list[Mapping[str, object]],
+) -> None:
+    """Fail fast when a requirement has no possible recurring capacity source."""
+    active_role_ids = {
+        str(role["role_id"]) for role in roles if bool(role.get("active", True))
+    }
+    calendar_by_id = {
+        str(calendar["calendar_id"]): calendar
+        for calendar in calendars
+        if bool(calendar.get("active", True))
+    }
+    failures: list[str] = []
+    for requirement in requirements:
+        process = processes_by_id.get(str(requirement["process_id"]), {})
+        if _is_done_process(process):
+            continue
+        role_id = str(requirement["role_id"])
+        key = (
+            f"{requirement.get('process_id')}:{requirement.get('requirement_id')}"
+        )
+        if role_id not in active_role_ids:
+            failures.append(f"{key} missing_role")
+            continue
+        eligible = _eligible_resources(requirement, active_role_ids, resources)
+        if not eligible:
+            failures.append(f"{key} no_eligible_resource")
+            continue
+        recurring_sources = [
+            resource
+            for resource in eligible
+            if _resource_has_recurring_capacity(resource, calendar_by_id)
+        ]
+        if not recurring_sources:
+            failures.append(f"{key} no_calendar_capacity")
+    if failures:
+        raise ValueError(
+            "resource schedule cannot be solved: " + "; ".join(failures)
+        )
+
+
+def _resource_has_recurring_capacity(
+    resource: Mapping[str, object],
+    calendar_by_id: dict[str, Mapping[str, object]],
+) -> bool:
+    calendar = calendar_by_id.get(str(resource.get("calendar_id")))
+    if calendar is None:
+        return False
+    for window in _sequence(calendar.get("weekly_windows", ())):
+        if not isinstance(window, Mapping):
+            continue
+        if float(window.get("capacity_hours", 0) or 0) > EPSILON:
+            return True
+    return False
+
+
+def _is_done_process(process: Mapping[str, object]) -> bool:
+    return (
+        str(process.get("explicit_status", "")) == "done"
+        or process.get("finished_at") is not None
+    )
 
 
 def _blocked_process_ids(
@@ -1983,15 +2264,43 @@ def _finalize_no_requirement_process(
     )
 
 
+def _finalize_done_process(
+    *,
+    process_id: str,
+    ready_at: dt.datetime,
+    process_rows: dict[str, dict[str, object]],
+    cpm_by_id: dict[str, _ProcessCpm],
+    processes_by_id: dict[str, Mapping[str, object]],
+    requirement_ids: list[str],
+) -> None:
+    process = processes_by_id[process_id]
+    starts_at = _as_utc(process["started_at"]) if process.get("started_at") else ready_at
+    ends_at = (
+        _as_utc(process["finished_at"])
+        if process.get("finished_at") is not None
+        else max(starts_at, ready_at)
+    )
+    process_rows[process_id] = _process_row(
+        cpm=cpm_by_id[process_id],
+        ready_at=ready_at,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        allocation_state="complete",
+        requirement_ids=requirement_ids,
+    )
+
+
 def _finalize_process_with_requirements(
     *,
     process_id: str,
     requirements: list[Mapping[str, object]],
-    states: dict[str, _RequirementState],
+    states: dict[tuple[str, str], _RequirementState],
     cpm_by_id: dict[str, _ProcessCpm],
     process_rows: dict[str, dict[str, object]],
 ) -> None:
-    process_states = [states[str(requirement["requirement_id"])] for requirement in requirements]
+    process_states = [
+        states[_requirement_state_key(requirement)] for requirement in requirements
+    ]
     starts = [state.starts_at for state in process_states if state.starts_at is not None]
     ready_values = [state.ready_at for state in process_states if state.ready_at is not None]
     complete = all(
@@ -2131,6 +2440,41 @@ def _reason_message(reason: str) -> str:
         "contiguous_window_unavailable": "No single resource has a contiguous window.",
         "iteration_not_converged": "The final iteration changed before convergence.",
     }.get(reason, reason)
+
+
+def _raise_for_permanent_capacity_failures(
+    unallocated: list[dict[str, object]],
+) -> None:
+    permanent_reasons = {
+        "missing_role",
+        "no_eligible_resource",
+        "contiguous_window_unavailable",
+        "blocked",
+    }
+    failures = [
+        item
+        for item in unallocated
+        if str(item.get("reason")) in permanent_reasons
+    ]
+    if not failures:
+        return
+    details = "; ".join(
+        (
+            f"{item.get('process_id')}:{item.get('requirement_id')} "
+            f"{item.get('reason')}"
+        )
+        for item in failures
+    )
+    raise ValueError(f"resource schedule cannot be solved: {details}")
+
+
+def _next_capacity_search_end(
+    horizon_starts_at: dt.datetime,
+    horizon_ends_at: dt.datetime,
+) -> dt.datetime:
+    current_days = max(1, math.ceil((horizon_ends_at - horizon_starts_at).days))
+    next_days = max(current_days * 2, current_days + 7)
+    return horizon_starts_at + dt.timedelta(days=next_days)
 
 
 def _requirement_diagnostics(
@@ -2445,7 +2789,10 @@ def _attach_resource_schedule_windows(
         duration = max(ends_at - starts_at, dt.timedelta())
         row["inferred_duration_hours"] = round(duration.total_seconds() / 3600, 6)
         process = process_by_id.get(process_id, {})
-        if process.get("started_at") is not None:
+        if process.get("finished_at") is not None:
+            ls_at = starts_at
+            lf_at = ends_at
+        elif process.get("started_at") is not None:
             ls_at = _as_utc(process["started_at"])
             lf_at = ls_at + duration
         else:

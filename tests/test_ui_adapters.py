@@ -576,24 +576,6 @@ def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
             },
         ]
     }
-    capacity = {
-        "buckets": [
-            {
-                "starts_at": "2026-05-13T09:00:00+00:00",
-                "ends_at": "2026-05-13T10:00:00+00:00",
-                "resource_id": "res_a",
-                "role_ids": ["role_dev"],
-                "capacity_hours": 1,
-            },
-            {
-                "starts_at": "2026-05-13T10:00:00+00:00",
-                "ends_at": "2026-05-13T11:00:00+00:00",
-                "resource_id": "res_a",
-                "role_ids": ["role_dev"],
-                "capacity_hours": 1,
-            },
-        ]
-    }
     schedule = {
         "allocation_slices": [
             {
@@ -607,7 +589,7 @@ def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
     resource_labels, resource_times, resource_matrix = resource_utilization_heatmap(
         utilization,
     )
-    role_labels, role_times, role_matrix = role_utilization_heatmap(capacity, schedule)
+    role_labels, role_times, role_matrix = role_utilization_heatmap(utilization, schedule)
 
     assert resource_labels == ["res_a"]
     assert [time.hour for time in resource_times] == [9, 10]

@@ -74,7 +74,6 @@ from projdash.service.queries import (
     QueryResourceSchedule,
     QuerySchedule,
     QueryScheduleSnapshots,
-    QueryUnallocatedRequirements,
     QueryUtilization,
 )
 from projdash.service.repository import ProjectRepository
@@ -737,16 +736,6 @@ class ProjectService:
             data, warnings = self._resource_schedule_data(query)
         elif isinstance(query, QueryResourceCapacity):
             data = self._capacity_data(query)
-        elif isinstance(query, QueryUnallocatedRequirements):
-            schedule, warnings = self._resource_schedule_data(query)
-            data = {
-                "project_id": query.project_id,
-                "as_of": query.as_of.isoformat(),
-                "horizon_starts_at": schedule["horizon_starts_at"],
-                "horizon_ends_at": schedule["horizon_ends_at"],
-                "planning_granularity": self._enum_value(query.planning_granularity),
-                "unallocated_requirements": schedule["unallocated_requirements"],
-            }
         elif isinstance(query, QueryUtilization):
             data, warnings = self._utilization_data(query)
         elif isinstance(query, QueryCosts):
@@ -814,9 +803,10 @@ class ProjectService:
             scope=scope,
             include_allocation_slices=False,
         )
-        schedule, _warnings = self._resource_schedule_data(schedule_query)
-        horizon_starts_at = self._parse_datetime(schedule["horizon_starts_at"])
-        horizon_ends_at = self._parse_datetime(schedule["horizon_ends_at"])
+        schedule = self._compute_resource_schedule(
+            schedule_query,
+            include_allocation_slices=False,
+        )
         process_rows = list(schedule["processes"])
         terminal_process_ids = self._terminal_process_ids(
             command.project_id,
@@ -846,10 +836,7 @@ class ProjectService:
             terminal_process_symbols=terminal_symbols,
             schedule_basis=ScheduleBasis.RESOURCE_AWARE,
             completion_at=completion_at,
-            horizon_starts_at=horizon_starts_at,
-            horizon_ends_at=horizon_ends_at,
             converged=schedule.get("converged"),
-            unallocated_count=len(schedule.get("unallocated_requirements", [])),
             note=command.note,
         )
         recorder = getattr(self._repository, "record_schedule_snapshot", None)
@@ -949,7 +936,7 @@ class ProjectService:
                 next_days = current_days * 2
             else:
                 next_days = int(current_days * max(2.0, total_effort_hours / capacity_hours))
-            horizon_end = horizon_start + dt.timedelta(days=min(next_days + 7, 3650))
+            horizon_end = horizon_start + dt.timedelta(days=min(next_days + 7, 36500))
         return horizon_end
 
     def _terminal_scope_data(
@@ -1302,12 +1289,6 @@ class ProjectService:
             return "canceled"
         if is_blocked:
             return "blocked"
-        if allocation_state == "blocked_zero_capacity":
-            return "blocked_zero_capacity"
-        if allocation_state == "unallocated":
-            return "unallocated"
-        if allocation_state == "partial":
-            return "partial"
         if now >= latest_start_at:
             return "late_risk"
         if earliest_start_at <= now < latest_start_at:
@@ -1328,8 +1309,6 @@ class ProjectService:
             return "canceled"
         if is_blocked:
             return "blocked"
-        if allocation_state in {"partial", "unallocated", "blocked_zero_capacity"}:
-            return allocation_state
         return fallback_status
 
     def _blocker_summary_by_process(
@@ -1517,6 +1496,8 @@ class ProjectService:
         warnings = self._resource_warnings(data, query.max_iterations)
         if not include_slices:
             data["allocation_slices"] = []
+        data.pop("horizon_starts_at", None)
+        data.pop("horizon_ends_at", None)
         return data, warnings
 
     def _compute_resource_schedule(
@@ -1529,10 +1510,16 @@ class ProjectService:
             query,
             include_allocation_slices=include_allocation_slices,
         )
-        if self._resource_scheduler is not None:
-            schedule = self._resource_scheduler(scheduler_input)
-        else:
-            schedule = compute_resource_schedule(scheduler_input)
+        try:
+            if self._resource_scheduler is not None:
+                schedule = self._resource_scheduler(scheduler_input)
+            else:
+                schedule = compute_resource_schedule(scheduler_input)
+        except ValueError as exc:
+            raise ServiceValidationError(
+                code="resource_schedule_unsatisfiable",
+                message=str(exc),
+            ) from exc
         return self._normalize_schedule_dict(schedule)
 
     def _resource_schedule_input(
@@ -1594,6 +1581,11 @@ class ProjectService:
                     ),
                     "started_at": (
                         getattr(process, "started_at", None)
+                        if process is not None
+                        else None
+                    ),
+                    "finished_at": (
+                        getattr(process, "finished_at", None)
                         if process is not None
                         else None
                     ),
@@ -1688,7 +1680,7 @@ class ProjectService:
                 "planning_granularity": self._enum_value(query.planning_granularity),
                 "max_iterations": query.max_iterations,
                 "convergence_tolerance_hours": query.convergence_tolerance_hours,
-                "blocked_policy": self._enum_value(query.blocked_policy),
+                "blocked_policy": "include_normally",
                 "include_allocation_slices": include_allocation_slices,
             },
         }
@@ -1698,456 +1690,13 @@ class ProjectService:
         query,
         scope: dict[str, object] | None,
     ) -> tuple[dt.datetime, dt.datetime]:
-        starts_at = getattr(query, "horizon_starts_at", None)
-        ends_at = getattr(query, "horizon_ends_at", None)
-        if starts_at is not None and ends_at is not None:
-            return starts_at, ends_at
         return self._snapshot_horizon(query.project_id, query.as_of, scope)
-
-    def _fallback_resource_schedule(self, query) -> dict[str, object]:
-        schedule_input = self._repository.get_project_schedule_input(
-            query.project_id,
-            query.as_of,
-        )
-        projection = compute_schedule(schedule_input, query.now)
-        horizon_starts_at, horizon_ends_at = self._resource_schedule_window(
-            query,
-            getattr(query, "scope", None),
-        )
-        buckets = self._expanded_capacity(
-            query.project_id,
-            horizon_starts_at,
-            horizon_ends_at,
-            None,
-            None,
-        )
-        ledger = {
-            (
-                bucket["resource_id"],
-                bucket["starts_at"],
-                bucket["ends_at"],
-            ): bucket
-            for bucket in buckets
-        }
-        processes = getattr(self._repository, "processes", {})
-        resources = getattr(self._repository, "resources", {})
-        roles = getattr(self._repository, "roles", {})
-        blockers = self._blocker_summary_by_process(query.project_id, query.as_of)
-        schedule_rows = []
-        allocation_slices = []
-        unallocated = []
-        finish_by_process: dict[str, dt.datetime | None] = {}
-        starts_by_process: dict[str, dt.datetime | None] = {}
-        ready_by_process: dict[str, dt.datetime | None] = {}
-        for row in projection.rows:
-            revision = self._repository.selected_revision_as_of(
-                query.project_id,
-                row.process_id,
-                query.as_of,
-            )
-            requirements = list(revision.role_requirements if revision else [])
-            requirement_ids = [
-                requirement.requirement_id or f"requirement-{index + 1}"
-                for index, requirement in enumerate(requirements)
-            ]
-            predecessor_finishes = [
-                finish_by_process.get(predecessor_id)
-                for predecessor_id in row.dependencies
-            ]
-            if any(finish is None for finish in predecessor_finishes):
-                ready_at = None
-                for requirement in requirements:
-                    unallocated.append(
-                        self._unallocated_json(
-                            query.project_id,
-                            row.process_id,
-                            requirement,
-                            "predecessor_unallocated",
-                            requirement.effort_hours,
-                            0,
-                            [],
-                            None,
-                        )
-                    )
-                allocation_state = "unallocated"
-                starts_at = None
-                ends_at = None
-            else:
-                if predecessor_finishes:
-                    ready_at = max(f for f in predecessor_finishes if f is not None)
-                else:
-                    ready_at = row.earliest_start_at
-                if ready_at < horizon_starts_at:
-                    ready_at = horizon_starts_at
-                is_blocked = bool(blockers.get(row.process_id, {}).get("blocking_count"))
-                blocked_policy = self._enum_value(query.blocked_policy)
-                if is_blocked and blocked_policy != "include_normally":
-                    allocation_state = (
-                        "blocked_zero_capacity"
-                        if blocked_policy == "include_as_zero_capacity"
-                        else "unallocated"
-                    )
-                    starts_at = None
-                    ends_at = None
-                    for requirement in requirements:
-                        unallocated.append(
-                            self._unallocated_json(
-                                query.project_id,
-                                row.process_id,
-                                requirement,
-                                "blocked",
-                                requirement.effort_hours,
-                                0,
-                                [],
-                                None,
-                            )
-                        )
-                elif not requirements:
-                    allocation_state = "complete"
-                    starts_at = ready_at
-                    ends_at = max(row.earliest_finish_at, ready_at)
-                else:
-                    req_starts = []
-                    req_finishes = []
-                    allocated_any = False
-                    all_complete = True
-                    for requirement in requirements:
-                        req_id = requirement.requirement_id or new_id()
-                        role = roles.get(requirement.role_id)
-                        if role is None or not role["active"]:
-                            unallocated.append(
-                                self._unallocated_json(
-                                    query.project_id,
-                                    row.process_id,
-                                    requirement,
-                                    "missing_role",
-                                    requirement.effort_hours,
-                                    0,
-                                    [],
-                                    None,
-                                )
-                            )
-                            all_complete = False
-                            continue
-                        eligible_ids = [
-                            resource_id
-                            for resource_id, resource in resources.items()
-                            if resource["project_id"] == query.project_id
-                            and resource["active"]
-                            and requirement.role_id in resource["role_ids"]
-                        ]
-                        if not eligible_ids:
-                            unallocated.append(
-                                self._unallocated_json(
-                                    query.project_id,
-                                    row.process_id,
-                                    requirement,
-                                    "no_eligible_resource",
-                                    requirement.effort_hours,
-                                    0,
-                                    [],
-                                    None,
-                                )
-                            )
-                            all_complete = False
-                            continue
-                        allocated, first_start, finish = self._allocate_requirement(
-                            query,
-                            row.process_id,
-                            req_id,
-                            requirement,
-                            ready_at,
-                            sorted(eligible_ids),
-                            ledger,
-                            allocation_slices,
-                        )
-                        if allocated > 0:
-                            allocated_any = True
-                            req_starts.append(first_start)
-                        if finish is not None:
-                            req_finishes.append(finish)
-                        remaining = max(float(requirement.effort_hours) - allocated, 0)
-                        if remaining > 0.0001:
-                            reason = "horizon_exhausted"
-                            if not any(
-                                key[0] in eligible_ids and bucket["capacity_hours"] > 0
-                                for key, bucket in ledger.items()
-                            ):
-                                reason = "no_calendar_capacity"
-                            unallocated.append(
-                                self._unallocated_json(
-                                    query.project_id,
-                                    row.process_id,
-                                    requirement,
-                                    reason,
-                                    remaining,
-                                    allocated,
-                                    eligible_ids,
-                                    first_start,
-                                )
-                            )
-                            all_complete = False
-                    if all_complete:
-                        allocation_state = "complete"
-                        starts_at = min(req_starts) if req_starts else ready_at
-                        ends_at = max(req_finishes) if req_finishes else ready_at
-                    elif allocated_any:
-                        allocation_state = "partial"
-                        starts_at = min(req_starts) if req_starts else None
-                        ends_at = None
-                    else:
-                        allocation_state = "unallocated"
-                        starts_at = None
-                        ends_at = None
-            ready_by_process[row.process_id] = ready_at
-            starts_by_process[row.process_id] = starts_at
-            finish_by_process[row.process_id] = ends_at
-            delay_hours = 0
-            if ends_at is not None:
-                delay_hours = max(
-                    (ends_at - row.earliest_finish_at).total_seconds() / 3600,
-                    0,
-                )
-            process = processes.get(row.process_id)
-            schedule_rows.append(
-                {
-                    "process_id": row.process_id,
-                    "name": row.name,
-                    "description": revision.description if revision else "",
-                    "ready_at": ready_at.isoformat() if ready_at else None,
-                    "starts_at": starts_at.isoformat() if starts_at else None,
-                    "ends_at": ends_at.isoformat() if ends_at else None,
-                    "dependency_only_starts_at": row.earliest_start_at.isoformat(),
-                    "dependency_only_ends_at": row.earliest_finish_at.isoformat(),
-                    "resource_delay_hours": delay_hours,
-                    "allocation_state": allocation_state,
-                    "allocation_diagnostic": None,
-                    "status": row.explicit_status,
-                    "finished_at": (
-                        process.finished_at.isoformat()
-                        if process is not None and process.finished_at
-                        else None
-                    ),
-                    "requirement_ids": requirement_ids,
-                }
-            )
-        converged = query.max_iterations > 1
-        critical_path = self._resource_critical_path(
-            projection,
-            ready_by_process,
-            finish_by_process,
-            query.convergence_tolerance_hours,
-        )
-        changed_process_ids = [] if converged else [
-            row.process_id for row in projection.rows
-        ]
-        return {
-            "project_id": query.project_id,
-            "as_of": query.as_of.isoformat(),
-            "now": query.now.isoformat(),
-            "horizon_starts_at": horizon_starts_at.isoformat(),
-            "horizon_ends_at": horizon_ends_at.isoformat(),
-            "planning_granularity": self._enum_value(query.planning_granularity),
-            "processes": schedule_rows,
-            "allocation_slices": allocation_slices,
-            "critical_path_process_ids": critical_path,
-            "unallocated_requirements": unallocated,
-            "converged": converged,
-            "iteration_count": 1,
-            "convergence": {
-                "converged": converged,
-                "iteration_count": 1,
-                "max_iterations": query.max_iterations,
-                "tolerance_hours": query.convergence_tolerance_hours,
-                "changed_process_ids": changed_process_ids,
-                "reason_changes": [],
-                "allocation_fingerprint_changed": False,
-            },
-        }
-
-    def _allocate_requirement(
-        self,
-        query,
-        process_id: str,
-        requirement_id: str,
-        requirement,
-        ready_at: dt.datetime,
-        eligible_resource_ids: list[str],
-        ledger: dict[tuple[str, dt.datetime, dt.datetime], dict[str, Any]],
-        allocation_slices: list[dict[str, object]],
-    ) -> tuple[float, dt.datetime | None, dt.datetime | None]:
-        remaining = float(requirement.effort_hours)
-        allocated = 0.0
-        first_start = None
-        finish = None
-        for key in sorted(ledger, key=lambda item: (item[1], item[2], item[0])):
-            resource_id, starts_at, ends_at = key
-            bucket = ledger[key]
-            if resource_id not in eligible_resource_ids or ends_at <= ready_at:
-                continue
-            if bucket["remaining_hours"] <= 0.0001 or remaining <= 0.0001:
-                continue
-            slice_start = max(starts_at, ready_at)
-            if slice_start >= ends_at:
-                continue
-            available_fraction = (
-                (ends_at - slice_start).total_seconds()
-                / (ends_at - starts_at).total_seconds()
-            )
-            capacity = min(bucket["remaining_hours"] * available_fraction, remaining)
-            if capacity <= 0.0001:
-                continue
-            resources = getattr(self._repository, "resources", {})
-            resource = resources.get(resource_id, {})
-            currency = resource.get("cost_currency")
-            slice_id = (
-                f"slice-{process_id}-{requirement_id}-{resource_id}-"
-                f"{len(allocation_slices) + 1}"
-            )
-            allocation_slices.append(
-                {
-                    "slice_id": slice_id,
-                    "project_id": query.project_id,
-                    "process_id": process_id,
-                    "requirement_id": requirement_id,
-                    "role_id": requirement.role_id,
-                    "resource_id": resource_id,
-                    "starts_at": slice_start.isoformat(),
-                    "ends_at": ends_at.isoformat(),
-                    "effort_hours": self._clean_number(capacity),
-                    "capacity_hours": self._clean_number(capacity),
-                    "cost_amount": None,
-                    "cost_currency": currency,
-                    "iteration": 1,
-                }
-            )
-            bucket["allocated_hours"] += capacity
-            bucket["remaining_hours"] -= capacity
-            allocated += capacity
-            remaining -= capacity
-            first_start = first_start or slice_start
-            finish = ends_at
-            if remaining <= 0.0001:
-                break
-        return allocated, first_start, finish if remaining <= 0.0001 else None
-
-    def _unallocated_json(
-        self,
-        project_id: str,
-        process_id: str,
-        requirement,
-        reason: str,
-        remaining_effort_hours: float,
-        allocated_effort_hours: float,
-        eligible_resource_ids: list[str],
-        first_feasible_starts_at: dt.datetime | None,
-    ) -> dict[str, object]:
-        messages = {
-            "missing_role": "Required role is inactive or missing.",
-            "no_eligible_resource": "No active resource can fill the required role.",
-            "no_calendar_capacity": "Eligible resources have no capacity in horizon.",
-            "resource_capacity_exhausted": (
-                "Eligible resources exist but capacity in horizon is exhausted."
-            ),
-            "blocked": "Process is blocked as of the query.",
-            "predecessor_unallocated": "A dependency predecessor is unallocated.",
-            "horizon_exhausted": "Horizon ends before remaining effort can be allocated.",
-        }
-        required_effort_hours = remaining_effort_hours + allocated_effort_hours
-        message = messages.get(reason, reason.replace("_", " "))
-        return {
-            "project_id": project_id,
-            "process_id": process_id,
-            "requirement_id": requirement.requirement_id or "",
-            "role_id": requirement.role_id,
-            "reason": reason,
-            "message": message,
-            "diagnostic_message": message,
-            "required_effort_hours": self._clean_number(required_effort_hours),
-            "remaining_effort_hours": self._clean_number(remaining_effort_hours),
-            "allocated_effort_hours": self._clean_number(allocated_effort_hours),
-            "eligible_resource_ids": eligible_resource_ids,
-            "first_feasible_starts_at": (
-                first_feasible_starts_at.isoformat()
-                if first_feasible_starts_at is not None
-                else None
-            ),
-            "diagnostics": {
-                "eligible_resource_count": len(eligible_resource_ids),
-                "eligible_resource_ids": eligible_resource_ids,
-                "remaining_effort_hours": self._clean_number(remaining_effort_hours),
-                "allocated_effort_hours": self._clean_number(allocated_effort_hours),
-            },
-        }
-
-    def _resource_critical_path(
-        self,
-        projection,
-        ready_by_process: dict[str, dt.datetime | None],
-        finish_by_process: dict[str, dt.datetime | None],
-        tolerance_hours: float,
-    ) -> list[str]:
-        finished = [
-            row for row in projection.rows if finish_by_process.get(row.process_id) is not None
-        ]
-        if not finished:
-            return []
-        topological_index = {
-            row.process_id: index for index, row in enumerate(projection.rows)
-        }
-        terminal = max(
-            finished,
-            key=lambda row: (
-                finish_by_process[row.process_id],
-                -topological_index[row.process_id],
-                row.process_id,
-            ),
-        )
-        path = [terminal.process_id]
-        current = terminal
-        tolerance = dt.timedelta(hours=float(tolerance_hours))
-        rows_by_id = {row.process_id: row for row in projection.rows}
-        while True:
-            if current.dependencies:
-                predecessor_id = max(
-                    current.dependencies,
-                    key=lambda item: finish_by_process.get(item) or dt.datetime.min.replace(
-                        tzinfo=dt.UTC,
-                    ),
-                )
-                current = rows_by_id[predecessor_id]
-                path.append(current.process_id)
-                continue
-            ready_at = ready_by_process.get(current.process_id)
-            if ready_at is None:
-                break
-            gating = []
-            for predecessor_id in current.dependencies:
-                predecessor_finish = finish_by_process.get(predecessor_id)
-                if predecessor_finish is None:
-                    continue
-                if abs(predecessor_finish - ready_at) <= tolerance:
-                    predecessor = rows_by_id[predecessor_id]
-                    gating.append(
-                        (
-                            predecessor.total_float_business_days,
-                            topological_index[predecessor_id],
-                            predecessor_id,
-                            predecessor,
-                        )
-                    )
-            if not gating:
-                break
-            current = sorted(gating)[0][3]
-            path.append(current.process_id)
-        return list(reversed(path))
 
     def _normalize_schedule_dict(self, schedule: dict[str, Any]) -> dict[str, object]:
         data = self._json_ready(dict(schedule))
         data.setdefault("allocation_slices", [])
         data.setdefault("processes", [])
         data.setdefault("critical_path_process_ids", [])
-        data.setdefault("unallocated_requirements", [])
         data.setdefault("converged", True)
         data.setdefault("iteration_count", 1)
         data.setdefault(
@@ -2171,26 +1720,6 @@ class ProjectService:
             if not isinstance(row, dict):
                 continue
             row.setdefault("allocation_diagnostic", None)
-        for item in data.get("unallocated_requirements", []):
-            if not isinstance(item, dict):
-                continue
-            message = str(item.get("message", ""))
-            item.setdefault("diagnostic_message", message)
-            required = float(item.get("remaining_effort_hours", 0) or 0) + float(
-                item.get("allocated_effort_hours", 0) or 0
-            )
-            item.setdefault("required_effort_hours", self._clean_number(required))
-            item.setdefault(
-                "diagnostics",
-                {
-                    "eligible_resource_count": len(
-                        item.get("eligible_resource_ids", []) or []
-                    ),
-                    "eligible_resource_ids": item.get("eligible_resource_ids", []) or [],
-                    "remaining_effort_hours": item.get("remaining_effort_hours", 0),
-                    "allocated_effort_hours": item.get("allocated_effort_hours", 0),
-                },
-            )
 
     def _attach_process_facts_to_schedule(self, data: dict[str, object]) -> None:
         processes = getattr(self._repository, "processes", {})
@@ -2330,9 +1859,6 @@ class ProjectService:
                     "role_id": role_id,
                     "demanded_effort_hours": self._clean_number(demanded),
                     "fulfilled_effort_hours": self._clean_number(fulfilled),
-                    "unallocated_effort_hours": self._clean_number(
-                        max(demanded - fulfilled, 0),
-                    ),
                 }
             )
         time_series = []
@@ -2371,8 +1897,6 @@ class ProjectService:
             {
                 "project_id": query.project_id,
                 "as_of": query.as_of.isoformat(),
-                "horizon_starts_at": horizon_starts_at.isoformat(),
-                "horizon_ends_at": horizon_ends_at.isoformat(),
                 "planning_granularity": self._enum_value(query.planning_granularity),
                 "by_resource": by_resource,
                 "by_role": by_role,
@@ -2573,8 +2097,6 @@ class ProjectService:
             {
                 "project_id": query.project_id,
                 "as_of": query.as_of.isoformat(),
-                "horizon_starts_at": horizon_starts_at.isoformat(),
-                "horizon_ends_at": horizon_ends_at.isoformat(),
                 "currency": currency,
                 "total_cost": self._money(total_cost),
                 "by_resource": by_resource,

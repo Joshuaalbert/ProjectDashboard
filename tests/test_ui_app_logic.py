@@ -124,7 +124,7 @@ def test_schedule_debug_payload_contains_query_and_schedule_context():
             "graph": {"nodes": []},
             "full_graph": {"nodes": []},
             "blockers": {"blockers": []},
-            "resource_schedule": {"processes": [], "unallocated_requirements": []},
+            "resource_schedule": {"processes": []},
             "capacity": {"buckets": []},
             "utilization": {"by_resource": [], "by_role": []},
             "costs": {"total_cost": "0"},
@@ -137,5 +137,4 @@ def test_schedule_debug_payload_contains_query_and_schedule_context():
     assert payload["resource_schedule_query"]["action"] == "query_resource_schedule"
     assert "horizon_starts_at" not in payload["resource_schedule_query"]
     assert "horizon_ends_at" not in payload["resource_schedule_query"]
-    assert payload["resource_schedule"]["unallocated_requirements"] == []
     json.dumps(payload, default=str)

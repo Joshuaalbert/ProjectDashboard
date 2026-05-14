@@ -76,14 +76,6 @@ class PlanningGranularity(str, Enum):
     HOUR = "hour"
 
 
-class BlockedPolicy(str, Enum):
-    """Resource scheduling blocker policy."""
-
-    EXCLUDE = "exclude"
-    INCLUDE_AS_ZERO_CAPACITY = "include_as_zero_capacity"
-    INCLUDE_NORMALLY = "include_normally"
-
-
 class ScheduleBasis(str, Enum):
     """Schedule basis exposed by process graph queries."""
 
@@ -101,32 +93,12 @@ class ComputedStatus(str, Enum):
     BLOCKED = "blocked"
     COMPLETE = "complete"
     CANCELED = "canceled"
-    PARTIAL = "partial"
-    UNALLOCATED = "unallocated"
-    BLOCKED_ZERO_CAPACITY = "blocked_zero_capacity"
 
 
 class AllocationState(str, Enum):
     """Resource allocation state for a process row."""
 
     COMPLETE = "complete"
-    PARTIAL = "partial"
-    UNALLOCATED = "unallocated"
-    BLOCKED_ZERO_CAPACITY = "blocked_zero_capacity"
-
-
-class UnallocatedReason(str, Enum):
-    """Structured infeasibility reasons returned by resource queries."""
-
-    MISSING_ROLE = "missing_role"
-    NO_ELIGIBLE_RESOURCE = "no_eligible_resource"
-    NO_CALENDAR_CAPACITY = "no_calendar_capacity"
-    RESOURCE_CAPACITY_EXHAUSTED = "resource_capacity_exhausted"
-    BLOCKED = "blocked"
-    PREDECESSOR_UNALLOCATED = "predecessor_unallocated"
-    HORIZON_EXHAUSTED = "horizon_exhausted"
-    CONTIGUOUS_WINDOW_UNAVAILABLE = "contiguous_window_unavailable"
-    ITERATION_NOT_CONVERGED = "iteration_not_converged"
 
 
 class TopologyDirection(str, Enum):
@@ -533,24 +505,6 @@ class ConvergenceData(StrictModel):
     allocation_fingerprint_changed: bool = False
 
 
-class UnallocatedRequirement(StrictModel):
-    """Unallocated requirement output row."""
-
-    project_id: str
-    process_id: str
-    requirement_id: str
-    role_id: str
-    reason: UnallocatedReason
-    message: str
-    diagnostic_message: str
-    required_effort_hours: NonNegativeFloat
-    remaining_effort_hours: NonNegativeFloat
-    allocated_effort_hours: NonNegativeFloat
-    eligible_resource_ids: list[str] = Field(default_factory=list)
-    first_feasible_starts_at: AwareDatetime | None = None
-    diagnostics: dict[str, Any] = Field(default_factory=dict)
-
-
 class CapacityBucket(StrictModel):
     """Expanded resource capacity bucket."""
 
@@ -590,7 +544,6 @@ class RoleUtilization(StrictModel):
     role_id: str
     demanded_effort_hours: NonNegativeFloat
     fulfilled_effort_hours: NonNegativeFloat
-    unallocated_effort_hours: NonNegativeFloat
 
 
 class UtilizationBucket(StrictModel):
@@ -693,10 +646,7 @@ class ScheduleSnapshotRecord(StrictModel):
     terminal_process_symbols: list[str] = Field(default_factory=list)
     schedule_basis: ScheduleBasis = ScheduleBasis.RESOURCE_AWARE
     completion_at: AwareDatetime | None = None
-    horizon_starts_at: AwareDatetime
-    horizon_ends_at: AwareDatetime
     converged: bool | None = None
-    unallocated_count: int = Field(ge=0, default=0)
     note: str | None = None
 
     def model_dump(self, *args, **kwargs):
@@ -705,8 +655,6 @@ class ScheduleSnapshotRecord(StrictModel):
             for field in (
                 "committed_at",
                 "completion_at",
-                "horizon_starts_at",
-                "horizon_ends_at",
             ):
                 if isinstance(data.get(field), str) and data[field].endswith("Z"):
                     data[field] = f"{data[field][:-1]}+00:00"

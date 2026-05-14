@@ -124,14 +124,20 @@ Supported query actions are:
 - `query_resource_capacity`
 - `query_utilization`
 - `query_costs`
-- `query_unallocated_requirements`
 
 `query_process_graph` returns process nodes with dependency-only schedule fields
 and, when requested, resource-aware fields plus allocation slices. Resource-aware
-schedule, graph, utilization, cost, and unallocated queries do not require an
-operator-supplied schedule horizon; the service computes the capacity search
-span from project anchors, terminal scope, dependencies, role effort, and
-resource calendars.
+schedule, graph, utilization, and cost queries do not accept an
+operator-supplied schedule horizon; the service computes and extends its
+capacity search span from project anchors, terminal scope, dependencies, role
+effort, and recurring resource calendars. `query_resource_capacity` is the
+inspection endpoint that accepts explicit `horizon_starts_at` and
+`horizon_ends_at` values.
+
+If a resource-aware schedule cannot ever be solved because required roles,
+eligible resources, or recurring calendar capacity are missing, the query
+returns a structured `resource_schedule_unsatisfiable` error rather than a
+partial schedule.
 
 ## Slippage
 
@@ -143,7 +149,6 @@ terminal symbols and persists an immutable snapshot with:
 - schedule basis
 - completion datetime
 - convergence status
-- unallocated requirement count
 - optional note
 
 Repeated commits for the same project, timestamp, and terminal symbol set are

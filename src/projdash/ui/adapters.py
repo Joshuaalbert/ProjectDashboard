@@ -131,13 +131,6 @@ def catalog_from_query_data(*datasets: dict[str, Any] | None) -> dict[str, list[
                 role_ids.add(slice_data["role_id"])
             if slice_data.get("process_id"):
                 process_ids.add(slice_data["process_id"])
-        for row in data.get("unallocated_requirements", []):
-            if row.get("role_id"):
-                role_ids.add(row["role_id"])
-            if row.get("process_id"):
-                process_ids.add(row["process_id"])
-            resource_ids.update(row.get("eligible_resource_ids") or [])
-
     return {
         "process_ids": sorted(process_ids),
         "process_symbols": sorted(process_symbols),
@@ -355,14 +348,14 @@ def resource_utilization_heatmap(
 
 
 def role_utilization_heatmap(
-    capacity_data: dict[str, Any],
+    utilization_data: dict[str, Any],
     schedule_data: dict[str, Any],
 ) -> tuple[list[str], list[dt.datetime], list[list[float]]]:
-    """Return role utilization matrix from capacity buckets and allocations."""
+    """Return role utilization matrix from utilization buckets and allocations."""
     labels = sorted(
         {
             role_id
-            for bucket in capacity_data.get("buckets", [])
+            for bucket in utilization_data.get("time_series", [])
             for role_id in bucket.get("role_ids", [])
         }
         | {
@@ -374,7 +367,7 @@ def role_utilization_heatmap(
     times = sorted(
         {
             _parse_datetime(bucket.get("starts_at"))
-            for bucket in capacity_data.get("buckets", [])
+            for bucket in utilization_data.get("time_series", [])
             if bucket.get("starts_at")
         }
     )
@@ -388,7 +381,7 @@ def role_utilization_heatmap(
         for role_id in labels
         for time in times
     }
-    for bucket in capacity_data.get("buckets", []):
+    for bucket in utilization_data.get("time_series", []):
         starts_at = _parse_datetime(bucket.get("starts_at"))
         if starts_at not in times:
             continue
@@ -613,7 +606,7 @@ def cost_time_series_rows(cost_data: dict[str, Any]) -> list[dict[str, Any]]:
 def _node_fill(status: str) -> str:
     if status in {"complete", "done"}:
         return "#dcfce7"
-    if status in {"blocked", "blocked_zero_capacity"}:
+    if status == "blocked":
         return "#ffedd5"
     if status in {"late_risk", "late"}:
         return "#fee2e2"

@@ -23,7 +23,6 @@ from projdash.service.models import (
     RoleUtilization,
     ScheduleBasis,
     StrictModel,
-    UnallocatedRequirement,
     UtilizationBucket,
     WarningSeverity,
 )
@@ -215,13 +214,10 @@ class ResourceScheduleData(StrictModel):
     project_id: str
     as_of: AwareDatetime
     now: AwareDatetime
-    horizon_starts_at: AwareDatetime
-    horizon_ends_at: AwareDatetime
     planning_granularity: str
     processes: list[ResourceScheduleRow] = Field(default_factory=list)
     allocation_slices: list[AllocationSlice] = Field(default_factory=list)
     critical_path_process_ids: list[str] = Field(default_factory=list)
-    unallocated_requirements: list[UnallocatedRequirement] = Field(default_factory=list)
     converged: bool
     iteration_count: int = Field(ge=0)
     convergence: ConvergenceData
@@ -243,8 +239,6 @@ class UtilizationData(StrictModel):
 
     project_id: str
     as_of: AwareDatetime
-    horizon_starts_at: AwareDatetime
-    horizon_ends_at: AwareDatetime
     planning_granularity: str
     by_resource: list[ResourceUtilization] = Field(default_factory=list)
     by_role: list[RoleUtilization] = Field(default_factory=list)
@@ -257,25 +251,12 @@ class CostData(StrictModel):
 
     project_id: str
     as_of: AwareDatetime
-    horizon_starts_at: AwareDatetime
-    horizon_ends_at: AwareDatetime
     currency: str
     total_cost: str
     by_resource: list[ResourceCost] = Field(default_factory=list)
     by_process: list[ProcessCost] = Field(default_factory=list)
     by_role: list[RoleCost] = Field(default_factory=list)
     time_series: list[CostBucket] = Field(default_factory=list)
-
-
-class UnallocatedData(StrictModel):
-    """Unallocated requirement query data."""
-
-    project_id: str
-    as_of: AwareDatetime
-    horizon_starts_at: AwareDatetime
-    horizon_ends_at: AwareDatetime
-    planning_granularity: str
-    unallocated_requirements: list[UnallocatedRequirement] = Field(default_factory=list)
 
 
 class ResourceUtilizationData(StrictModel):
