@@ -183,6 +183,7 @@ class QueryResourceSchedule(QueryModel, HorizonMixin, ResourceOptionsMixin):
     project_id: str = Field(min_length=1)
     as_of: AwareDatetime
     now: AwareDatetime
+    scope: Scope | None = None
     include_allocation_slices: bool = False
 
 
@@ -193,6 +194,7 @@ class QueryUtilization(QueryModel, HorizonMixin, ResourceOptionsMixin):
     project_id: str = Field(min_length=1)
     as_of: AwareDatetime
     now: AwareDatetime
+    scope: Scope | None = None
 
 
 class QueryCosts(QueryModel, HorizonMixin, ResourceOptionsMixin):
@@ -278,6 +280,7 @@ class QueryUnallocatedRequirements(QueryModel, HorizonMixin, ResourceOptionsMixi
     project_id: str = Field(min_length=1)
     as_of: AwareDatetime
     now: AwareDatetime
+    scope: Scope | None = None
 
 
 Query = Annotated[

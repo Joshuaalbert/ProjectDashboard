@@ -3,9 +3,19 @@ import datetime as dt
 import pytest
 
 from projdash.ui.adapters import (
+    allowed_dependency_symbols,
+    allowed_shared_dependency_symbols,
+    allowed_successor_symbols,
+    ancestor_scope_symbols,
+    auto_horizon_from_graph,
     build_process_graph_dot,
     catalog_from_query_data,
     cost_time_series_rows,
+    existing_dependency_symbols,
+    gantt_rows,
+    process_symbol_maps,
+    resource_utilization_heatmap,
+    role_utilization_heatmap,
 )
 from projdash.ui.service_client import (
     batch_payload_envelope,
@@ -208,6 +218,169 @@ def test_catalog_extracts_ids_from_query_data():
     assert catalog["resource_ids"] == ["r1", "resource_catalog"]
     assert catalog["calendar_ids"] == ["c1", "calendar_catalog"]
     assert catalog["blocker_ids"] == ["b1"]
+
+
+def test_process_symbol_helpers_filter_cycle_safe_dependency_choices():
+    graph = {
+        "nodes": [
+            {"process_id": "p1", "process_symbol": "A"},
+            {"process_id": "p2", "process_symbol": "B"},
+            {"process_id": "p3", "process_symbol": "C"},
+            {"process_id": "p4", "process_symbol": "D"},
+        ],
+        "edges": [
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "B",
+            },
+            {
+                "predecessor_process_symbol": "B",
+                "successor_process_symbol": "C",
+            },
+        ],
+    }
+
+    id_by_symbol, symbol_by_id = process_symbol_maps(graph)
+
+    assert id_by_symbol == {"A": "p1", "B": "p2", "C": "p3", "D": "p4"}
+    assert symbol_by_id["p3"] == "C"
+    assert existing_dependency_symbols(graph, "B") == ["A"]
+    assert allowed_dependency_symbols(graph, "B") == ["A", "D"]
+    assert allowed_shared_dependency_symbols(graph, ["B", "C"]) == ["A", "D"]
+    assert allowed_successor_symbols(graph, ["B"]) == ["C", "D"]
+    assert ancestor_scope_symbols(graph, ["C"]) == ["A", "B", "C"]
+
+
+def test_auto_horizon_and_gantt_rows_use_terminal_ancestor_scope():
+    as_of = dt.datetime(2026, 5, 13, 10, tzinfo=dt.UTC)
+    graph = {
+        "critical_path_process_ids": ["p1", "p2"],
+        "nodes": [
+            {
+                "process_id": "p1",
+                "process_symbol": "A",
+                "name": "Start",
+                "dependency_only": {
+                    "es_at": "2026-05-13T09:00:00+00:00",
+                    "ef_at": "2026-05-13T17:00:00+00:00",
+                    "ls_at": "2026-05-13T09:00:00+00:00",
+                    "lf_at": "2026-05-13T17:00:00+00:00",
+                    "slack_hours": 0,
+                    "criticality_label": "critical",
+                },
+            },
+            {
+                "process_id": "p2",
+                "process_symbol": "B",
+                "name": "Finish",
+                "due_at": "2026-05-15T17:00:00+00:00",
+                "dependency_only": {
+                    "es_at": "2026-05-14T09:00:00+00:00",
+                    "ef_at": "2026-05-15T17:00:00+00:00",
+                    "ls_at": "2026-05-14T09:00:00+00:00",
+                    "lf_at": "2026-05-15T17:00:00+00:00",
+                    "slack_hours": 0,
+                    "criticality_label": "critical",
+                },
+            },
+            {
+                "process_id": "p3",
+                "process_symbol": "C",
+                "name": "Unrelated",
+                "dependency_only": {
+                    "es_at": "2026-06-01T09:00:00+00:00",
+                    "ef_at": "2026-06-01T17:00:00+00:00",
+                    "ls_at": "2026-06-01T09:00:00+00:00",
+                    "lf_at": "2026-06-01T17:00:00+00:00",
+                    "slack_hours": 0,
+                    "criticality_label": "non_critical",
+                },
+            },
+        ],
+        "edges": [
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "B",
+            }
+        ],
+    }
+
+    starts_at, ends_at = auto_horizon_from_graph(
+        {"project": {"start_at": "2026-05-13T09:00:00+00:00"}},
+        graph,
+        as_of,
+        terminal_symbols=["B"],
+    )
+    rows = gantt_rows(graph, terminal_symbols=["B"])
+
+    assert starts_at.isoformat() == "2026-05-13T00:00:00+00:00"
+    assert ends_at.isoformat() == "2026-05-16T00:00:00+00:00"
+    assert [row["symbol"] for row in rows] == ["A", "B"]
+    assert all(row["critical"] for row in rows)
+
+
+def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
+    utilization = {
+        "time_series": [
+            {
+                "starts_at": "2026-05-13T09:00:00+00:00",
+                "ends_at": "2026-05-13T10:00:00+00:00",
+                "resource_id": "res_a",
+                "role_ids": ["role_dev"],
+                "capacity_hours": 1,
+                "allocated_hours": 0.5,
+                "utilization_ratio": 0.5,
+            },
+            {
+                "starts_at": "2026-05-13T10:00:00+00:00",
+                "ends_at": "2026-05-13T11:00:00+00:00",
+                "resource_id": "res_a",
+                "role_ids": ["role_dev"],
+                "capacity_hours": 1,
+                "allocated_hours": 1,
+                "utilization_ratio": 1,
+            },
+        ]
+    }
+    capacity = {
+        "buckets": [
+            {
+                "starts_at": "2026-05-13T09:00:00+00:00",
+                "ends_at": "2026-05-13T10:00:00+00:00",
+                "resource_id": "res_a",
+                "role_ids": ["role_dev"],
+                "capacity_hours": 1,
+            },
+            {
+                "starts_at": "2026-05-13T10:00:00+00:00",
+                "ends_at": "2026-05-13T11:00:00+00:00",
+                "resource_id": "res_a",
+                "role_ids": ["role_dev"],
+                "capacity_hours": 1,
+            },
+        ]
+    }
+    schedule = {
+        "allocation_slices": [
+            {
+                "role_id": "role_dev",
+                "starts_at": "2026-05-13T09:30:00+00:00",
+                "ends_at": "2026-05-13T10:30:00+00:00",
+            }
+        ]
+    }
+
+    resource_labels, resource_times, resource_matrix = resource_utilization_heatmap(
+        utilization,
+    )
+    role_labels, role_times, role_matrix = role_utilization_heatmap(capacity, schedule)
+
+    assert resource_labels == ["res_a"]
+    assert [time.hour for time in resource_times] == [9, 10]
+    assert resource_matrix == [[0.5, 1.0]]
+    assert role_labels == ["role_dev"]
+    assert [time.hour for time in role_times] == [9, 10]
+    assert role_matrix == [[0.5, 0.5]]
 
 
 def test_graph_adapter_marks_critical_path_and_collapsed_nodes():

@@ -49,6 +49,48 @@ def _create_project(service: ProjectService) -> str:
     return ids["project_id"]
 
 
+def test_upsert_process_revision_respects_process_symbol_identity():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+
+    created = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_symbol": "design",
+            "name": "Design",
+            "effective_at": _iso(13, 9),
+            "duration_business_days": 0,
+        },
+    )
+    updated = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_symbol": "design",
+            "name": "Design updated",
+            "effective_at": _iso(13, 10),
+            "duration_business_days": 0,
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 12),
+        },
+    )
+
+    assert created["process_id"] == "design"
+    assert updated["process_id"] == "design"
+    assert graph["nodes"][0]["process_symbol"] == "design"
+    assert graph["nodes"][0]["name"] == "Design updated"
+
+
 def _weekday_windows() -> list[dict[str, object]]:
     return [
         {
@@ -685,6 +727,77 @@ def test_resource_schedule_capacity_unallocated_and_utilization_contracts():
     )
     assert utilization["by_role"][0]["role_id"] == ids["engineer_id"]
     assert utilization["overallocated_buckets"] == []
+
+
+def test_terminal_topology_scope_filters_resource_schedule_and_utilization():
+    service = ProjectService(InMemoryProjectRepository())
+    ids = _seed_resource_project(service)
+    scope = {
+        "type": "topo_filter",
+        "root_process_symbols": ["process-build"],
+        "direction": "ancestors",
+    }
+
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": ids["project_id"],
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 12),
+            "scope": scope,
+            **_resource_horizon(),
+            "include_resource_fields": True,
+            "include_allocation_slices": True,
+            "planning_granularity": "hour",
+        },
+    )
+    schedule = _query(
+        service,
+        {
+            "action": "query_resource_schedule",
+            "project_id": ids["project_id"],
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 12),
+            "scope": scope,
+            **_resource_horizon(),
+            "include_allocation_slices": True,
+            "planning_granularity": "hour",
+        },
+    )
+    utilization = _query(
+        service,
+        {
+            "action": "query_utilization",
+            "project_id": ids["project_id"],
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 12),
+            "scope": scope,
+            **_resource_horizon(),
+            "planning_granularity": "hour",
+        },
+    )
+
+    assert {node["process_id"] for node in graph["nodes"]} == {
+        ids["design_id"],
+        ids["build_id"],
+    }
+    assert {row["process_id"] for row in schedule["processes"]} == {
+        ids["design_id"],
+        ids["build_id"],
+    }
+    assert schedule["unallocated_requirements"] == []
+    assert {
+        allocation["process_id"] for allocation in schedule["allocation_slices"]
+    } == {ids["design_id"], ids["build_id"]}
+    assert utilization["by_role"] == [
+        {
+            "role_id": ids["engineer_id"],
+            "demanded_effort_hours": 12,
+            "fulfilled_effort_hours": 12,
+            "unallocated_effort_hours": 0,
+        }
+    ]
 
 
 def test_query_critical_path_remains_dependency_only_under_resource_delay():

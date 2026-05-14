@@ -6,16 +6,26 @@ import datetime as dt
 import os
 from typing import Any
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import streamlit as st
 from pydantic import ValidationError
 
 from projdash.ui.adapters import (
+    allowed_dependency_symbols,
+    allowed_shared_dependency_symbols,
+    allowed_successor_symbols,
+    auto_horizon_from_graph,
     build_process_graph_dot,
     catalog_from_query_data,
     cost_time_series_rows,
     edge_table_rows,
+    existing_dependency_symbols,
+    gantt_rows,
+    process_symbol_maps,
     process_table_rows,
+    resource_utilization_heatmap,
+    role_utilization_heatmap,
 )
 from projdash.ui.service_client import (
     DEFAULT_TIMEZONE,
@@ -147,23 +157,12 @@ def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, A
         now_utc.time().replace(microsecond=0),
         help="Planning snapshot time for schedule and history queries.",
     )
-    horizon_days = st.sidebar.number_input(
-        "Horizon days",
-        1,
-        365,
-        45,
-        help="Number of days shown in resource, utilization, and cost queries.",
-    )
     now_at = combine_datetime(as_of_date, as_of_time, timezone_name)
-    horizon_starts_at = combine_datetime(as_of_date, dt.time(0, 0), timezone_name)
-    horizon_ends_at = horizon_starts_at + dt.timedelta(days=int(horizon_days))
     return {
         "project_id": project_id,
         "timezone": timezone_name,
         "as_of": now_at,
         "now": now_at,
-        "horizon_starts_at": horizon_starts_at,
-        "horizon_ends_at": horizon_ends_at,
     }
 
 
@@ -267,6 +266,7 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             key="project",
         ),
         "graph": None,
+        "full_graph": None,
         "blockers": None,
         "history": None,
         "catalog": None,
@@ -274,6 +274,11 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         "capacity": None,
         "utilization": None,
         "costs": None,
+        "scope": None,
+        "terminal_symbols": [],
+        "now": controls["now"],
+        "horizon_starts_at": None,
+        "horizon_ends_at": None,
     }
     if base["project"] is None:
         return base
@@ -284,6 +289,34 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "project_id": project_id,
         },
     )
+    dependency_graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": controls["as_of"],
+            "now": controls["now"],
+        },
+    )
+    base["full_graph"] = dependency_graph
+    terminal_symbols = _valid_process_symbols(
+        st.session_state.get("terminal_process_symbols", []),
+        dependency_graph or {},
+    )
+    scope = _terminal_scope(terminal_symbols)
+    horizon_starts_at, horizon_ends_at = auto_horizon_from_graph(
+        base["project"],
+        dependency_graph or {},
+        controls["as_of"],
+        terminal_symbols=terminal_symbols,
+    )
+    controls["horizon_starts_at"] = horizon_starts_at
+    controls["horizon_ends_at"] = horizon_ends_at
+    base["scope"] = scope
+    base["terminal_symbols"] = terminal_symbols
+    base["horizon_starts_at"] = horizon_starts_at
+    base["horizon_ends_at"] = horizon_ends_at
+    scoped_query = {"scope": scope} if scope else {}
     base["graph"] = _query(
         service,
         {
@@ -291,9 +324,10 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "project_id": project_id,
             "as_of": controls["as_of"],
             "now": controls["now"],
+            **scoped_query,
             "include_resource_fields": True,
-            "horizon_starts_at": controls["horizon_starts_at"],
-            "horizon_ends_at": controls["horizon_ends_at"],
+            "horizon_starts_at": horizon_starts_at,
+            "horizon_ends_at": horizon_ends_at,
             "include_allocation_slices": True,
         },
     )
@@ -312,6 +346,7 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "action": "query_due_date_history",
             "project_id": project_id,
             "as_of": controls["as_of"],
+            **scoped_query,
             "include_project_total": True,
         },
     )
@@ -319,8 +354,9 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         "project_id": project_id,
         "as_of": controls["as_of"],
         "now": controls["now"],
-        "horizon_starts_at": controls["horizon_starts_at"],
-        "horizon_ends_at": controls["horizon_ends_at"],
+        **scoped_query,
+        "horizon_starts_at": horizon_starts_at,
+        "horizon_ends_at": horizon_ends_at,
     }
     base["resource_schedule"] = _query(
         service,
@@ -336,8 +372,8 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "action": "query_resource_capacity",
             "project_id": project_id,
             "as_of": controls["as_of"],
-            "horizon_starts_at": controls["horizon_starts_at"],
-            "horizon_ends_at": controls["horizon_ends_at"],
+            "horizon_starts_at": horizon_starts_at,
+            "horizon_ends_at": horizon_ends_at,
         },
     )
     base["utilization"] = _query(
@@ -483,37 +519,102 @@ def _render_project_settings(
             st.rerun()
 
 
+def _render_process_table(
+    graph: dict[str, Any],
+    *,
+    key: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    rows = process_table_rows(graph)
+    selected_symbols: list[str] = []
+    try:
+        event = st.dataframe(
+            rows,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key=key,
+        )
+        selection = getattr(event, "selection", None)
+        if isinstance(selection, dict):
+            selected_rows = selection.get("rows", [])
+        else:
+            selected_rows = getattr(selection, "rows", []) if selection else []
+        selected_symbols = [
+            rows[index]["symbol"]
+            for index in selected_rows
+            if 0 <= index < len(rows) and rows[index].get("symbol")
+        ]
+    except TypeError:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    if selected_symbols:
+        st.session_state["selected_process_symbols"] = selected_symbols
+        return rows, selected_symbols
+    stored = _valid_process_symbols(
+        st.session_state.get("selected_process_symbols", []),
+        graph,
+    )
+    return rows, stored
+
+
 def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
-    graph = context.get("graph") or {}
+    graph = context.get("full_graph") or context.get("graph") or {}
     catalog = catalog_from_query_data(
         context.get("catalog"),
         graph,
         context.get("blockers"),
     )
+    id_by_symbol, _symbol_by_id = process_symbol_maps(graph)
+    node_by_symbol = {
+        node.get("process_symbol"): node
+        for node in graph.get("nodes", [])
+        if node.get("process_symbol")
+    }
     st.subheader("Process plan")
-    st.dataframe(process_table_rows(graph), use_container_width=True, hide_index=True)
+    _rows, selected_symbols = _render_process_table(graph, key="process_table")
 
     with st.expander("Create or revise process", expanded=True):
         with st.form("process_revision"):
+            default_symbol = selected_symbols[0] if len(selected_symbols) == 1 else ""
+            symbol_options = [""] + catalog["process_symbols"]
+            selected_index = (
+                symbol_options.index(default_symbol)
+                if default_symbol in symbol_options
+                else 0
+            )
             existing = st.selectbox(
-                "Existing process id",
-                [""] + catalog["process_ids"],
+                "Existing process",
+                symbol_options,
+                index=selected_index,
                 help=(
                     "Choose a defined process to revise, or leave blank to create a "
                     "new process."
                 ),
             )
-            name = st.text_input("Name", help="Human-readable process name.")
-            duration = st.number_input(
-                "Duration business days",
-                0,
-                3650,
-                1,
-                help="Dependency-only duration before resource allocation is applied.",
+            selected_node = node_by_symbol.get(existing, {})
+            process_symbol = st.text_input(
+                "New process symbol",
+                help=(
+                    "Canonical symbol for a new process. Existing processes use "
+                    "the selector above."
+                ),
+                disabled=bool(existing),
             )
+            name = st.text_input(
+                "Name",
+                selected_node.get("name", ""),
+                help="Human-readable process name.",
+            )
+            dependency_options = allowed_dependency_symbols(graph, existing)
+            dependency_defaults = [
+                symbol
+                for symbol in existing_dependency_symbols(graph, existing)
+                if symbol in dependency_options
+            ]
             dependencies = st.multiselect(
                 "Dependencies",
-                catalog["process_ids"],
+                dependency_options,
+                default=dependency_defaults,
                 help="Defined predecessor processes that must finish first.",
             )
             effective_date = st.date_input(
@@ -568,18 +669,27 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
             )
             submitted = st.form_submit_button("Save revision")
         if submitted:
+            active_symbol = existing or process_symbol.strip()
+            if not active_symbol:
+                st.error("Process symbol is required for new processes.")
+                return
+            duration_days = int((selected_node.get("duration_hours") or 0) / 8)
             payload = {
                 "action": "upsert_process_revision",
                 "project_id": controls["project_id"],
-                "process_id": existing or None,
+                "process_symbol": active_symbol,
                 "name": name,
                 "effective_at": combine_datetime(
                     effective_date,
                     effective_time,
                     controls["timezone"],
                 ),
-                "duration_business_days": int(duration),
-                "dependencies": dependencies,
+                "duration_business_days": duration_days,
+                "dependencies": [
+                    id_by_symbol[symbol]
+                    for symbol in dependencies
+                    if symbol in id_by_symbol
+                ],
                 "due_at": combine_datetime(due_date, due_time, controls["timezone"])
                 if due_enabled
                 else None,
@@ -601,17 +711,181 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
             }
             _apply_command(service, payload)
 
-    _render_process_status_form(service, controls, catalog)
-    _render_process_due_form(service, controls, catalog)
-    _render_blocker_forms(service, controls, catalog)
+    _render_batch_process_menu(service, controls, graph, catalog, selected_symbols)
+    _render_process_status_form(service, controls, catalog, selected_symbols)
+    _render_process_due_form(service, controls, catalog, selected_symbols)
+    _render_blocker_forms(service, controls, catalog, selected_symbols)
 
 
-def _render_process_status_form(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
+def _render_batch_process_menu(
+    service,
+    controls: dict[str, Any],
+    graph: dict[str, Any],
+    catalog: dict[str, list[str]],
+    selected_symbols: list[str],
+) -> None:
+    id_by_symbol, _symbol_by_id = process_symbol_maps(graph)
+    with st.expander("Batch update processes"):
+        default_symbols = [
+            symbol for symbol in selected_symbols if symbol in catalog["process_symbols"]
+        ]
+        target_symbols = st.multiselect(
+            "Selected process symbols",
+            catalog["process_symbols"],
+            default=default_symbols,
+            help="Processes affected by the batch operation.",
+        )
+        predecessor_options = allowed_shared_dependency_symbols(graph, target_symbols)
+        successor_options = allowed_successor_symbols(graph, target_symbols)
+
+        with st.form("batch_add_predecessors"):
+            predecessors = st.multiselect(
+                "Predecessors to add",
+                predecessor_options,
+                help="Only symbols that can precede every selected process are shown.",
+            )
+            add_predecessors = st.form_submit_button("Add predecessors")
+        if add_predecessors and target_symbols and predecessors:
+            _apply_command(
+                service,
+                {
+                    "action": "batch_update_process_graph",
+                    "project_id": controls["project_id"],
+                    "edit_at": controls["as_of"],
+                    "operations": [
+                        {
+                            "action": "add_dependency",
+                            "operation_id": f"add-{predecessor}-{target}",
+                            "predecessor_process_symbol": predecessor,
+                            "successor_process_symbol": target,
+                        }
+                        for target in target_symbols
+                        for predecessor in predecessors
+                    ],
+                },
+            )
+
+        with st.form("batch_add_existing_children"):
+            children = st.multiselect(
+                "Existing children to add",
+                successor_options,
+                help="Only symbols that can follow every selected process are shown.",
+            )
+            add_children = st.form_submit_button("Add existing children")
+        if add_children and target_symbols and children:
+            _apply_command(
+                service,
+                {
+                    "action": "batch_update_process_graph",
+                    "project_id": controls["project_id"],
+                    "edit_at": controls["as_of"],
+                    "operations": [
+                        {
+                            "action": "add_dependency",
+                            "operation_id": f"add-{parent}-{child}",
+                            "predecessor_process_symbol": parent,
+                            "successor_process_symbol": child,
+                        }
+                        for parent in target_symbols
+                        for child in children
+                    ],
+                },
+            )
+
+        with st.form("batch_add_new_child"):
+            child_symbol = st.text_input(
+                "New child symbol",
+                help="Canonical symbol for the new child process.",
+            )
+            child_name = st.text_input(
+                "New child name",
+                help="Human-readable name for the new child process.",
+            )
+            role_id = st.selectbox(
+                "Required role",
+                [""] + catalog["role_ids"],
+                key="batch_child_role",
+                help="Defined role required by the new child process.",
+            )
+            effort = st.number_input(
+                "Effort hours",
+                0.0,
+                10000.0,
+                0.0,
+                key="batch_child_effort",
+                help="Total role effort used by resource-aware scheduling.",
+            )
+            add_new_child = st.form_submit_button("Create child after selected")
+        if add_new_child and target_symbols and child_symbol:
+            _apply_command(
+                service,
+                {
+                    "action": "upsert_process_revision",
+                    "project_id": controls["project_id"],
+                    "process_symbol": child_symbol,
+                    "name": child_name,
+                    "effective_at": controls["as_of"],
+                    "duration_business_days": 0,
+                    "dependencies": [
+                        id_by_symbol[symbol]
+                        for symbol in target_symbols
+                        if symbol in id_by_symbol
+                    ],
+                    "role_requirements": [
+                        {
+                            "role_id": role_id,
+                            "effort_hours": effort,
+                        }
+                    ]
+                    if role_id and effort > 0
+                    else [],
+                },
+            )
+
+        with st.form("batch_collapse_selected"):
+            new_symbol = st.text_input(
+                "Collapsed process symbol",
+                help="Canonical symbol for the replacement process.",
+            )
+            new_name = st.text_input(
+                "Collapsed process name",
+                help="Human-readable name for the replacement process.",
+            )
+            collapse = st.form_submit_button("Collapse selected")
+        if collapse and target_symbols:
+            _apply_command(
+                service,
+                {
+                    "action": "collapse_subgraph",
+                    "project_id": controls["project_id"],
+                    "edit_at": controls["as_of"],
+                    "process_symbols": target_symbols,
+                    "new_process": {
+                        "process_symbol": new_symbol,
+                        "name": new_name,
+                    },
+                },
+            )
+
+
+def _render_process_status_form(
+    service,
+    controls: dict[str, Any],
+    catalog: dict[str, list[str]],
+    selected_symbols: list[str],
+):
     with st.expander("Set process status"):
         with st.form("process_status"):
-            process_id = st.selectbox(
-                "Process id",
-                [""] + catalog["process_ids"],
+            default_symbol = selected_symbols[0] if len(selected_symbols) == 1 else ""
+            symbol_options = [""] + catalog["process_symbols"]
+            process_symbol = st.selectbox(
+                "Process",
+                symbol_options,
+                index=(
+                    symbol_options.index(default_symbol)
+                    if default_symbol in symbol_options
+                    else 0
+                ),
                 help="Defined process to update.",
             )
             status = st.selectbox(
@@ -635,13 +909,13 @@ def _render_process_status_form(service, controls: dict[str, Any], catalog: dict
             )
             note = st.text_input("Note", help="Optional status note.")
             submitted = st.form_submit_button("Set status")
-        if submitted and process_id:
+        if submitted and process_symbol:
             _apply_command(
                 service,
                 {
                     "action": "set_process_status",
                     "project_id": controls["project_id"],
-                    "process_id": process_id,
+                    "process_symbol": process_symbol,
                     "status": status,
                     "edit_at": controls["as_of"],
                     "finished_at": combine_datetime(
@@ -656,12 +930,24 @@ def _render_process_status_form(service, controls: dict[str, Any], catalog: dict
             )
 
 
-def _render_process_due_form(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
+def _render_process_due_form(
+    service,
+    controls: dict[str, Any],
+    catalog: dict[str, list[str]],
+    selected_symbols: list[str],
+):
     with st.expander("Set or clear due date"):
         with st.form("process_due"):
-            process_id = st.selectbox(
-                "Process id",
-                [""] + catalog["process_ids"],
+            default_symbol = selected_symbols[0] if len(selected_symbols) == 1 else ""
+            symbol_options = [""] + catalog["process_symbols"]
+            process_symbol = st.selectbox(
+                "Process",
+                symbol_options,
+                index=(
+                    symbol_options.index(default_symbol)
+                    if default_symbol in symbol_options
+                    else 0
+                ),
                 key="due_pid",
                 help="Defined process whose due datetime will change.",
             )
@@ -682,13 +968,13 @@ def _render_process_due_form(service, controls: dict[str, Any], catalog: dict[st
                 help="Explicit process due time.",
             )
             submitted = st.form_submit_button("Save due date")
-        if submitted and process_id:
+        if submitted and process_symbol:
             _apply_command(
                 service,
                 {
                     "action": "set_process_due_at",
                     "project_id": controls["project_id"],
-                    "process_id": process_id,
+                    "process_symbol": process_symbol,
                     "due_at": None
                     if clear_due
                     else combine_datetime(due_date, due_time, controls["timezone"]),
@@ -697,12 +983,24 @@ def _render_process_due_form(service, controls: dict[str, Any], catalog: dict[st
             )
 
 
-def _render_blocker_forms(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
+def _render_blocker_forms(
+    service,
+    controls: dict[str, Any],
+    catalog: dict[str, list[str]],
+    selected_symbols: list[str],
+):
     with st.expander("Blockers"):
         with st.form("add_blocker"):
-            process_id = st.selectbox(
-                "Process id",
-                [""] + catalog["process_ids"],
+            default_symbol = selected_symbols[0] if len(selected_symbols) == 1 else ""
+            symbol_options = [""] + catalog["process_symbols"]
+            process_symbol = st.selectbox(
+                "Process",
+                symbol_options,
+                index=(
+                    symbol_options.index(default_symbol)
+                    if default_symbol in symbol_options
+                    else 0
+                ),
                 key="blk_pid",
                 help="Defined process that is blocked.",
             )
@@ -714,13 +1012,13 @@ def _render_blocker_forms(service, controls: dict[str, Any], catalog: dict[str, 
                 help="Whether this blocker prevents work or is informational.",
             )
             add = st.form_submit_button("Add blocker")
-        if add and process_id:
+        if add and process_symbol:
             _apply_command(
                 service,
                 {
                     "action": "add_blocker",
                     "project_id": controls["project_id"],
-                    "process_id": process_id,
+                    "process_symbol": process_symbol,
                     "summary": summary,
                     "details": details or None,
                     "severity": severity,
@@ -770,6 +1068,20 @@ def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]
     st.subheader("Roles")
     st.write(", ".join(catalog["role_ids"]) or "No roles configured.")
     _render_role_forms(service, controls, catalog)
+
+    st.subheader("Resource utilization")
+    _render_heatmap(
+        "Resource utilization",
+        *resource_utilization_heatmap(context.get("utilization") or {}),
+    )
+    st.subheader("Role utilization")
+    _render_heatmap(
+        "Role utilization",
+        *role_utilization_heatmap(
+            context.get("capacity") or {},
+            context.get("resource_schedule") or {},
+        ),
+    )
 
     st.subheader("Capacity")
     st.dataframe(
@@ -1245,8 +1557,44 @@ def _resource_payload_with_holidays(
 
 
 def _render_schedule(context: dict[str, Any]) -> None:
+    graph = context.get("graph") or {}
+    full_graph = context.get("full_graph") or graph
     schedule = context.get("resource_schedule") or {}
+    symbol_options = [
+        node.get("process_symbol")
+        for node in full_graph.get("nodes", [])
+        if node.get("process_symbol")
+    ]
+    current_terminals = [
+        symbol
+        for symbol in st.session_state.get("terminal_process_symbols", [])
+        if symbol in symbol_options
+    ]
+    terminal_symbols = st.multiselect(
+        "Completion targets",
+        symbol_options,
+        default=current_terminals,
+        help=(
+            "Leave empty to plan to all terminal nodes. Select symbols to plan "
+            "their ancestor subgraph."
+        ),
+    )
+    if terminal_symbols != current_terminals:
+        st.session_state["terminal_process_symbols"] = terminal_symbols
+        st.rerun()
+
+    horizon_start = context.get("horizon_starts_at")
+    horizon_end = context.get("horizon_ends_at")
+    if horizon_start and horizon_end:
+        st.caption(
+            f"Query horizon: {horizon_start.isoformat()} to {horizon_end.isoformat()}"
+        )
     st.metric("Converged", str(schedule.get("converged", "-")))
+    _render_gantt_chart(
+        graph,
+        controls_now=context.get("now"),
+        terminal_symbols=terminal_symbols,
+    )
     st.dataframe(schedule.get("processes", []), use_container_width=True, hide_index=True)
     st.subheader("Unallocated requirements")
     st.dataframe(
@@ -1262,6 +1610,93 @@ def _render_schedule(context: dict[str, Any]) -> None:
     )
 
 
+def _render_gantt_chart(
+    graph: dict[str, Any],
+    *,
+    controls_now: dt.datetime | None,
+    terminal_symbols: list[str],
+) -> None:
+    rows = gantt_rows(graph, terminal_symbols=terminal_symbols)
+    rows = [
+        row
+        for row in rows
+        if row.get("es_at") is not None and row.get("lf_at") is not None
+    ]
+    if not rows:
+        return
+    fig_height = max(3, len(rows) * 0.42)
+    fig, ax = plt.subplots(figsize=(12, fig_height))
+    for index, row in enumerate(rows):
+        color = "#dc2626" if row["critical"] else "#2563eb"
+        y = len(rows) - index - 1
+        _barh_datetime(
+            ax,
+            row["es_at"],
+            row["ef_at"],
+            y - 0.24,
+            0.32,
+            facecolor=color,
+            edgecolor=color,
+            alpha=0.85,
+        )
+        _barh_datetime(
+            ax,
+            row["ls_at"],
+            row["lf_at"],
+            y + 0.12,
+            0.20,
+            facecolor="none",
+            edgecolor=color,
+            alpha=1.0,
+            linestyle="--",
+        )
+    if controls_now is not None:
+        ax.axvline(mdates.date2num(controls_now), color="#111827", linewidth=1.2)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([row["symbol"] for row in reversed(rows)])
+    ax.set_xlabel("Time")
+    locator = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    ax.grid(axis="x", color="#e5e7eb", linewidth=0.8)
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
+def _render_heatmap(
+    title: str,
+    labels: list[str],
+    times: list[dt.datetime],
+    matrix: list[list[float]],
+) -> None:
+    if not labels or not times or not matrix:
+        st.info(f"No {title.lower()} data for the inferred horizon.")
+        return
+    step = times[1] - times[0] if len(times) > 1 else dt.timedelta(hours=1)
+    time_edges = [*times, times[-1] + step]
+    y_edges = list(range(len(labels) + 1))
+    fig_height = max(2.5, len(labels) * 0.35)
+    fig, ax = plt.subplots(figsize=(12, fig_height))
+    image = ax.pcolormesh(
+        mdates.date2num(time_edges),
+        y_edges,
+        matrix,
+        cmap="jet",
+        vmin=0,
+        vmax=1,
+        shading="flat",
+    )
+    ax.set_yticks([index + 0.5 for index in range(len(labels))])
+    ax.set_yticklabels(labels)
+    locator = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    ax.set_xlabel("Time")
+    fig.colorbar(image, ax=ax, label="Utilization")
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
 def _render_costs(context: dict[str, Any]) -> None:
     costs = context.get("costs") or {}
     utilization = context.get("utilization") or {}
@@ -1271,9 +1706,18 @@ def _render_costs(context: dict[str, Any]) -> None:
     rows = cost_time_series_rows(costs)
     if rows:
         fig, ax = plt.subplots()
-        ax.plot([row["starts_at"] for row in rows], [row["cost_amount"] for row in rows])
+        ax.plot(
+            [
+                _parse_iso_datetime(row["starts_at"], dt.datetime.now(dt.UTC))
+                for row in rows
+            ],
+            [row["cost_amount"] for row in rows],
+        )
         ax.set_ylabel("Cost")
-        ax.tick_params(axis="x", rotation=30)
+        locator = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        fig.tight_layout()
         st.pyplot(fig)
     st.dataframe(costs.get("by_resource", []), use_container_width=True, hide_index=True)
     st.dataframe(costs.get("by_process", []), use_container_width=True, hide_index=True)
@@ -1307,7 +1751,7 @@ def _render_history(context: dict[str, Any]) -> None:
 
 
 def _render_topology(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
-    graph = context.get("graph") or {}
+    graph = context.get("full_graph") or context.get("graph") or {}
     catalog = catalog_from_query_data(context.get("catalog"), graph)
     node_by_symbol = {
         node.get("process_symbol"): node.get("process_id")
@@ -1329,8 +1773,8 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
     with st.expander("Replace process with subgraph"):
         with st.form("replace_subgraph"):
             target = st.selectbox(
-                "Parent process id",
-                [""] + catalog["process_ids"],
+                "Parent process",
+                [""] + catalog["process_symbols"],
                 help="Defined process to replace with a detailed subgraph.",
             )
             children = st.text_area(
@@ -1382,7 +1826,7 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                     {
                         "action": "replace_process_with_subgraph",
                         "project_id": controls["project_id"],
-                        "process_id": target,
+                        "process_symbol": target,
                         "edit_at": controls["as_of"],
                         "processes": parsed_children,
                         "dependencies": parsed_dependencies,
@@ -1408,13 +1852,6 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                 "New process name",
                 help="Human-readable name for the replacement process.",
             )
-            duration = st.number_input(
-                "Duration hours",
-                0.0,
-                10000.0,
-                8.0,
-                help="Dependency-only duration for the replacement process.",
-            )
             collapse = st.form_submit_button("Collapse")
         if collapse and symbols:
             _apply_command(
@@ -1427,7 +1864,6 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
                     "new_process": {
                         "process_symbol": new_symbol,
                         "name": new_name,
-                        "duration_hours": duration,
                     },
                 },
             )
@@ -1532,6 +1968,43 @@ def _weekly_windows(
         }
         for weekday in weekdays
     ]
+
+
+def _valid_process_symbols(
+    symbols: list[str] | tuple[str, ...],
+    graph: dict[str, Any],
+) -> list[str]:
+    valid_symbols = {
+        node.get("process_symbol")
+        for node in graph.get("nodes", [])
+        if node.get("process_symbol")
+    }
+    return [symbol for symbol in symbols if symbol in valid_symbols]
+
+
+def _terminal_scope(symbols: list[str]) -> dict[str, Any] | None:
+    if not symbols:
+        return None
+    return {
+        "type": "topo_filter",
+        "root_process_symbols": symbols,
+        "direction": "ancestors",
+    }
+
+
+def _barh_datetime(
+    ax,
+    starts_at: dt.datetime | None,
+    ends_at: dt.datetime | None,
+    y: float,
+    height: float,
+    **kwargs,
+) -> None:
+    if starts_at is None or ends_at is None:
+        return
+    start_num = mdates.date2num(starts_at)
+    width = max(mdates.date2num(ends_at) - start_num, 1 / (24 * 60))
+    ax.broken_barh([(start_num, width)], (y, height), **kwargs)
 
 
 if __name__ == "__main__":

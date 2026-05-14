@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 from collections import defaultdict
+from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -12,7 +13,7 @@ from zoneinfo import ZoneInfo
 import networkx as nx
 
 from projdash.engine.resource_schedule import compute_resource_schedule
-from projdash.engine.schedule import compute_schedule
+from projdash.engine.schedule import ProjectScheduleInput, compute_schedule
 from projdash.service.commands import (
     AddBlocker,
     AddCalendarException,
@@ -288,9 +289,20 @@ class ProjectService:
             role_result = self._validate_required_roles_transition(envelope)
             if isinstance(role_result, CommandErrorResult):
                 return role_result
+            process_id = command.process_id
+            if command.process_symbol is not None:
+                try:
+                    process_id = self._repository.resolve_process_id(
+                        command.project_id,
+                        command.process_symbol,
+                    )
+                except ServiceValidationError as exc:
+                    if exc.code != "not_found":
+                        raise
+                    process_id = command.process_symbol
             process, revision = self._repository.upsert_process_revision(
                 project_id=command.project_id,
-                process_id=command.process_id,
+                process_id=process_id,
                 name=command.name,
                 effective_at=command.effective_at,
                 duration_business_days=command.duration_business_days,
@@ -731,7 +743,12 @@ class ProjectService:
         elif isinstance(query, QuerySchedule):
             data = self._schedule_data(query)
         elif isinstance(query, QueryCriticalPath):
-            projection = self._schedule(query.project_id, query.as_of, query.now)
+            projection = self._schedule(
+                query.project_id,
+                query.as_of,
+                query.now,
+                query.scope,
+            )
             path = list(projection.critical_path)
             data = {
                 "project_id": query.project_id,
@@ -776,12 +793,50 @@ class ProjectService:
         """Return blockers for direct Python callers."""
         return self._repository.list_blockers(project_id, include_resolved)
 
-    def _schedule(self, project_id, as_of, now):
+    def _schedule_input_for_scope(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        scope: Any,
+    ) -> ProjectScheduleInput:
         schedule_input = self._repository.get_project_schedule_input(project_id, as_of)
+        if scope is None:
+            return schedule_input
+        selected_ids, _scope_data, _target_process_id = (
+            self._repository.process_ids_for_scope(project_id, as_of, scope)
+        )
+        processes = []
+        for process in schedule_input.processes:
+            if process.process_id not in selected_ids:
+                continue
+            processes.append(
+                replace(
+                    process,
+                    dependencies=tuple(
+                        dependency
+                        for dependency in process.dependencies
+                        if dependency in selected_ids
+                    ),
+                )
+            )
+        return ProjectScheduleInput(
+            project_id=schedule_input.project_id,
+            name=schedule_input.name,
+            start_at=schedule_input.start_at,
+            processes=tuple(processes),
+        )
+
+    def _schedule(self, project_id, as_of, now, scope=None):
+        schedule_input = self._schedule_input_for_scope(project_id, as_of, scope)
         return compute_schedule(schedule_input, now)
 
     def _schedule_data(self, query: QuerySchedule) -> dict[str, object]:
-        graph = self._dependency_graph_parts(query.project_id, query.as_of, query.now)
+        graph = self._dependency_graph_parts(
+            query.project_id,
+            query.as_of,
+            query.now,
+            query.scope,
+        )
         return {
             "project_id": query.project_id,
             "as_of": query.as_of.isoformat(),
@@ -792,7 +847,12 @@ class ProjectService:
         }
 
     def _process_graph_data(self, query: QueryProcessGraph) -> dict[str, object]:
-        graph = self._dependency_graph_parts(query.project_id, query.as_of, query.now)
+        graph = self._dependency_graph_parts(
+            query.project_id,
+            query.as_of,
+            query.now,
+            query.scope,
+        )
         resource_schedule = None
         resource_by_process: dict[str, dict[str, object]] = {}
         if query.include_resource_fields:
@@ -866,10 +926,12 @@ class ProjectService:
         project_id: str,
         as_of: dt.datetime,
         now: dt.datetime,
+        scope: Any = None,
     ) -> dict[str, list[dict[str, object]]]:
-        schedule_input = self._repository.get_project_schedule_input(
+        schedule_input = self._schedule_input_for_scope(
             project_id,
             as_of,
+            scope,
         )
         projection = compute_schedule(schedule_input, now)
         input_by_id = {
@@ -1335,6 +1397,23 @@ class ProjectService:
             query.project_id,
             query.as_of,
         )
+        scope = getattr(query, "scope", None)
+        if isinstance(query, QueryCosts):
+            scope = None
+        if scope is not None:
+            scoped_ids, _scope_data, _target_process_id = (
+                self._repository.process_ids_for_scope(
+                    query.project_id,
+                    query.as_of,
+                    scope,
+                )
+            )
+            active_process_ids = [
+                process_id
+                for process_id in active_process_ids
+                if process_id in scoped_ids
+            ]
+        selected_process_ids = set(active_process_ids)
         processes = []
         requirements = []
         process_records = getattr(self._repository, "processes", {})
@@ -1347,11 +1426,16 @@ class ProjectService:
             if revision is None:
                 continue
             process = process_records.get(process_id)
+            dependencies = [
+                dependency
+                for dependency in revision.dependencies
+                if dependency in selected_process_ids
+            ]
             processes.append(
                 {
                     "process_id": process_id,
                     "name": revision.name,
-                    "dependencies": list(revision.dependencies),
+                    "dependencies": dependencies,
                     "duration_business_days": revision.duration_business_days,
                     "explicit_status": (
                         self._enum_value(process.status)
@@ -1988,9 +2072,19 @@ class ProjectService:
                     ),
                 }
             )
+        scoped_ids = None
+        if getattr(query, "scope", None) is not None:
+            scoped_ids, _scope_data, _target_process_id = (
+                self._repository.process_ids_for_scope(
+                    query.project_id,
+                    query.as_of,
+                    query.scope,
+                )
+            )
         demanded_by_role = self._demanded_effort_by_role(
             query.project_id,
             query.as_of,
+            scoped_ids,
         )
         fulfilled_by_role: dict[str, float] = defaultdict(float)
         for slice_data in slices:
@@ -2063,6 +2157,7 @@ class ProjectService:
         self,
         project_id: str,
         as_of: dt.datetime,
+        process_ids: set[str] | None = None,
     ) -> dict[str, float]:
         demanded: dict[str, float] = defaultdict(float)
         active_ids = self._repository.active_process_ids_as_of(
@@ -2070,6 +2165,8 @@ class ProjectService:
             as_of,
         )
         for process_id in active_ids:
+            if process_ids is not None and process_id not in process_ids:
+                continue
             revision = self._repository.selected_revision_as_of(
                 project_id,
                 process_id,
