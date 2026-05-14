@@ -27,8 +27,9 @@ processes.
   expose the collapsed process graph and allocation evidence, not the virtual
   nodes.
 - Process `duration_business_days` is not an input to resource-aware finish
-  arithmetic. A process duration is the collapsed span implied by fulfilled role
-  effort on resource-hour buckets.
+  arithmetic. `inferred_duration_hours` is the collapsed active scheduled time
+  implied by fulfilled resource-hour buckets; start/end datetimes still preserve
+  the wall-clock placement across nights, weekends, and holidays.
 - `started_at` is set when a process enters `in_progress` or `paused`. If no
   explicit `started_at` is supplied, the status edit datetime is used.
 - Marking a process `done` preserves any previous `started_at`; if none exists,

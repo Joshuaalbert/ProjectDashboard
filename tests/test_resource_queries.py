@@ -900,10 +900,12 @@ def test_resource_schedule_without_public_horizon_extends_to_required_work():
     assert rows[second_id]["allocation_state"] == "complete"
     assert rows[second_id]["starts_at"] > rows[first_id]["ends_at"]
     assert rows[second_id]["ends_at"] is not None
+    assert rows[second_id]["inferred_duration_hours"] == 40
     second_node = next(
         node for node in graph["nodes"] if node["process_symbol"] == "2nd-step"
     )
     assert second_node["resource_aware"]["allocation_state"] == "complete"
+    assert second_node["resource_aware"]["inferred_duration_hours"] == 40
 
 
 def test_resource_schedule_capacity_and_utilization_contracts():

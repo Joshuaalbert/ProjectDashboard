@@ -242,6 +242,7 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     )
     _attach_resource_schedule_windows(
         rows=processes_out,
+        allocation_slices=all_slices,
         processes=processes,
         dependencies=dependencies,
         topo_order=topo_order,
@@ -2748,6 +2749,7 @@ def _resource_critical_path(
 def _attach_resource_schedule_windows(
     *,
     rows: list[dict[str, object]],
+    allocation_slices: list[dict[str, object]],
     processes: list[Mapping[str, object]],
     dependencies: dict[str, tuple[str, ...]],
     topo_order: tuple[str, ...],
@@ -2755,6 +2757,7 @@ def _attach_resource_schedule_windows(
     """Attach process-level resource-aware ES/EF/LS/LF windows to rows."""
     row_by_id = {str(row["process_id"]): row for row in rows}
     process_by_id = {str(process["process_id"]): process for process in processes}
+    active_hours_by_process = _active_allocation_hours_by_process(allocation_slices)
     complete_ids = [
         process_id
         for process_id, row in row_by_id.items()
@@ -2786,15 +2789,18 @@ def _attach_resource_schedule_windows(
             continue
         starts_at = _as_utc(row["starts_at"])
         ends_at = _as_utc(row["ends_at"])
-        duration = max(ends_at - starts_at, dt.timedelta())
-        row["inferred_duration_hours"] = round(duration.total_seconds() / 3600, 6)
+        elapsed_duration = max(ends_at - starts_at, dt.timedelta())
+        active_duration_hours = active_hours_by_process.get(process_id)
+        if active_duration_hours is None:
+            active_duration_hours = elapsed_duration.total_seconds() / 3600
+        row["inferred_duration_hours"] = round(active_duration_hours, 6)
         process = process_by_id.get(process_id, {})
         if process.get("finished_at") is not None:
             ls_at = starts_at
             lf_at = ends_at
         elif process.get("started_at") is not None:
             ls_at = _as_utc(process["started_at"])
-            lf_at = ls_at + duration
+            lf_at = ls_at + elapsed_duration
         else:
             successor_starts = [
                 latest_start[successor_id]
@@ -2802,7 +2808,7 @@ def _attach_resource_schedule_windows(
                 if successor_id in latest_start
             ]
             lf_at = min(successor_starts, default=completion_at)
-            ls_at = lf_at - duration
+            ls_at = lf_at - elapsed_duration
         latest_start[process_id] = ls_at
         row["resource_ls_at"] = ls_at
         row["resource_lf_at"] = lf_at
@@ -2810,6 +2816,35 @@ def _attach_resource_schedule_windows(
             (ls_at - starts_at).total_seconds() / 3600,
             6,
         )
+
+
+def _active_allocation_hours_by_process(
+    allocation_slices: list[dict[str, object]],
+) -> dict[str, float]:
+    intervals_by_process: dict[str, list[tuple[dt.datetime, dt.datetime]]] = (
+        defaultdict(list)
+    )
+    for allocation in allocation_slices:
+        starts_at = _as_utc(allocation["starts_at"])
+        ends_at = _as_utc(allocation["ends_at"])
+        if ends_at <= starts_at:
+            continue
+        intervals_by_process[str(allocation["process_id"])].append((starts_at, ends_at))
+
+    output = {}
+    for process_id, intervals in intervals_by_process.items():
+        merged: list[list[dt.datetime]] = []
+        for starts_at, ends_at in sorted(intervals):
+            if not merged or starts_at > merged[-1][1]:
+                merged.append([starts_at, ends_at])
+                continue
+            if ends_at > merged[-1][1]:
+                merged[-1][1] = ends_at
+        output[process_id] = sum(
+            (ends_at - starts_at).total_seconds() / 3600
+            for starts_at, ends_at in merged
+        )
+    return output
 
 
 def _rows_by_process(state: Mapping[str, object]) -> dict[str, dict[str, object]]:
