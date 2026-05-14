@@ -64,6 +64,7 @@ from projdash.service.queries import (
     QueryDueDateHistory,
     QueryEnvelope,
     QueryProcessGraph,
+    QueryProjectCatalog,
     QueryResourceCapacity,
     QueryResourceSchedule,
     QuerySchedule,
@@ -103,7 +104,7 @@ class ProjectService:
         self._command_replay_cache: dict[
             object,
             dict[str, CommandResult | CommandErrorResult],
-        ] = {}
+        ] = self._load_command_replay_cache()
 
     def handle_command(
         self,
@@ -132,6 +133,7 @@ class ProjectService:
                 ),
             )
             cached[fingerprint] = result
+            self._persist_command_replay_cache()
             return result
         clone = getattr(self._repository, "clone", None)
         replace_with = getattr(self._repository, "replace_with", None)
@@ -147,6 +149,7 @@ class ProjectService:
                 ),
             )
             self._command_replay_cache[envelope.command_id] = {fingerprint: result}
+            self._persist_command_replay_cache()
             return result
 
         staged = clone()
@@ -169,9 +172,26 @@ class ProjectService:
                 error=exc.to_error(),
             )
         if result.ok:
-            replace_with(staged)
-            self._command_replay_cache = staged_service._command_replay_cache
+            try:
+                replace_with(staged)
+            except ServiceValidationError as exc:
+                result = CommandErrorResult(
+                    command_id=envelope.command_id,
+                    error=exc.to_error(),
+                )
+            except Exception as exc:  # pragma: no cover - defensive persistence guard.
+                result = CommandErrorResult(
+                    command_id=envelope.command_id,
+                    error=Error(
+                        code="persistence_error",
+                        message="Repository failed while committing staged command.",
+                        details={"error": str(exc)},
+                    ),
+                )
+            else:
+                self._command_replay_cache = staged_service._command_replay_cache
         self._command_replay_cache[envelope.command_id] = {fingerprint: result}
+        self._persist_command_replay_cache()
         return result
 
     def _handle_command(
@@ -182,9 +202,10 @@ class ProjectService:
         command = envelope.command
         if isinstance(command, CreateProject):
             project = self._repository.create_project(
-                command.name,
-                command.start_at,
-                command.default_currency,
+                name=command.name,
+                start_at=command.start_at,
+                default_currency=command.default_currency,
+                project_id=command.project_id,
             )
             return CommandResult(
                 command_id=envelope.command_id,
@@ -377,6 +398,7 @@ class ProjectService:
                 cost_rate=command.cost_rate,
                 cost_unit=command.cost_unit,
                 cost_currency=command.cost_currency,
+                holidays=command.holidays,
                 active=command.active,
             )
             return CommandResult(
@@ -491,9 +513,15 @@ class ProjectService:
                 entity_ids={"process_id": process_id},
             )
         if isinstance(command, RenameRole):
-            raise ServiceValidationError(
-                code="unsupported_command",
-                message=f"Unsupported command type: {type(command)!r}",
+            role_id = self._repository_call(
+                "rename_role",
+                project_id=command.project_id,
+                role_id=command.role_id,
+                name=command.name,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"role_id": role_id},
             )
         if isinstance(command, ReplaceProcessWithSubgraph):
             process_id = self._resolve_process_id(
@@ -633,8 +661,28 @@ class ProjectService:
                 ]
                 return [*rolled_back, result, *skipped]
             results.append(result)
-        replace_with(staged)
+        try:
+            replace_with(staged)
+        except ServiceValidationError as exc:
+            return [
+                CommandErrorResult(
+                    command_id=command.command_id,
+                    error=exc.to_error(),
+                )
+                for command in envelope.commands
+            ]
+        except Exception as exc:  # pragma: no cover - defensive persistence guard.
+            error = Error(
+                code="persistence_error",
+                message="Repository failed while committing staged batch.",
+                details={"error": str(exc)},
+            )
+            return [
+                CommandErrorResult(command_id=command.command_id, error=error)
+                for command in envelope.commands
+            ]
         self._command_replay_cache = staged_service._command_replay_cache
+        self._persist_command_replay_cache()
         return results
 
     def handle_query(self, envelope: QueryEnvelope) -> QueryResult | QueryErrorResult:
@@ -650,6 +698,8 @@ class ProjectService:
         if isinstance(query, GetProject):
             project = self._repository.get_project(query.project_id)
             data = {"project": project.model_dump(mode="json")}
+        elif isinstance(query, QueryProjectCatalog):
+            data = self._project_catalog_data(query)
         elif isinstance(query, QuerySchedule):
             data = self._schedule_data(query)
         elif isinstance(query, QueryCriticalPath):
@@ -991,6 +1041,30 @@ class ProjectService:
                 row["blocking_count"] += 1
                 row["blocker_ids"].append(blocker.blocker_id)
         return summary
+
+    def _project_catalog_data(self, query: QueryProjectCatalog) -> dict[str, object]:
+        self._repository.get_project(query.project_id)
+        roles = [
+            self._json_ready(role)
+            for role in getattr(self._repository, "roles", {}).values()
+            if role["project_id"] == query.project_id
+        ]
+        calendars = [
+            self._json_ready(calendar)
+            for calendar in getattr(self._repository, "calendars", {}).values()
+            if calendar["project_id"] == query.project_id
+        ]
+        resources = [
+            self._json_ready(resource)
+            for resource in getattr(self._repository, "resources", {}).values()
+            if resource["project_id"] == query.project_id
+        ]
+        return {
+            "project_id": query.project_id,
+            "roles": sorted(roles, key=lambda item: item["role_id"]),
+            "calendars": sorted(calendars, key=lambda item: item["calendar_id"]),
+            "resources": sorted(resources, key=lambda item: item["resource_id"]),
+        }
 
     def _blocker_data(self, query: QueryBlockers) -> dict[str, object]:
         list_as_of = getattr(self._repository, "list_blockers_as_of", None)
@@ -2967,6 +3041,7 @@ class ProjectService:
                         cost_rate=operation.resource.cost_rate,
                         cost_unit=operation.resource.cost_unit,
                         cost_currency=operation.resource.cost_currency,
+                        holidays=operation.resource.holidays,
                         active=operation.resource.active,
                     )
                 resource_ids.append(resource_id)
@@ -3461,6 +3536,9 @@ class ProjectService:
         default_currency = repository.get_project(project_id).default_currency
         cost_currency = resource.cost_currency or default_currency
         cost_unit = getattr(resource.cost_unit, "value", resource.cost_unit)
+        if any(holiday.holiday_id is None for holiday in resource.holidays):
+            return False
+        holiday_records = [holiday.model_dump() for holiday in resource.holidays]
         return (
             existing.get("name") == resource.name
             and existing.get("role_ids") == resource.role_ids
@@ -3470,6 +3548,7 @@ class ProjectService:
             and existing.get("cost_rate") == str(resource.cost_rate)
             and existing.get("cost_unit") == cost_unit
             and existing.get("cost_currency") == cost_currency
+            and existing.get("holidays", []) == holiday_records
             and existing.get("active") == resource.active
         )
 
@@ -3506,6 +3585,19 @@ class ProjectService:
             and resource.get("project_id") == project_id
             and resource.get("calendar_id") == calendar_id
         )
+
+    def _load_command_replay_cache(
+        self,
+    ) -> dict[object, dict[str, CommandResult | CommandErrorResult]]:
+        loader = getattr(self._repository, "load_command_replay_cache", None)
+        if callable(loader):
+            return loader()
+        return {}
+
+    def _persist_command_replay_cache(self) -> None:
+        persister = getattr(self._repository, "replace_command_replay_cache", None)
+        if callable(persister):
+            persister(self._command_replay_cache)
 
     def _repository_call(self, method_name: str, **kwargs):
         return self._repository_call_on(self._repository, method_name, **kwargs)

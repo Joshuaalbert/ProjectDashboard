@@ -211,6 +211,47 @@ def _calendar_exceptions(
     return calendar.get("exceptions", [])
 
 
+def test_upsert_resource_stores_timezone_aware_holidays():
+    repository = InMemoryProjectRepository()
+    service = ProjectService(repository)
+    project_id, role_id, calendar_id, resource_id, _ = _seed_allocatable_project(
+        service,
+    )
+
+    _handle(
+        service,
+        {
+            "action": "upsert_resource",
+            "project_id": project_id,
+            "resource_id": resource_id,
+            "name": "Ada",
+            "role_ids": [role_id],
+            "calendar_id": calendar_id,
+            "available_from_at": _iso(13, 13),
+            "cost_rate": "125.00",
+            "cost_unit": "hour",
+            "holidays": [
+                {
+                    "holiday_id": "ada-vacation",
+                    "starts_at": _iso(18, 0),
+                    "ends_at": _iso(19, 0),
+                    "reason": "Vacation",
+                }
+            ],
+        },
+    )
+
+    resource = _find_record_by_id(repository, "resource_id", resource_id)
+    assert resource["holidays"] == [
+        {
+            "holiday_id": "ada-vacation",
+            "starts_at": _at(18, 0),
+            "ends_at": _at(19, 0),
+            "reason": "Vacation",
+        }
+    ]
+
+
 def test_cross_project_resource_references_are_rejected():
     repository = InMemoryProjectRepository()
     service = ProjectService(repository)
@@ -1215,6 +1256,95 @@ def test_active_duplicate_role_names_are_rejected_without_writes():
 
     _assert_failed_command_result(result)
     assert _repository_snapshot(repository) == before_duplicate
+
+
+def test_rename_role_updates_catalog_and_rejects_duplicate_names():
+    repository = InMemoryProjectRepository()
+    service = ProjectService(repository)
+    project_id = _create_project(service)
+    _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-engineer",
+            "name": "Engineer",
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-reviewer",
+            "name": "Reviewer",
+        },
+    )
+
+    rename_result = _handle(
+        service,
+        {
+            "action": "rename_role",
+            "project_id": project_id,
+            "role_id": "role-reviewer",
+            "name": "QA Reviewer",
+        },
+    )
+    before_duplicate = _repository_snapshot(repository)
+    duplicate_result = _handle(
+        service,
+        {
+            "action": "rename_role",
+            "project_id": project_id,
+            "role_id": "role-engineer",
+            "name": "QA Reviewer",
+        },
+    )
+    catalog_result = _query(
+        service,
+        {
+            "action": "query_project_catalog",
+            "project_id": project_id,
+        },
+    )
+
+    assert rename_result.ok is True
+    assert rename_result.entity_ids == {"role_id": "role-reviewer"}
+    _assert_failed_command_result(duplicate_result)
+    assert duplicate_result.error.code == "duplicate_role_name"
+    assert _repository_snapshot(repository) == before_duplicate
+    roles_by_id = {
+        role["role_id"]: role["name"]
+        for role in catalog_result.data["roles"]
+    }
+    assert roles_by_id == {
+        "role-engineer": "Engineer",
+        "role-reviewer": "QA Reviewer",
+    }
+
+
+def test_project_catalog_query_lists_roles_calendars_and_resources():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, role_id, calendar_id, resource_id, _ = _seed_allocatable_project(
+        service,
+    )
+
+    result = _query(
+        service,
+        {
+            "action": "query_project_catalog",
+            "project_id": project_id,
+        },
+    )
+
+    assert result.ok is True
+    assert [role["role_id"] for role in result.data["roles"]] == [role_id]
+    assert [calendar["calendar_id"] for calendar in result.data["calendars"]] == [
+        calendar_id,
+    ]
+    assert [resource["resource_id"] for resource in result.data["resources"]] == [
+        resource_id,
+    ]
 
 
 def test_role_id_reuse_with_conflicting_fields_rejects_without_writes():

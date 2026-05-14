@@ -713,6 +713,156 @@ def test_resource_calendar_pto_exception_replaces_capacity_only_inside_work_wind
     )
 
 
+def test_resource_holidays_close_only_that_resource_capacity():
+    calendar = {
+        "calendar_id": "cal_shared",
+        "project_id": "project",
+        "name": "Shared UTC",
+        "timezone": "UTC",
+        "weekly_windows": [
+            {
+                "window_id": "monday",
+                "weekday": 0,
+                "start_local_time": "09:00:00",
+                "end_local_time": "17:00:00",
+                "capacity_hours": 8,
+            }
+        ],
+        "exceptions": [],
+        "active": True,
+    }
+    holiday_resource = {
+        "resource_id": "res_on_holiday",
+        "role_ids": ["role_dev"],
+        "available_from_at": dt.datetime(2026, 5, 11, 0, tzinfo=UTC),
+        "available_until_at": None,
+        "holidays": [
+            {
+                "holiday_id": "bank_holiday",
+                "starts_at": dt.datetime(2026, 5, 11, 0, tzinfo=UTC),
+                "ends_at": dt.datetime(2026, 5, 12, 0, tzinfo=UTC),
+                "reason": "Bank holiday",
+            }
+        ],
+        "active": True,
+    }
+    working_resource = {
+        "resource_id": "res_working",
+        "role_ids": ["role_dev"],
+        "available_from_at": dt.datetime(2026, 5, 11, 0, tzinfo=UTC),
+        "available_until_at": None,
+        "holidays": [],
+        "active": True,
+    }
+
+    closed_buckets = _expand_resource_calendar(
+        calendar=calendar,
+        resource=holiday_resource,
+        horizon_starts_at=dt.datetime(2026, 5, 11, 0, tzinfo=UTC),
+        horizon_ends_at=dt.datetime(2026, 5, 12, 0, tzinfo=UTC),
+    )
+    working_buckets = _expand_resource_calendar(
+        calendar=calendar,
+        resource=working_resource,
+        horizon_starts_at=dt.datetime(2026, 5, 11, 0, tzinfo=UTC),
+        horizon_ends_at=dt.datetime(2026, 5, 12, 0, tzinfo=UTC),
+    )
+
+    assert closed_buckets == []
+    assert sum(float(_value(bucket, "capacity_hours")) for bucket in working_buckets) == 8.0
+
+
+def test_resource_holidays_clip_partial_work_windows():
+    calendar = {
+        "calendar_id": "cal_partial_holiday",
+        "project_id": "project",
+        "name": "Partial holiday UTC",
+        "timezone": "UTC",
+        "weekly_windows": [
+            {
+                "window_id": "monday",
+                "weekday": 0,
+                "start_local_time": "09:00:00",
+                "end_local_time": "17:00:00",
+                "capacity_hours": 8,
+            }
+        ],
+        "exceptions": [],
+        "active": True,
+    }
+    resource = {
+        "resource_id": "res_partial_holiday",
+        "role_ids": ["role_dev"],
+        "available_from_at": dt.datetime(2026, 5, 11, 0, tzinfo=UTC),
+        "available_until_at": None,
+        "holidays": [
+            {
+                "holiday_id": "afternoon_closure",
+                "starts_at": dt.datetime(2026, 5, 11, 12, tzinfo=UTC),
+                "ends_at": dt.datetime(2026, 5, 11, 15, tzinfo=UTC),
+                "reason": "Personal holiday",
+            }
+        ],
+        "active": True,
+    }
+
+    buckets = _expand_resource_calendar(
+        calendar=calendar,
+        resource=resource,
+        horizon_starts_at=dt.datetime(2026, 5, 11, 0, tzinfo=UTC),
+        horizon_ends_at=dt.datetime(2026, 5, 12, 0, tzinfo=UTC),
+    )
+
+    assert _bucket_expectations(buckets) == [
+        ExpectedBucket(
+            starts_at="2026-05-11T09:00:00+00:00",
+            ends_at="2026-05-11T10:00:00+00:00",
+            capacity_hours=1.0,
+        ),
+        ExpectedBucket(
+            starts_at="2026-05-11T10:00:00+00:00",
+            ends_at="2026-05-11T11:00:00+00:00",
+            capacity_hours=1.0,
+        ),
+        ExpectedBucket(
+            starts_at="2026-05-11T11:00:00+00:00",
+            ends_at="2026-05-11T12:00:00+00:00",
+            capacity_hours=1.0,
+        ),
+        ExpectedBucket(
+            starts_at="2026-05-11T15:00:00+00:00",
+            ends_at="2026-05-11T16:00:00+00:00",
+            capacity_hours=1.0,
+        ),
+        ExpectedBucket(
+            starts_at="2026-05-11T16:00:00+00:00",
+            ends_at="2026-05-11T17:00:00+00:00",
+            capacity_hours=1.0,
+        ),
+    ]
+
+
+def test_resource_calendar_rejects_naive_resource_holiday_datetimes():
+    resource = {
+        **_base_resource(),
+        "holidays": [
+            {
+                "holiday_id": "naive_holiday",
+                "starts_at": dt.datetime(2026, 5, 11, 9),
+                "ends_at": dt.datetime(2026, 5, 11, 17, tzinfo=UTC),
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _expand_resource_calendar(
+            calendar=_base_calendar(),
+            resource=resource,
+            horizon_starts_at=dt.datetime(2026, 5, 11, 0, tzinfo=UTC),
+            horizon_ends_at=dt.datetime(2026, 5, 12, 0, tzinfo=UTC),
+        )
+
+
 def test_resource_calendar_output_is_sorted_by_time_resource_and_calendar_ids():
     calendar = {
         "calendar_id": "cal_sort",

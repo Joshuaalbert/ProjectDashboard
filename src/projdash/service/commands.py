@@ -51,6 +51,7 @@ class CreateProject(CommandModel):
     """Create a project."""
 
     action: Literal["create_project"] = "create_project"
+    project_id: str | None = Field(default=None, min_length=1)
     name: str = Field(min_length=1)
     start_at: AwareDatetime
     default_currency: str = Field(default="USD", min_length=3, max_length=3)

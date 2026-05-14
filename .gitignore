@@ -1,6 +1,8 @@
 secrets.toml
 *.json
 *.lbug
+*.lbug.shadow
+*.lbug.wal
 *.lbug/
 __pycache__/
 *.py[cod]

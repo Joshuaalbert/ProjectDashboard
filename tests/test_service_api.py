@@ -151,6 +151,40 @@ def test_service_creates_project_and_process_revision():
     assert graph_query_result.data["nodes"][0]["name"] == "Define service API"
 
 
+def test_service_create_project_accepts_explicit_id_and_rejects_reuse():
+    service = ProjectService(InMemoryProjectRepository())
+
+    first = service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "create_project",
+                    "project_id": "project-stable",
+                    "name": "Stable Project",
+                    "start_at": _at(13).isoformat(),
+                }
+            }
+        )
+    )
+    second = service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "create_project",
+                    "project_id": "project-stable",
+                    "name": "Duplicate Stable Project",
+                    "start_at": _at(13).isoformat(),
+                }
+            }
+        )
+    )
+
+    assert first.ok is True
+    assert first.entity_ids == {"project_id": "project-stable"}
+    assert second.ok is False
+    assert second.error.code == "project_conflict"
+
+
 def test_batch_commands_are_applied_in_order():
     service = ProjectService(InMemoryProjectRepository())
     project_result = service.handle_command(

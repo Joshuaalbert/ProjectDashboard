@@ -38,6 +38,13 @@ class GetProject(QueryModel):
     project_id: str = Field(min_length=1)
 
 
+class QueryProjectCatalog(QueryModel):
+    """Fetch project-owned management facts for guided UI forms."""
+
+    action: Literal["query_project_catalog"] = "query_project_catalog"
+    project_id: str = Field(min_length=1)
+
+
 class ResourceOptionsMixin(StrictModel):
     """Shared resource scheduling query options."""
 
@@ -269,6 +276,7 @@ class QueryUnallocatedRequirements(QueryModel, HorizonMixin, ResourceOptionsMixi
 
 Query = Annotated[
     GetProject
+    | QueryProjectCatalog
     | QuerySchedule
     | QueryCriticalPath
     | QueryProcessGraph
@@ -299,6 +307,7 @@ __all__ = [
     "QueryDueDateHistory",
     "QueryEnvelope",
     "QueryProcessGraph",
+    "QueryProjectCatalog",
     "QueryResourceCapacity",
     "QueryResourceSchedule",
     "QuerySchedule",

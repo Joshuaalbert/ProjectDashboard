@@ -86,6 +86,7 @@ warning aliases.
   "command_id": "optional uuid",
   "command": {
     "action": "create_project",
+    "project_id": "optional stable project id",
     "name": "Launch Plan",
     "start_at": "2026-05-13T09:00:00-04:00",
     "default_currency": "USD"
@@ -650,11 +651,13 @@ Resource planning actions:
 | `set_calendar_active` | `project_id`, `calendar_id`, `active` | `force` default `false` | `calendar_id` |
 | `add_calendar_exception` | `project_id`, `calendar_id`, `starts_at`, `ends_at`, `capacity_hours` | `exception_id`, `reason` | `exception_id` |
 | `remove_calendar_exception` | `project_id`, `calendar_id`, `exception_id` | none | `exception_id` |
-| `upsert_resource` | `project_id`, `name`, `role_ids`, `calendar_id`, `available_from_at`, `cost_rate`, `cost_unit` | `resource_id`, `available_until_at`, `cost_currency`, `active` default `true` | `resource_id` |
+| `upsert_resource` | `project_id`, `name`, `role_ids`, `calendar_id`, `available_from_at`, `cost_rate`, `cost_unit` | `resource_id`, `available_until_at`, `cost_currency`, `holidays`, `active` default `true` | `resource_id` |
 | `set_resource_active` | `project_id`, `resource_id`, `active` | none | `resource_id` |
 | `set_resource_roles` | `project_id`, `resource_id`, `role_ids` | none | `resource_id` |
 | `set_resource_calendar` | `project_id`, `resource_id`, `calendar_id` | none | `resource_id` |
 
+`create_project.project_id` is optional; when omitted, the service generates an
+id. UI bootstrapping and agents that need stable references should provide it.
 `create_project.default_currency` is optional and defaults to `USD`.
 `set_project_default_currency` requires `project_id` and `default_currency`.
 Currencies are ISO 4217 codes.
@@ -679,6 +682,20 @@ Calendar exceptions replace recurring capacity only where the exception interval
 intersects an existing weekly window. They do not create capacity outside
 recurring windows in v1. Use another weekly window for planned recurring
 capacity.
+
+Resource holidays:
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `holiday_id` | string | Optional; generated when omitted. Supplied ids must be unique within the resource. |
+| `starts_at` | aware datetime | Inclusive. |
+| `ends_at` | aware datetime | Exclusive and after `starts_at`. |
+| `reason` | string | Optional. |
+
+Holidays are resource-local zero-capacity intervals. Use timezone-aware
+datetimes for full-day local holidays, for example local midnight to the next
+local midnight. Holidays close only that resource's capacity after reusable
+calendar windows and calendar exceptions are applied.
 
 Process `role_requirements` item:
 
@@ -738,6 +755,7 @@ Initial dependency-only queries:
 - `query_process_graph`
 - `query_blockers`
 - `query_due_date_history`
+- `query_project_catalog`
 
 Process query field tables:
 
@@ -748,6 +766,11 @@ Process query field tables:
 | `query_process_graph` | `project_id`, `as_of`, `now` | `scope`, `include_resource_fields` default `false`, `horizon_starts_at`, `horizon_ends_at`, shared resource query options, `include_allocation_slices` default `false` | `ProcessGraphData` |
 | `query_blockers` | `project_id`, `as_of` | `process_ids`, `process_symbols`, `include_resolved` default `false` | `BlockerData` |
 | `query_due_date_history` | `project_id`, `as_of` | `scope`, `target_process_id`, `target_process_symbol`, `include_project_total` default `true` | `DueDateHistoryData` |
+| `query_project_catalog` | `project_id` | none | `ProjectCatalogData` |
+
+`query_project_catalog` returns the current role, calendar, and resource
+catalogs for forms and agent-side lookup. It is intentionally not schedule
+aware; use schedule/resource queries for time-varying projections.
 
 `scope` is optional and defaults to the whole active process graph. Supported
 values are `{"type": "project"}`,

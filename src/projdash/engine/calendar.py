@@ -46,6 +46,13 @@ class _CalendarException:
 
 
 @dataclass(frozen=True, slots=True)
+class _ResourceHoliday:
+    holiday_id: str
+    starts_at: dt.datetime
+    ends_at: dt.datetime
+
+
+@dataclass(frozen=True, slots=True)
 class _CapacityInterval:
     starts_at: dt.datetime
     ends_at: dt.datetime
@@ -226,6 +233,7 @@ def expand_resource_calendar(
 
     weekly_windows = _parse_weekly_windows(calendar.get("weekly_windows", ()))
     exceptions = _parse_exceptions(calendar.get("exceptions", ()))
+    holidays = _parse_holidays(resource.get("holidays", ()))
     _validate_weekly_windows_do_not_overlap(weekly_windows)
     _validate_exceptions_do_not_conflict(exceptions)
 
@@ -243,6 +251,7 @@ def expand_resource_calendar(
                 exceptions=exceptions,
             )
             intervals.extend(interval)
+    intervals = list(_apply_resource_holidays(tuple(intervals), holidays))
 
     buckets: list[CapacityBucket] = []
     resource_id = str(resource["resource_id"])
@@ -351,6 +360,41 @@ def _parse_exceptions(value: object) -> tuple[_CalendarException, ...]:
             )
         )
     return tuple(exceptions)
+
+
+def _parse_holidays(value: object) -> tuple[_ResourceHoliday, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list | tuple):
+        raise ValueError("holidays must be a sequence")
+
+    holidays: list[_ResourceHoliday] = []
+    seen_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ValueError("resource holiday must be an object")
+
+        holiday_id_value = item.get("holiday_id")
+        if not holiday_id_value:
+            raise ValueError("holiday_id is required")
+        holiday_id = str(holiday_id_value)
+        if holiday_id in seen_ids:
+            raise ValueError(f"duplicate holiday id {holiday_id!r}")
+        seen_ids.add(holiday_id)
+
+        starts_at = _coerce_aware_datetime(item["starts_at"], "holiday starts_at")
+        ends_at = _coerce_aware_datetime(item["ends_at"], "holiday ends_at")
+        if ends_at <= starts_at:
+            raise ValueError("holiday ends_at must be after starts_at")
+
+        holidays.append(
+            _ResourceHoliday(
+                holiday_id=holiday_id,
+                starts_at=starts_at.astimezone(UTC),
+                ends_at=ends_at.astimezone(UTC),
+            )
+        )
+    return tuple(holidays)
 
 
 def _parse_local_time(value: object, field_name: str) -> dt.time:
@@ -541,6 +585,60 @@ def _apply_exceptions(
             )
         )
     return tuple(intervals)
+
+
+def _apply_resource_holidays(
+    intervals: tuple[_CapacityInterval, ...],
+    holidays: tuple[_ResourceHoliday, ...],
+) -> tuple[_CapacityInterval, ...]:
+    if not holidays:
+        return intervals
+
+    output: list[_CapacityInterval] = []
+    for interval in intervals:
+        boundaries = {interval.starts_at, interval.ends_at}
+        overlapping_holidays = []
+        for holiday in holidays:
+            overlap_starts_at = max(interval.starts_at, holiday.starts_at)
+            overlap_ends_at = min(interval.ends_at, holiday.ends_at)
+            if overlap_ends_at <= overlap_starts_at:
+                continue
+            boundaries.add(overlap_starts_at)
+            boundaries.add(overlap_ends_at)
+            overlapping_holidays.append(holiday)
+
+        ordered_boundaries = sorted(boundaries)
+        base_elapsed_hours = _hours_between(interval.starts_at, interval.ends_at)
+        for segment_starts_at, segment_ends_at in zip(
+            ordered_boundaries,
+            ordered_boundaries[1:],
+            strict=False,
+        ):
+            if segment_ends_at <= segment_starts_at:
+                continue
+            if any(
+                holiday.starts_at < segment_ends_at
+                and segment_starts_at < holiday.ends_at
+                for holiday in overlapping_holidays
+            ):
+                continue
+            segment_capacity = (
+                interval.capacity_hours
+                * _hours_between(segment_starts_at, segment_ends_at)
+                / base_elapsed_hours
+            )
+            if segment_capacity <= 0:
+                continue
+            output.append(
+                _CapacityInterval(
+                    starts_at=segment_starts_at,
+                    ends_at=segment_ends_at,
+                    capacity_hours=segment_capacity,
+                    local_date=interval.local_date,
+                    local_week=interval.local_week,
+                )
+            )
+    return tuple(output)
 
 
 def _split_interval_into_buckets(

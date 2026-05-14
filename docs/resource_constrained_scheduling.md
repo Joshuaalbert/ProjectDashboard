@@ -258,7 +258,21 @@ Resource fields:
 | `cost_rate` | decimal string or number | yes | Finite, `>= 0`. |
 | `cost_unit` | enum | yes | `hour`, `day`, `week`, or `fixed`. |
 | `cost_currency` | string | yes | ISO 4217 code, default project currency if omitted by command. |
+| `holidays` | list | no | Resource-local zero-capacity intervals. |
 | `active` | bool | yes | Inactive resources have no schedulable capacity. |
+
+Resource holiday fields:
+
+| Field | Type | Required | Rules |
+| --- | --- | --- | --- |
+| `holiday_id` | string | no | Unique within the resource; generated when omitted by command. |
+| `starts_at` | aware datetime | yes | Inclusive instant. |
+| `ends_at` | aware datetime | yes | Exclusive and after `starts_at`. |
+| `reason` | string | no | Human note. |
+
+Resource holidays close capacity for only that resource after reusable calendar
+windows and calendar exceptions have been applied. They do not change the
+shared calendar and they do not create capacity outside weekly windows.
 
 Cost accounting:
 
@@ -703,10 +717,11 @@ For each active resource:
    clipped horizon.
 3. Apply exceptions by replacing recurring capacity over intersecting
    half-open intervals.
-4. Split intervals into `planning_granularity` buckets in UTC. Buckets keep
+4. Apply resource-local holidays as zero-capacity half-open intervals.
+5. Split intervals into `planning_granularity` buckets in UTC. Buckets keep
    `calendar_id`, `resource_id`, `starts_at`, `ends_at`, `capacity_hours`,
    `available_hours`, `local_date`, and `local_week`.
-5. Drop zero-capacity buckets after exception application.
+6. Drop zero-capacity buckets after exception and holiday application.
 
 Capacity distribution:
 
@@ -961,6 +976,10 @@ User-facing semantics and limitations:
 - `critical_path_process_ids` explains the dependency chain that gates the final
   resource-constrained finish after resource effects have changed process
   `ends_at` values. It is not a resource-contention explanation graph.
+- "Process-level" means every item in the path is an authored process node.
+  Resource calendars, resource holidays, allocation slices, and shared-capacity
+  contention influence the selected process finish times, but they are not
+  materialized as nodes in the returned critical path.
 - Resource contention can make a process critical even when no predecessor
   gates it; in that case the path may contain only that delayed process.
 - To explain which resource caused delay, users and agents must inspect
@@ -1024,7 +1043,7 @@ Command field tables:
 
 | Action | Required fields | Optional fields | Result `entity_ids` |
 | --- | --- | --- | --- |
-| `create_project` | existing required fields | `default_currency` default `USD` | `project_id` |
+| `create_project` | existing required fields | `project_id`, `default_currency` default `USD` | `project_id` |
 | `set_project_default_currency` | `project_id`, `default_currency` | none | `project_id` |
 | `set_project_due_at` | `project_id`, `due_at`, `edit_at` | none | `project_id`, `due_history_event_id` |
 | `clear_project_due_at` | `project_id`, `edit_at` | none | `project_id`, `due_history_event_id` |
@@ -1044,7 +1063,7 @@ Command field tables:
 | `set_calendar_active` | `project_id`, `calendar_id`, `active` | `force` default `false` | `calendar_id` |
 | `add_calendar_exception` | `project_id`, `calendar_id`, `starts_at`, `ends_at`, `capacity_hours` | `exception_id`, `reason` | `exception_id` |
 | `remove_calendar_exception` | `project_id`, `calendar_id`, `exception_id` | none | `exception_id` |
-| `upsert_resource` | `project_id`, `name`, `role_ids`, `calendar_id`, `available_from_at`, `cost_rate`, `cost_unit` | `resource_id`, `available_until_at`, `cost_currency`, `active` | `resource_id` |
+| `upsert_resource` | `project_id`, `name`, `role_ids`, `calendar_id`, `available_from_at`, `cost_rate`, `cost_unit` | `resource_id`, `available_until_at`, `cost_currency`, `holidays`, `active` | `resource_id` |
 | `set_resource_active` | `project_id`, `resource_id`, `active` | none | `resource_id` |
 | `set_resource_roles` | `project_id`, `resource_id`, `role_ids` | none | `resource_id` |
 | `set_resource_calendar` | `project_id`, `resource_id`, `calendar_id` | none | `resource_id` |
@@ -1113,6 +1132,7 @@ Query field tables:
 | `query_process_graph` | `project_id`, `as_of`, `now` | `scope`, `include_resource_fields`, `horizon_starts_at`, `horizon_ends_at`, shared resource query options, `include_allocation_slices` | process graph nodes/edges with CPM and optional resource-aware fields |
 | `query_blockers` | `project_id`, `as_of` | `process_ids`, `process_symbols`, `include_resolved` default `false` | blocker rows and blocked process ids |
 | `query_due_date_history` | `project_id`, `as_of` | `scope`, `target_process_id`, `target_process_symbol`, `include_project_total` default `true` | due-date history events |
+| `query_project_catalog` | `project_id` | none | current role, calendar, and resource catalogs |
 | `query_resource_schedule` | `project_id`, `as_of`, `now`, `horizon_starts_at`, `horizon_ends_at` | `include_allocation_slices`, `planning_granularity`, `max_iterations`, `convergence_tolerance_hours`, `blocked_policy` | schedule rows, optional allocation slices, process criticality, convergence |
 | `query_utilization` | `project_id`, `as_of`, `now`, `horizon_starts_at`, `horizon_ends_at` | `planning_granularity`, `max_iterations`, `convergence_tolerance_hours`, `blocked_policy` | utilization aggregates |
 | `query_costs` | `project_id`, `as_of`, `now`, `horizon_starts_at`, `horizon_ends_at` | `scope`, `target_process_id`, `target_process_symbol`, `resource_ids`, `role_ids`, `planning_granularity`, `currency`, `group_by`, `max_iterations`, `convergence_tolerance_hours`, `blocked_policy` | cost aggregates |

@@ -22,6 +22,7 @@ from projdash.service.models import (
     ProcessRevisionRecord,
     ProcessStatus,
     ProjectRecord,
+    ResourceHolidayCommand,
     RoleRequirementCommand,
 )
 
@@ -56,6 +57,7 @@ class ProjectRepository(Protocol):
         name: str,
         start_at: dt.datetime,
         default_currency: str = "USD",
+        project_id: str | None = None,
     ) -> ProjectRecord:
         """Create and persist a project."""
 
@@ -66,6 +68,14 @@ class ProjectRepository(Protocol):
         role_id: str | None = None,
     ) -> str:
         """Create and persist a project role."""
+
+    def rename_role(
+        self,
+        project_id: str,
+        role_id: str,
+        name: str,
+    ) -> str:
+        """Rename a project role."""
 
     def get_project(self, project_id: str) -> ProjectRecord:
         """Return a project by id."""
@@ -153,6 +163,7 @@ class ProjectRepository(Protocol):
         cost_unit: CostUnit,
         cost_currency: str | None = None,
         available_until_at: dt.datetime | None = None,
+        holidays: list[ResourceHolidayCommand] | None = None,
         active: bool = True,
     ) -> str:
         """Create or replace a resource."""
@@ -259,9 +270,17 @@ class InMemoryProjectRepository:
         name: str,
         start_at: dt.datetime,
         default_currency: str = "USD",
+        project_id: str | None = None,
     ) -> ProjectRecord:
+        resolved_project_id = project_id or new_id()
+        if resolved_project_id in self.projects:
+            raise ServiceValidationError(
+                code="project_conflict",
+                message="Project id already exists.",
+                entity_id=resolved_project_id,
+            )
         project = ProjectRecord(
-            project_id=new_id(),
+            project_id=resolved_project_id,
             name=name,
             start_at=start_at,
             default_currency=default_currency,
@@ -302,6 +321,28 @@ class InMemoryProjectRepository:
         }
         self.role_ids_by_project[project_id].append(resolved_role_id)
         return resolved_role_id
+
+    def rename_role(
+        self,
+        project_id: str,
+        role_id: str,
+        name: str,
+    ) -> str:
+        role = self._get_role(project_id, role_id)
+        for existing_id in self.role_ids_by_project[project_id]:
+            existing = self.roles[existing_id]
+            if (
+                existing_id != role_id
+                and existing["active"]
+                and existing["name"] == name
+            ):
+                raise ServiceValidationError(
+                    code="duplicate_role_name",
+                    message="Active role names must be unique within a project.",
+                    field_path="name",
+                )
+        role["name"] = name
+        return role_id
 
     def get_project(self, project_id: str) -> ProjectRecord:
         if project_id not in self.projects:
@@ -628,6 +669,7 @@ class InMemoryProjectRepository:
         cost_unit: CostUnit,
         cost_currency: str | None = None,
         available_until_at: dt.datetime | None = None,
+        holidays: list[ResourceHolidayCommand] | None = None,
         active: bool = True,
     ) -> str:
         self.get_project(project_id)
@@ -657,6 +699,26 @@ class InMemoryProjectRepository:
             calendar_id=calendar_id,
             active=active,
         )
+        holiday_records = []
+        seen_holiday_ids: set[str] = set()
+        for holiday in holidays or []:
+            holiday_id = holiday.holiday_id or new_id()
+            if holiday_id in seen_holiday_ids:
+                raise ServiceValidationError(
+                    code="duplicate_resource_holiday",
+                    message="Resource holiday ids must be unique.",
+                    entity_id=holiday_id,
+                    field_path="holidays",
+                )
+            seen_holiday_ids.add(holiday_id)
+            holiday_records.append(
+                {
+                    "holiday_id": holiday_id,
+                    "starts_at": holiday.starts_at,
+                    "ends_at": holiday.ends_at,
+                    "reason": holiday.reason,
+                }
+            )
         project = self.get_project(project_id)
         self.resources[resolved_resource_id] = RecordDict({
             "resource_id": resolved_resource_id,
@@ -669,6 +731,7 @@ class InMemoryProjectRepository:
             "cost_rate": str(cost_rate),
             "cost_unit": getattr(cost_unit, "value", cost_unit),
             "cost_currency": cost_currency or project.default_currency,
+            "holidays": holiday_records,
             "active": active,
         })
         if resolved_resource_id not in self.resource_ids_by_project[project_id]:

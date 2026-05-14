@@ -266,6 +266,21 @@ class CalendarExceptionCommand(StrictModel):
         return self
 
 
+class ResourceHolidayCommand(StrictModel):
+    """Resource-local zero-capacity interval."""
+
+    holiday_id: str | None = Field(default=None, min_length=1)
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_holiday_interval(self) -> ResourceHolidayCommand:
+        if self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at.")
+        return self
+
+
 class UpsertResourcePayload(StrictModel):
     """Resource payload used by top-level and batch upsert commands."""
 
@@ -278,12 +293,28 @@ class UpsertResourcePayload(StrictModel):
     cost_rate: Decimal = Field(ge=Decimal("0"))
     cost_unit: CostUnit
     cost_currency: str | None = Field(default=None, min_length=3, max_length=3)
+    holidays: list[ResourceHolidayCommand] = Field(default_factory=list)
     active: bool = True
 
     @field_validator("cost_currency")
     @classmethod
     def _normalize_currency(cls, value: str | None) -> str | None:
         return value.upper() if value is not None else None
+
+    @field_validator("holidays")
+    @classmethod
+    def _validate_holiday_ids(
+        cls,
+        value: list[ResourceHolidayCommand],
+    ) -> list[ResourceHolidayCommand]:
+        holiday_ids = [
+            holiday.holiday_id
+            for holiday in value
+            if holiday.holiday_id is not None
+        ]
+        if len(holiday_ids) != len(set(holiday_ids)):
+            raise ValueError("holiday_id values must be unique.")
+        return value
 
     @model_validator(mode="after")
     def _validate_availability_interval(self) -> UpsertResourcePayload:
