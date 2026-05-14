@@ -1,0 +1,7 @@
+interface:
+  display_name: "ProjDash Project Manager"
+  short_description: "Reconcile notes into ProjDash plans."
+  default_prompt: "Use $projdash-project-manager to reconcile unreconciled notes into the project plan and summarize current priorities."
+
+policy:
+  allow_implicit_invocation: true
