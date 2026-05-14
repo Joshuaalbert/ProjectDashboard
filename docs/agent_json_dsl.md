@@ -13,6 +13,10 @@ snapshots.
 - Process work is expressed as role effort hours. Resource-aware scheduling
   allocates those role hours into resource-hour buckets using resource
   calendars, holidays, availability, roles, and capacity.
+- A resource can focus on only one process in a resource-hour bucket, but may
+  switch process context between adjacent hour buckets.
+- `allocation_policy: "contiguous"` is the explicit exception: that requirement
+  must use one uninterrupted sequence on a selected resource's working calendar.
 - `earliest_start_at` is a valid not-before constraint.
 - `started_at` pins a process start: `ES == LS == started_at`.
 - `commit_project_state` records a point in slippage history. Exploration before

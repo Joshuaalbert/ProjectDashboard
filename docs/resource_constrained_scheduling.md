@@ -18,20 +18,25 @@ requirements, resource calendars, holidays, and availability.
 - Resource cost currency is the project currency.
 - Calendars recur indefinitely. There is no operator-supplied schedule horizon
   for schedule, graph, utilization, cost, or slippage computations.
-- A resource may carry concurrent fractional allocations, but once a resource
-  starts work on a process requirement it must continue through that resource's
-  working-calendar time until that requirement contribution is complete. Nights,
-  weekends, holidays, and other zero-capacity periods do not break continuity.
+- A resource can focus on only one process in each resource-hour bucket. Within
+  that bucket, the resource may split capacity across multiple role requirements
+  for the same process.
+- Context switching between hour buckets is allowed, so a resource may work on
+  different processes in adjacent working hours.
+- Requirements that explicitly set `allocation_policy` to `contiguous` still
+  require one uninterrupted sequence through the selected resource's working
+  calendar. They cannot bridge over an intervening working bucket used by
+  another process.
 
 ## Allocation Model
 
 The scheduler allocates ready role requirements into project-time hour buckets.
 For every bucket, it uses eligible resources that have capacity in their local
 calendar and can fill the demanded role. Allocation must not exceed a resource's
-available bucket capacity. The capacity search window is internal: if required
-work does not fit in the current window, the solver extends the recurring
-calendars forward and retries until the work is complete or a permanent
-configuration error is found.
+available bucket capacity or assign the same resource bucket to more than one
+process. The capacity search window is internal: if required work does not fit
+in the current window, the solver extends the recurring calendars forward and
+retries until the work is complete or a permanent configuration error is found.
 
 The collapsed schedule evidence records:
 
@@ -73,7 +78,7 @@ next iteration.
 - Permanent resource infeasibility is reported as a structured
   `resource_schedule_unsatisfiable` query error. Diagnostics distinguish missing
   active roles, missing eligible resources, calendars with no recurring
-  capacity, and continuity constraints.
+  capacity, and unavailable contiguous windows.
 
 ## Slippage
 

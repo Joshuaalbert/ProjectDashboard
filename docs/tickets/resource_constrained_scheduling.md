@@ -28,8 +28,10 @@ defined by role effort hours and resource capacity, not target-date facts.
 - Allocation must not exceed resource bucket capacity.
 - Calendars recur indefinitely; schedule computations do not accept public
   horizon bounds.
-- Resource-process assignments are continuous through each resource's working
-  calendar time once started.
+- A resource can focus on only one process in each resource-hour bucket.
+- A resource may switch process context between adjacent hour buckets.
+- Explicit contiguous allocation requirements still require an uninterrupted
+  sequence through the selected resource's working calendar.
 - Role and resource utilization must reconcile with allocation slices.
 - Costs use the project currency.
 

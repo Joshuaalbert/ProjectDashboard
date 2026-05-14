@@ -230,9 +230,8 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
         horizon_ends_at=horizon_ends_at,
         options=options,
     )
-    _validate_resource_process_continuity(
+    _validate_resource_bucket_process_focus(
         slices=all_slices,
-        buckets=expanded_buckets,
     )
     output_slices = all_slices if include_slices else []
     processes_out = list(final_iteration["processes"])
@@ -401,7 +400,7 @@ def _run_allocation_iteration(
 ) -> dict[str, object]:
     ledger = _fresh_ledger(expanded_buckets)
     daily_allocated: dict[tuple[str, str, str, str], float] = defaultdict(float)
-    active_streams: set[tuple[str, str, str]] = set()
+    bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str] = {}
     process_rows: dict[str, dict[str, object]] = {}
     requirement_states = {
         _requirement_state_key(requirement): _RequirementState(requirement=requirement)
@@ -475,7 +474,7 @@ def _run_allocation_iteration(
                 processes_by_id=processes_by_id,
                 ledger=ledger,
                 resources_used_by_requirement=resources_used_by_requirement,
-                active_streams=active_streams,
+                bucket_focus=bucket_focus,
             )
             assignments = _water_fill_requirement_candidates(
                 candidates,
@@ -490,12 +489,10 @@ def _run_allocation_iteration(
                     daily_allocated,
                     candidate.requirement,
                 )
-                active_streams.add(
-                    _requirement_resource_key(candidate.requirement, bucket.resource_id)
-                )
                 process_id, requirement_id = _requirement_state_key(
                     candidate.requirement
                 )
+                bucket_focus[_bucket_focus_key(bucket)] = process_id
                 resources_used_by_requirement[
                     (
                         process_id,
@@ -536,6 +533,7 @@ def _run_allocation_iteration(
                 project_start_at=project_start_at,
                 processes_by_id=processes_by_id,
                 horizon_ends_at=horizon_ends_at,
+                bucket_focus=bucket_focus,
                 iteration=iteration,
                 allocation_slices=allocation_slices,
             ):
@@ -759,10 +757,13 @@ def _ready_split_candidates_for_bucket(
         tuple[str, str, dt.datetime, dt.datetime],
         set[str],
     ],
-    active_streams: set[tuple[str, str, str]],
+    bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
 ) -> list[_RequirementCandidate]:
     candidates = []
+    focused_process_id = bucket_focus.get(_bucket_focus_key(bucket))
     for process_id in cpm_by_id:
+        if focused_process_id is not None and process_id != focused_process_id:
+            continue
         if process_id in completed_process_ids or process_id in closed_process_ids:
             continue
         ready_at = _process_ready_at(
@@ -800,17 +801,6 @@ def _ready_split_candidates_for_bucket(
             )
             used_resources = resources_used_by_requirement[concurrency_key]
             required_count = max(1, int(requirement.get("required_resource_count", 1)))
-            active_resources = {
-                resource_id
-                for process_id, requirement_id, resource_id in active_streams
-                if (process_id, requirement_id) == requirement_key
-            }
-            if (
-                active_resources
-                and bucket.resource_id not in active_resources
-                and len(active_resources) >= required_count
-            ):
-                continue
             if (
                 bucket.resource_id not in used_resources
                 and len(used_resources) >= required_count
@@ -854,7 +844,6 @@ def _ready_split_candidates_for_bucket(
                 state.first_feasible_starts_at = feasible_start
             state.ready_at = ready_at
             cpm = cpm_by_id[process_id]
-            stream_key = _requirement_resource_key(requirement, bucket.resource_id)
             candidates.append(
                 _RequirementCandidate(
                     requirement=requirement,
@@ -864,7 +853,6 @@ def _ready_split_candidates_for_bucket(
                     ready_at=ready_at,
                     headroom_hours=headroom,
                     sort_key=(
-                        0 if stream_key in active_streams else 1,
                         ready_at,
                         cpm.topo_index,
                         process_id,
@@ -873,7 +861,21 @@ def _ready_split_candidates_for_bucket(
                     ),
                 )
             )
-    return sorted(candidates, key=lambda item: item.sort_key)
+    return _focused_process_candidates(candidates)
+
+
+def _focused_process_candidates(
+    candidates: list[_RequirementCandidate],
+) -> list[_RequirementCandidate]:
+    if not candidates:
+        return []
+    ordered = sorted(candidates, key=lambda item: item.sort_key)
+    focus_process_id = str(ordered[0].requirement["process_id"])
+    return [
+        candidate
+        for candidate in ordered
+        if str(candidate.requirement["process_id"]) == focus_process_id
+    ]
 
 
 def _water_fill_requirement_candidates(
@@ -948,6 +950,7 @@ def _allocate_contiguous_ready_requirements(
     project_start_at: dt.datetime,
     processes_by_id: dict[str, Mapping[str, object]],
     horizon_ends_at: dt.datetime,
+    bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
     iteration: int,
     allocation_slices: list[dict[str, object]],
 ) -> bool:
@@ -984,10 +987,13 @@ def _allocate_contiguous_ready_requirements(
                 resource_by_id=resource_by_id,
                 ledger=ledger,
                 daily_allocated=daily_allocated,
+                bucket_focus=bucket_focus,
                 iteration=iteration,
             )
             for allocation in new_slices:
                 allocation_slices.append(allocation)
+                allocation_bucket = _allocation_bucket_key(allocation)
+                bucket_focus[allocation_bucket] = str(allocation["process_id"])
                 _apply_allocation_to_requirement_state(
                     state,
                     allocation,
@@ -1195,6 +1201,7 @@ def _allocate_requirement(
             resource_by_id=resource_by_id,
             ledger=ledger,
             daily_allocated=daily_allocated,
+            bucket_focus={},
             iteration=iteration,
         )
     else:
@@ -1326,21 +1333,29 @@ def _allocate_contiguous(
     resource_by_id: dict[str, Mapping[str, object]],
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
     daily_allocated: dict[tuple[str, str, str, str], float],
+    bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
     iteration: int,
 ) -> list[dict[str, object]]:
     effort = float(requirement["effort_hours"])
+    process_id = str(requirement["process_id"])
     sorted_resources = sorted(
         eligible,
         key=lambda resource: _first_resource_bucket_key(resource, ledger, ready_at),
     )
     for resource in sorted_resources:
         resource_id = str(resource["resource_id"])
-        buckets = [
+        resource_working_buckets = [
             bucket
             for bucket in sorted(ledger.values(), key=_bucket_sort_key)
             if bucket.resource_id == resource_id
             and bucket.ends_at > ready_at
-            and bucket.remaining_hours > EPSILON
+            and bucket.capacity_hours > EPSILON
+        ]
+        buckets = [
+            bucket
+            for bucket in resource_working_buckets
+            if bucket.remaining_hours > EPSILON
+            and bucket_focus.get(_bucket_focus_key(bucket), process_id) == process_id
         ]
         for index, _first in enumerate(buckets):
             total = 0.0
@@ -1349,7 +1364,7 @@ def _allocate_contiguous(
             for bucket in buckets[index:]:
                 if previous_ends_at is not None and _has_working_gap(
                     resource_id=resource_id,
-                    buckets=buckets,
+                    buckets=resource_working_buckets,
                     previous_end=previous_ends_at,
                     current_start=bucket.starts_at,
                 ):
@@ -1376,6 +1391,7 @@ def _allocate_contiguous(
                             daily_allocated,
                             requirement,
                         )
+                        bucket_focus[_bucket_focus_key(selected_bucket)] = process_id
                         slices.append(
                             _allocation_row(
                                 project_id=project_id,
@@ -1649,52 +1665,43 @@ def _with_slice_ids(
     return output
 
 
-def _validate_resource_process_continuity(
+def _validate_resource_bucket_process_focus(
     *,
     slices: list[dict[str, object]],
-    buckets: tuple[_LedgerBucket, ...],
 ) -> None:
-    """Ensure resource/process streams do not stop during working capacity."""
-    slices_by_stream: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
+    """Ensure each resource works on at most one process per hour bucket."""
+    slices_by_resource: dict[str, list[dict[str, object]]] = defaultdict(list)
     for allocation in slices:
-        slices_by_stream[
-            (
-                str(allocation["process_id"]),
-                str(allocation["requirement_id"]),
-                str(allocation["resource_id"]),
-            )
-        ].append(allocation)
+        slices_by_resource[str(allocation["resource_id"])].append(allocation)
 
-    buckets_by_resource: dict[str, list[_LedgerBucket]] = defaultdict(list)
-    for bucket in buckets:
-        if bucket.capacity_hours > EPSILON:
-            buckets_by_resource[bucket.resource_id].append(bucket)
-
-    for (process_id, requirement_id, resource_id), stream_slices in slices_by_stream.items():
-        ordered = sorted(
-            stream_slices,
-            key=lambda item: (
-                _as_utc(item["starts_at"]),
-                _as_utc(item["ends_at"]),
-            ),
-        )
-        for previous, current in zip(ordered, ordered[1:], strict=False):
-            previous_end = _as_utc(previous["ends_at"])
-            current_start = _as_utc(current["starts_at"])
-            if current_start <= previous_end:
-                continue
-            has_working_gap = any(
-                bucket.starts_at < current_start
-                and bucket.ends_at > previous_end
-                for bucket in buckets_by_resource.get(resource_id, [])
-            )
-            if has_working_gap:
-                raise ValueError(
-                    "resource schedule violates resource-process continuity: "
-                    f"{process_id}:{requirement_id}:{resource_id} has a working "
-                    f"calendar gap between {previous_end.isoformat()} and "
-                    f"{current_start.isoformat()}"
+    for resource_id, resource_slices in slices_by_resource.items():
+        boundaries = sorted(
+            {
+                boundary
+                for allocation in resource_slices
+                for boundary in (
+                    _as_utc(allocation["starts_at"]),
+                    _as_utc(allocation["ends_at"]),
                 )
+            }
+        )
+        for starts_at, ends_at in zip(boundaries, boundaries[1:], strict=False):
+            if starts_at == ends_at:
+                continue
+            process_ids = {
+                str(allocation["process_id"])
+                for allocation in resource_slices
+                if _as_utc(allocation["starts_at"]) < ends_at
+                and _as_utc(allocation["ends_at"]) > starts_at
+            }
+            if len(process_ids) <= 1:
+                continue
+            raise ValueError(
+                "resource schedule violates resource focus: "
+                f"{resource_id} has allocations for processes "
+                f"{sorted(process_ids)} between {starts_at.isoformat()} and "
+                f"{ends_at.isoformat()}"
+            )
 
 
 def _collect_dependencies(
@@ -1881,14 +1888,6 @@ def _requirement_state_key(requirement: Mapping[str, object]) -> tuple[str, str]
     )
 
 
-def _requirement_resource_key(
-    requirement: Mapping[str, object],
-    resource_id: str,
-) -> tuple[str, str, str]:
-    process_id, requirement_id = _requirement_state_key(requirement)
-    return process_id, requirement_id, resource_id
-
-
 def _daily_allocation_key(
     requirement: Mapping[str, object],
     resource_id: str,
@@ -1896,6 +1895,22 @@ def _daily_allocation_key(
 ) -> tuple[str, str, str, str]:
     process_id, requirement_id = _requirement_state_key(requirement)
     return process_id, requirement_id, resource_id, local_date
+
+
+def _bucket_focus_key(
+    bucket: _LedgerBucket,
+) -> tuple[str, dt.datetime, dt.datetime]:
+    return bucket.resource_id, bucket.starts_at, bucket.ends_at
+
+
+def _allocation_bucket_key(
+    allocation: Mapping[str, object],
+) -> tuple[str, dt.datetime, dt.datetime]:
+    return (
+        str(allocation["resource_id"]),
+        _as_utc(allocation["starts_at"]),
+        _as_utc(allocation["ends_at"]),
+    )
 
 
 def _validate_recurring_capacity_sources(

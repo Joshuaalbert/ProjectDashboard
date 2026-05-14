@@ -1,4 +1,5 @@
 import datetime as dt
+from collections import defaultdict
 from importlib import import_module
 from typing import NamedTuple
 
@@ -340,6 +341,42 @@ def _assert_resource_utilization_never_exceeds_capacity(
             assert utilization <= 1.0001, (resource_id, starts_at, ends_at, utilization)
 
 
+def _assert_resource_focus_never_splits_processes(
+    data: dict[str, object],
+) -> None:
+    allocations_by_resource: dict[str, list[object]] = {}
+    for allocation in data["allocation_slices"]:
+        resource_id = str(_value(allocation, "resource_id"))
+        allocations_by_resource.setdefault(resource_id, []).append(allocation)
+
+    for resource_id, allocations in allocations_by_resource.items():
+        boundaries = sorted(
+            {
+                boundary
+                for allocation in allocations
+                for boundary in (
+                    _as_datetime(_value(allocation, "starts_at")),
+                    _as_datetime(_value(allocation, "ends_at")),
+                )
+            }
+        )
+        for starts_at, ends_at in zip(boundaries, boundaries[1:], strict=False):
+            if starts_at == ends_at:
+                continue
+            process_ids = {
+                str(_value(allocation, "process_id"))
+                for allocation in allocations
+                if _as_datetime(_value(allocation, "starts_at")) < ends_at
+                and _as_datetime(_value(allocation, "ends_at")) > starts_at
+            }
+            assert len(process_ids) <= 1, (
+                resource_id,
+                starts_at,
+                ends_at,
+                process_ids,
+            )
+
+
 def _base_input(
     *,
     processes: list[dict[str, object]],
@@ -541,10 +578,10 @@ def test_resource_allocation_uses_global_contention_ledger_without_overbooking()
 
     rows = _rows_by_id(data)
     assert _iso(_value(rows["alpha"], "starts_at")) == "2026-05-13T09:00:00+00:00"
-    assert _iso(_value(rows["alpha"], "ends_at")) == "2026-05-14T13:00:00+00:00"
-    assert _iso(_value(rows["beta"], "starts_at")) == "2026-05-13T09:00:00+00:00"
+    assert _iso(_value(rows["alpha"], "ends_at")) == "2026-05-13T15:00:00+00:00"
+    assert _iso(_value(rows["beta"], "starts_at")) == "2026-05-13T15:00:00+00:00"
     assert _iso(_value(rows["beta"], "ends_at")) == "2026-05-14T13:00:00+00:00"
-    assert float(_value(rows["beta"], "resource_delay_hours")) == 0.0
+    assert float(_value(rows["beta"], "resource_delay_hours")) == 6.0
 
     assert sum(
         float(_value(allocation, "effort_hours"))
@@ -555,14 +592,15 @@ def test_resource_allocation_uses_global_contention_ledger_without_overbooking()
         requirement_id="req_alpha",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(1.0)
     assert _allocated_effort_for_requirement_in_window(
         data,
         requirement_id="req_beta",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(0.0)
     _assert_resource_utilization_never_exceeds_capacity(data)
+    _assert_resource_focus_never_splits_processes(data)
 
 
 def test_done_process_does_not_require_current_resource_capacity():
@@ -657,7 +695,7 @@ def test_internal_capacity_search_extension_can_grow_beyond_initial_cap():
     assert next_capacity_search_end(starts_at, ends_at) > ends_at
 
 
-def test_ready_requirements_allocate_breadth_first_by_project_hour_bucket():
+def test_ready_requirements_allocate_one_process_per_resource_hour_bucket():
     data = _data(
         _compute_resource_schedule(
             _base_input(
@@ -674,28 +712,29 @@ def test_ready_requirements_allocate_breadth_first_by_project_hour_bucket():
     assert _value(rows["alpha"], "allocation_state") == "complete"
     assert _value(rows["beta"], "allocation_state") == "complete"
     assert _iso(_value(rows["alpha"], "starts_at")) == "2026-05-13T09:00:00+00:00"
-    assert _iso(_value(rows["beta"], "starts_at")) == "2026-05-13T09:00:00+00:00"
-    assert _iso(_value(rows["beta"], "ends_at")) == "2026-05-13T11:00:00+00:00"
-    assert _iso(_value(rows["alpha"], "ends_at")) == "2026-05-14T10:00:00+00:00"
+    assert _iso(_value(rows["alpha"], "ends_at")) == "2026-05-13T17:00:00+00:00"
+    assert _iso(_value(rows["beta"], "starts_at")) == "2026-05-14T09:00:00+00:00"
+    assert _iso(_value(rows["beta"], "ends_at")) == "2026-05-14T10:00:00+00:00"
     assert _allocated_effort_for_requirement_in_window(
         data,
         requirement_id="req_alpha",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(1.0)
     assert _allocated_effort_for_requirement_in_window(
         data,
         requirement_id="req_beta",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(0.0)
     assert _allocated_effort_for_requirement_in_window(
         data,
         requirement_id="req_alpha",
         starts_at=_at(13, 10),
         ends_at=_at(13, 11),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(1.0)
     _assert_resource_utilization_never_exceeds_capacity(data)
+    _assert_resource_focus_never_splits_processes(data)
 
 
 def test_resource_schedule_iterates_until_dependency_finish_converges():
@@ -802,18 +841,15 @@ def test_ready_queue_orders_by_ready_time_before_later_candidates():
         "2026-05-13T09:00:00+00:00"
     )
     assert _iso(_value(rows["earlier_ready"], "ends_at")) == (
-        "2026-05-13T12:00:00+00:00"
+        "2026-05-13T11:00:00+00:00"
     )
     assert _iso(_value(rows["later_ready"], "starts_at")) == (
-        "2026-05-13T10:00:00+00:00"
+        "2026-05-13T11:00:00+00:00"
     )
     assert _iso(_value(rows["later_ready"], "ends_at")) == (
         "2026-05-13T12:00:00+00:00"
     )
     assert _allocation_order(data) == [
-        ("earlier_ready", "req_earlier_ready", "res_alex"),
-        ("earlier_ready", "req_earlier_ready", "res_alex"),
-        ("later_ready", "req_later_ready", "res_alex"),
         ("earlier_ready", "req_earlier_ready", "res_alex"),
         ("later_ready", "req_later_ready", "res_alex"),
     ]
@@ -850,7 +886,7 @@ def test_ready_demand_ties_do_not_use_dependency_only_latest_finish():
     ) < _as_datetime(_value(rows["zz_late_finish_first"], "dependency_only_ends_at"))
     assert "aa_early_finish_loose_leaf" < "zz_late_finish_first"
     assert _iso(_value(rows["zz_late_finish_first"], "starts_at")) == (
-        "2026-05-13T09:00:00+00:00"
+        "2026-05-13T10:00:00+00:00"
     )
     assert _iso(_value(rows["zz_late_finish_first"], "ends_at")) == (
         "2026-05-13T12:00:00+00:00"
@@ -859,7 +895,7 @@ def test_ready_demand_ties_do_not_use_dependency_only_latest_finish():
         "2026-05-13T09:00:00+00:00"
     )
     assert _iso(_value(rows["aa_early_finish_loose_leaf"], "ends_at")) == (
-        "2026-05-13T11:00:00+00:00"
+        "2026-05-13T10:00:00+00:00"
     )
     assert _allocation_order(data) == [
         (
@@ -867,13 +903,6 @@ def test_ready_demand_ties_do_not_use_dependency_only_latest_finish():
             "req_aa_early_finish_loose_leaf",
             "res_alex",
         ),
-        ("zz_late_finish_first", "req_zz_late_finish_first", "res_alex"),
-        (
-            "aa_early_finish_loose_leaf",
-            "req_aa_early_finish_loose_leaf",
-            "res_alex",
-        ),
-        ("zz_late_finish_first", "req_zz_late_finish_first", "res_alex"),
         ("zz_late_finish_first", "req_zz_late_finish_first", "res_alex"),
     ]
 
@@ -911,20 +940,17 @@ def test_ready_queue_ties_by_topological_index_before_process_id():
         "2026-05-13T09:00:00+00:00"
     )
     assert _iso(_value(rows["zz_topo_first"], "ends_at")) == (
-        "2026-05-13T12:00:00+00:00"
-    )
-    assert _iso(_value(rows["aa_process_id_first"], "starts_at")) == (
-        "2026-05-13T09:00:00+00:00"
-    )
-    assert _iso(_value(rows["aa_process_id_first"], "ends_at")) == (
         "2026-05-13T11:00:00+00:00"
     )
+    assert _iso(_value(rows["aa_process_id_first"], "starts_at")) == (
+        "2026-05-13T11:00:00+00:00"
+    )
+    assert _iso(_value(rows["aa_process_id_first"], "ends_at")) == (
+        "2026-05-13T12:00:00+00:00"
+    )
     assert _allocation_order(data) == [
-        ("aa_process_id_first", "req_aa_process_id_first", "res_alex"),
         ("zz_topo_first", "req_zz_topo_first", "res_alex"),
         ("aa_process_id_first", "req_aa_process_id_first", "res_alex"),
-        ("zz_topo_first", "req_zz_topo_first", "res_alex"),
-        ("zz_topo_first", "req_zz_topo_first", "res_alex"),
     ]
 
 
@@ -976,18 +1002,15 @@ def test_ready_queue_ties_by_topological_order_then_requirement_id():
         "2026-05-13T09:00:00+00:00"
     )
     assert _iso(_value(process_rows["aa_process"], "starts_at")) == (
-        "2026-05-13T09:00:00+00:00"
+        "2026-05-13T10:00:00+00:00"
     )
     assert _iso(_value(process_rows["zz_process"], "ends_at")) == (
-        "2026-05-13T11:00:00+00:00"
+        "2026-05-13T10:00:00+00:00"
     )
     assert _iso(_value(process_rows["aa_process"], "ends_at")) == (
         "2026-05-13T12:00:00+00:00"
     )
     assert _allocation_order(process_id_data) == [
-        ("aa_process", "req_aa_process", "res_alex"),
-        ("zz_process", "req_zz_process", "res_alex"),
-        ("aa_process", "req_aa_process", "res_alex"),
         ("zz_process", "req_zz_process", "res_alex"),
         ("aa_process", "req_aa_process", "res_alex"),
     ]
@@ -1164,7 +1187,7 @@ def test_capacity_contention_extends_schedule_instead_of_partial_allocation():
     rows = _rows_by_id(data)
     assert _value(rows["early"], "allocation_state") == "complete"
     assert _value(rows["late"], "allocation_state") == "complete"
-    assert _iso(_value(rows["late"], "starts_at")) == "2026-05-13T10:00:00+00:00"
+    assert _iso(_value(rows["late"], "starts_at")) == "2026-05-13T11:00:00+00:00"
     assert _iso(_value(rows["late"], "ends_at")) == "2026-05-13T12:00:00+00:00"
 
 
@@ -1614,8 +1637,8 @@ def test_min_allocation_schedules_final_remaining_effort_below_minimum():
     ) == pytest.approx(1.0)
 
 
-def test_max_daily_cap_that_creates_working_gap_violates_continuity():
-    with pytest.raises(ValueError, match="resource-process continuity"):
+def test_max_daily_cap_can_resume_on_next_working_day():
+    data = _data(
         _compute_resource_schedule(
             _base_input(
                 processes=[_process("build")],
@@ -1632,6 +1655,24 @@ def test_max_daily_cap_that_creates_working_gap_violates_continuity():
                 ],
             )
         )
+    )
+
+    rows = _rows_by_id(data)
+    assert _value(rows["build"], "allocation_state") == "complete"
+    assert _iso(_value(rows["build"], "starts_at")) == "2026-05-13T11:00:00+00:00"
+    assert _iso(_value(rows["build"], "ends_at")) == "2026-05-14T11:00:00+00:00"
+    assert _allocated_effort_in_window(
+        data,
+        resource_id="res_alex",
+        starts_at=_at(13, 11),
+        ends_at=_at(13, 14),
+    ) == pytest.approx(3.0)
+    assert _allocated_effort_in_window(
+        data,
+        resource_id="res_alex",
+        starts_at=_at(14),
+        ends_at=_at(14, 11),
+    ) == pytest.approx(2.0)
 
 
 def test_split_allowed_can_combine_resources_but_contiguous_requires_one_sequence():
@@ -1727,6 +1768,59 @@ def test_contiguous_policy_does_not_reserve_future_buckets_ahead_of_ready_split_
     rows = _rows_by_id(data)
     assert _iso(_value(rows["split"], "ends_at")) == "2026-05-13T10:00:00+00:00"
     assert _iso(_value(rows["contiguous"], "ends_at")) == "2026-05-14T10:00:00+00:00"
+
+
+def test_contiguous_policy_does_not_bridge_over_focused_working_bucket():
+    module = _resource_schedule_module()
+    bucket_type = module._LedgerBucket
+    allocate_contiguous = module._allocate_contiguous
+    ledger = {}
+    for hour, remaining in [
+        (9, 1.0),
+        (10, 0.0),
+        (11, 1.0),
+        (12, 1.0),
+    ]:
+        starts_at = _at(13, hour)
+        ends_at = _at(13, hour + 1)
+        bucket = bucket_type(
+            resource_id="res_alex",
+            calendar_id="cal_utc",
+            starts_at=starts_at,
+            ends_at=ends_at,
+            capacity_hours=1.0,
+            remaining_hours=remaining,
+            role_ids=("role_dev",),
+            local_date="2026-05-13",
+            local_week="2026-W20",
+            window_id="work",
+        )
+        ledger[("res_alex", starts_at, ends_at)] = bucket
+
+    requirement = _requirement(
+        "contiguous",
+        2,
+        requirement_id="req_contiguous",
+        allocation_policy="contiguous",
+    )
+    slices = allocate_contiguous(
+        project_id="project",
+        requirement=requirement,
+        ready_at=_at(13),
+        eligible=[_resource("res_alex")],
+        resource_by_id={"res_alex": _resource("res_alex")},
+        ledger=ledger,
+        daily_allocated=defaultdict(float),
+        bucket_focus={
+            ("res_alex", _at(13, 10), _at(13, 11)): "other_process",
+        },
+        iteration=1,
+    )
+
+    assert [(item["starts_at"], item["ends_at"]) for item in slices] == [
+        (_at(13, 11), _at(13, 12)),
+        (_at(13, 12), _at(13, 13)),
+    ]
 
 
 def test_multi_role_resource_uses_one_capacity_ledger_across_roles():
@@ -2425,9 +2519,9 @@ def test_resource_critical_path_is_process_level_after_convergence():
 
     rows = _rows_by_id(data)
     assert data["converged"] is True
-    assert _iso(_value(rows["a_design"], "ends_at")) == "2026-05-15T11:00:00+00:00"
-    assert _iso(_value(rows["c_independent"], "ends_at")) == "2026-05-14T17:00:00+00:00"
-    assert _iso(_value(rows["b_integrate"], "ready_at")) == "2026-05-15T11:00:00+00:00"
+    assert _iso(_value(rows["a_design"], "ends_at")) == "2026-05-14T11:00:00+00:00"
+    assert _iso(_value(rows["c_independent"], "ends_at")) == "2026-05-15T11:00:00+00:00"
+    assert _iso(_value(rows["b_integrate"], "ready_at")) == "2026-05-14T11:00:00+00:00"
     assert _iso(_value(rows["b_integrate"], "ends_at")) == "2026-05-15T12:00:00+00:00"
     assert data["critical_path_process_ids"] == ["a_design", "b_integrate"]
 
@@ -2458,10 +2552,8 @@ def test_resource_critical_path_can_differ_from_dependency_only_cpm():
     )
     assert _iso(_value(rows["solo_heavy"], "ends_at")) == "2026-05-15T17:00:00+00:00"
     assert data["critical_path_process_ids"] == ["solo_heavy"]
-    assert _iso(_value(rows["prep_resource"], "ends_at")) == "2026-05-13T11:00:00+00:00"
-    assert _iso(_value(rows["solo_heavy"], "starts_at")) == _iso(
-        _value(rows["solo_heavy"], "ready_at")
-    )
+    assert _iso(_value(rows["prep_resource"], "ends_at")) == "2026-05-13T10:00:00+00:00"
+    assert _iso(_value(rows["solo_heavy"], "starts_at")) == "2026-05-13T10:00:00+00:00"
 
 
 def test_resource_critical_path_terminal_tie_uses_topological_index_before_id():
