@@ -123,7 +123,8 @@ def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, A
     override_as_of = st.session_state.pop("as_of_override", None)
     if isinstance(override_as_of, str):
         override_as_of = _parse_iso_datetime(override_as_of, now_utc)
-    default_as_of = override_as_of if isinstance(override_as_of, dt.datetime) else now_utc
+    has_as_of_override = isinstance(override_as_of, dt.datetime)
+    default_as_of = override_as_of if has_as_of_override else now_utc
     st.sidebar.text_input(
         "Service database",
         db_path,
@@ -162,14 +163,20 @@ def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, A
         st.sidebar.error(str(exc))
         st.stop()
     default_as_of = to_display_timezone(default_as_of, timezone_name)
+    if has_as_of_override or "sidebar_as_of_date" not in st.session_state:
+        st.session_state["sidebar_as_of_date"] = default_as_of.date()
+    if has_as_of_override or "sidebar_as_of_time" not in st.session_state:
+        st.session_state["sidebar_as_of_time"] = default_as_of.time().replace(
+            microsecond=0,
+        )
     as_of_date = st.sidebar.date_input(
         "As of date",
-        default_as_of.date(),
+        key="sidebar_as_of_date",
         help="Planning snapshot date for schedule and history queries.",
     )
     as_of_time = st.sidebar.time_input(
         "As of time",
-        default_as_of.time().replace(microsecond=0),
+        key="sidebar_as_of_time",
         help="Planning snapshot time for schedule and history queries.",
     )
     now_at = combine_datetime(as_of_date, as_of_time, timezone_name)
@@ -1136,7 +1143,6 @@ def _process_revision_defaults_signature(
         str(aggregate.get("finished_at") or ""),
         tuple(aggregate.get("blocker_ids", [])),
         controls["timezone"],
-        controls["as_of"].isoformat(),
     )
     return repr(parts)
 
@@ -1834,23 +1840,23 @@ def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
         for node in full_graph.get("nodes", [])
         if node.get("process_symbol")
     ]
+    terminal_key = "terminal_process_symbols"
     current_terminals = [
         symbol
-        for symbol in st.session_state.get("terminal_process_symbols", [])
+        for symbol in st.session_state.get(terminal_key, [])
         if symbol in symbol_options
     ]
+    if st.session_state.get(terminal_key) != current_terminals:
+        st.session_state[terminal_key] = current_terminals
     terminal_symbols = st.multiselect(
         "Completion targets",
         symbol_options,
-        default=current_terminals,
+        key=terminal_key,
         help=(
             "Leave empty to plan to all terminal nodes. Select symbols to plan "
             "their ancestor subgraph."
         ),
     )
-    if terminal_symbols != current_terminals:
-        st.session_state["terminal_process_symbols"] = terminal_symbols
-        st.rerun()
 
     horizon_start = context.get("horizon_starts_at")
     horizon_end = context.get("horizon_ends_at")
