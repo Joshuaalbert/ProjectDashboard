@@ -20,16 +20,16 @@ from projdash.ui.adapters import (
 from projdash.ui.service_client import (
     DEFAULT_TIMEZONE,
     batch_payload_envelope,
+    calendar_options,
     combine_datetime,
     command_payload_envelope,
     create_project_service,
     parse_dependency_lines,
-    parse_holiday_lines,
-    parse_resource_lines,
-    parse_role_lines,
     parse_subgraph_process_lines,
+    project_options,
     query_payload_envelope,
     result_to_dict,
+    scoped_id,
     split_csv,
     stable_id,
     validate_timezone,
@@ -48,7 +48,12 @@ def main() -> None:
 
     db_path = os.environ.get("PROJDASH_DB_PATH", "projdash.lbug")
     service = _service(db_path)
-    controls = _render_sidebar(db_path)
+    projects_data = _query(
+        service,
+        {"action": "query_projects"},
+        render=False,
+    ) or {"projects": []}
+    controls = _render_sidebar(db_path, projects_data.get("projects", []))
 
     if not controls["project_id"]:
         _render_first_run(service, controls)
@@ -63,6 +68,7 @@ def main() -> None:
     tabs = st.tabs(
         [
             "Dashboard",
+            "Project",
             "Processes",
             "Graph",
             "Resources",
@@ -75,40 +81,79 @@ def main() -> None:
     with tabs[0]:
         _render_dashboard(context)
     with tabs[1]:
-        _render_processes(service, controls, context)
+        _render_project_settings(service, controls, context)
     with tabs[2]:
-        _render_graph(context)
+        _render_processes(service, controls, context)
     with tabs[3]:
-        _render_resources(service, controls, context)
+        _render_graph(context)
     with tabs[4]:
-        _render_schedule(context)
+        _render_resources(service, controls, context)
     with tabs[5]:
-        _render_costs(context)
+        _render_schedule(context)
     with tabs[6]:
-        _render_history(context)
+        _render_costs(context)
     with tabs[7]:
+        _render_history(context)
+    with tabs[8]:
         _render_topology(service, controls, context)
 
 
-def _render_sidebar(db_path: str) -> dict[str, Any]:
+def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, Any]:
     now_utc = dt.datetime.now(dt.UTC)
-    st.sidebar.text_input("Service database", db_path, disabled=True)
-    project_id = st.sidebar.text_input(
-        "Project id",
-        st.session_state.get("project_id", ""),
-    ).strip()
+    st.sidebar.text_input(
+        "Service database",
+        db_path,
+        disabled=True,
+        help="Durable LadybugDB file used by the service.",
+    )
+    options = project_options(projects)
+    option_ids = [option.project_id for option in options]
+    current_project_id = st.session_state.get("project_id", "")
+    selected_index = (
+        option_ids.index(current_project_id) + 1
+        if current_project_id in option_ids
+        else 0
+    )
+    selected_project_id = st.sidebar.selectbox(
+        "Project",
+        [""] + option_ids,
+        index=selected_index,
+        format_func=lambda value: _project_label(value, options),
+        help="Select an existing project from the service database.",
+    )
+    project_id = selected_project_id.strip()
     if project_id:
         st.session_state["project_id"] = project_id
+    else:
+        st.session_state.pop("project_id", None)
 
-    timezone_name = st.sidebar.text_input("Timezone", DEFAULT_TIMEZONE).strip()
+    timezone_name = st.sidebar.text_input(
+        "Timezone",
+        DEFAULT_TIMEZONE,
+        help="IANA timezone used for form date/time inputs, such as UTC or Europe/Paris.",
+    ).strip()
     try:
         validate_timezone(timezone_name)
     except ValueError as exc:
         st.sidebar.error(str(exc))
         st.stop()
-    as_of_date = st.sidebar.date_input("As of date", now_utc.date())
-    as_of_time = st.sidebar.time_input("As of time", now_utc.time().replace(microsecond=0))
-    horizon_days = st.sidebar.number_input("Horizon days", 1, 365, 45)
+    as_of_date = st.sidebar.date_input(
+        "As of date",
+        now_utc.date(),
+        help="Planning snapshot date for schedule and history queries.",
+    )
+    as_of_time = st.sidebar.time_input(
+        "As of time",
+        now_utc.time().replace(microsecond=0),
+        help="Planning snapshot time for schedule and history queries.",
+    )
+    horizon_days = st.sidebar.number_input(
+        "Horizon days",
+        1,
+        365,
+        45,
+        help="Number of days shown in resource, utilization, and cost queries.",
+    )
     now_at = combine_datetime(as_of_date, as_of_time, timezone_name)
     horizon_starts_at = combine_datetime(as_of_date, dt.time(0, 0), timezone_name)
     horizon_ends_at = horizon_starts_at + dt.timedelta(days=int(horizon_days))
@@ -122,32 +167,62 @@ def _render_sidebar(db_path: str) -> dict[str, Any]:
     }
 
 
+def _project_label(project_id: str, options: list[Any]) -> str:
+    if not project_id:
+        return "Create or select a project"
+    labels = {option.project_id: option.label for option in options}
+    return labels.get(project_id, project_id)
+
+
+def _calendar_label(calendar_id: str, options: list[Any]) -> str:
+    if not calendar_id:
+        return "Create a new calendar"
+    labels = {option.calendar_id: option.label for option in options}
+    return labels.get(calendar_id, calendar_id)
+
+
 def _render_first_run(service, controls: dict[str, Any]) -> None:
-    st.subheader("First-run setup")
+    st.subheader("Create project")
     with st.form("first_run"):
-        name = st.text_input("Project name", "New project")
-        project_id = st.text_input("Project id", stable_id("project", name))
-        currency = st.text_input("Default currency", "USD", max_chars=3)
-        start_date = st.date_input("Project start date", controls["as_of"].date())
-        start_time = st.time_input("Project start time", dt.time(9, 0))
-        set_due = st.checkbox("Set project due date")
-        due_date = st.date_input("Due date", controls["as_of"].date() + dt.timedelta(days=30))
-        due_time = st.time_input("Due time", dt.time(17, 0))
-        role_lines = st.text_area(
-            "Roles",
-            "role_engineer: Engineer\nrole_reviewer: Reviewer",
+        name = st.text_input(
+            "Project name",
+            "New project",
+            help="Human-readable project name.",
         )
-        include_calendar = st.checkbox("Create default weekday calendar", True)
-        work_start = st.time_input("Work starts", dt.time(9, 0))
-        work_end = st.time_input("Work ends", dt.time(17, 0))
-        capacity = st.number_input("Daily capacity hours", 0.0, 24.0, 8.0)
-        resource_lines = st.text_area(
-            "Resources",
-            "Alice | role_engineer | 100\nBob | role_reviewer | 90",
+        project_id = st.text_input(
+            "Project id",
+            stable_id("project", name),
+            help="Stable id agents and UI commands use to reference this project.",
         )
-        holiday_lines = st.text_area(
-            "Resource holidays",
-            "",
+        currency = st.text_input(
+            "Default currency",
+            "USD",
+            max_chars=3,
+            help="ISO 4217 default cost currency for resources in this project.",
+        )
+        start_date = st.date_input(
+            "Project start date",
+            controls["as_of"].date(),
+            help="Project start date in the selected sidebar timezone.",
+        )
+        start_time = st.time_input(
+            "Project start time",
+            dt.time(9, 0),
+            help="Project start time in the selected sidebar timezone.",
+        )
+        set_due = st.checkbox(
+            "Set project due date",
+            help="Optionally set an explicit whole-project due datetime.",
+        )
+        due_date = st.date_input(
+            "Due date",
+            controls["as_of"].date() + dt.timedelta(days=30),
+            help="Explicit project due date.",
+        )
+        due_time = st.time_input(
+            "Due time",
+            dt.time(17, 0),
+            help="Explicit project due time in the selected sidebar timezone.",
         )
         submitted = st.form_submit_button("Create project")
 
@@ -156,9 +231,6 @@ def _render_first_run(service, controls: dict[str, Any]) -> None:
 
     try:
         start_at = combine_datetime(start_date, start_time, controls["timezone"])
-        roles = parse_role_lines(role_lines)
-        holidays = parse_holiday_lines(holiday_lines, controls["timezone"])
-        resources = parse_resource_lines(resource_lines) if include_calendar else []
         commands = [
             {
                 "action": "create_project",
@@ -168,15 +240,6 @@ def _render_first_run(service, controls: dict[str, Any]) -> None:
                 "default_currency": currency,
             }
         ]
-        for role in roles:
-            commands.append(
-                {
-                    "action": "create_role",
-                    "project_id": project_id,
-                    "role_id": role.role_id,
-                    "name": role.name,
-                }
-            )
         if set_due:
             commands.append(
                 {
@@ -186,40 +249,6 @@ def _render_first_run(service, controls: dict[str, Any]) -> None:
                     "edit_at": controls["as_of"],
                 }
             )
-        if include_calendar:
-            commands.append(
-                {
-                    "action": "upsert_resource_calendar",
-                    "project_id": project_id,
-                    "calendar_id": "cal_default",
-                    "name": "Default weekday calendar",
-                    "timezone": controls["timezone"],
-                    "weekly_windows": _weekly_windows(
-                        [0, 1, 2, 3, 4],
-                        work_start,
-                        work_end,
-                        capacity,
-                    ),
-                    "active": True,
-                }
-            )
-            for resource in resources:
-                commands.append(
-                    {
-                        "action": "upsert_resource",
-                        "project_id": project_id,
-                        "resource_id": stable_id("res", resource.name),
-                        "name": resource.name,
-                        "role_ids": resource.role_ids,
-                        "calendar_id": "cal_default",
-                        "available_from_at": start_at,
-                        "cost_rate": resource.cost_rate,
-                        "cost_unit": "hour",
-                        "cost_currency": currency,
-                        "holidays": holidays,
-                        "active": True,
-                    }
-                )
         batch_results = _apply_batch(service, commands, rerun=False)
         if batch_results is None or not all(result.ok for result in batch_results):
             return
@@ -346,6 +375,114 @@ def _render_dashboard(context: dict[str, Any]) -> None:
     due_cols[2].metric("Schedule basis", graph.get("schedule_basis", "-"))
 
 
+def _render_project_settings(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> None:
+    project = (context.get("project") or {}).get("project", {})
+    st.subheader("Project settings")
+    start_at = _parse_iso_datetime(project.get("start_at"), controls["as_of"])
+    with st.form("project_settings"):
+        name = st.text_input(
+            "Project name",
+            project.get("name", ""),
+            help="Human-readable project name.",
+        )
+        currency = st.text_input(
+            "Default currency",
+            project.get("default_currency", "USD"),
+            max_chars=3,
+            help="ISO 4217 default currency used when resources omit a currency.",
+        )
+        start_date = st.date_input(
+            "Project start date",
+            start_at.date(),
+            help="Project start date in the selected sidebar timezone.",
+        )
+        start_time = st.time_input(
+            "Project start time",
+            start_at.timetz().replace(tzinfo=None),
+            help="Project start time in the selected sidebar timezone.",
+        )
+        save = st.form_submit_button("Save project settings")
+    if save:
+        _apply_command(
+            service,
+            {
+                "action": "update_project",
+                "project_id": controls["project_id"],
+                "name": name,
+                "default_currency": currency,
+                "start_at": combine_datetime(start_date, start_time, controls["timezone"]),
+            },
+        )
+
+    st.subheader("Project due date")
+    history = context.get("history") or {}
+    current_due = _parse_iso_datetime(
+        history.get("current_project_due_at"),
+        controls["as_of"] + dt.timedelta(days=30),
+    )
+    with st.form("project_due"):
+        clear_due = st.checkbox(
+            "Clear project due date",
+            help="Remove the explicit due datetime for the whole project.",
+        )
+        due_date = st.date_input(
+            "Due date",
+            current_due.date(),
+            help="Explicit whole-project due date.",
+        )
+        due_time = st.time_input(
+            "Due time",
+            current_due.timetz().replace(tzinfo=None),
+            help="Explicit whole-project due time in the selected sidebar timezone.",
+        )
+        save_due = st.form_submit_button("Save project due date")
+    if save_due:
+        _apply_command(
+            service,
+            {
+                "action": "clear_project_due_at" if clear_due else "set_project_due_at",
+                "project_id": controls["project_id"],
+                "edit_at": controls["as_of"],
+                **(
+                    {}
+                    if clear_due
+                    else {
+                        "due_at": combine_datetime(
+                            due_date,
+                            due_time,
+                            controls["timezone"],
+                        )
+                    }
+                ),
+            },
+        )
+
+    st.subheader("Delete project")
+    with st.form("delete_project"):
+        confirm = st.text_input(
+            "Confirm project id",
+            help="Type the exact project id to permanently delete this project.",
+        )
+        delete = st.form_submit_button("Delete project")
+    if delete:
+        result = _apply_command(
+            service,
+            {
+                "action": "delete_project",
+                "project_id": controls["project_id"],
+                "confirm_project_id": confirm,
+            },
+            rerun=False,
+        )
+        if result is not None and result.ok:
+            st.session_state.pop("project_id", None)
+            st.rerun()
+
+
 def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
     graph = context.get("graph") or {}
     catalog = catalog_from_query_data(
@@ -358,20 +495,77 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
 
     with st.expander("Create or revise process", expanded=True):
         with st.form("process_revision"):
-            existing = st.selectbox("Existing process id", [""] + catalog["process_ids"])
-            name = st.text_input("Name")
-            duration = st.number_input("Duration business days", 0, 3650, 1)
-            dependencies = st.multiselect("Dependencies", catalog["process_ids"])
-            effective_date = st.date_input("Effective date", controls["as_of"].date())
-            effective_time = st.time_input("Effective time", controls["as_of"].time())
-            due_enabled = st.checkbox("Set process due date")
-            due_date = st.date_input("Process due date", controls["as_of"].date())
-            due_time = st.time_input("Process due time", dt.time(17, 0))
-            earliest_enabled = st.checkbox("Set earliest start")
-            earliest_date = st.date_input("Earliest start date", controls["as_of"].date())
-            earliest_time = st.time_input("Earliest start time", dt.time(9, 0))
-            role_id = st.selectbox("Required role id", [""] + catalog["role_ids"])
-            effort = st.number_input("Effort hours for role", 0.0, 10000.0, 0.0)
+            existing = st.selectbox(
+                "Existing process id",
+                [""] + catalog["process_ids"],
+                help=(
+                    "Choose a defined process to revise, or leave blank to create a "
+                    "new process."
+                ),
+            )
+            name = st.text_input("Name", help="Human-readable process name.")
+            duration = st.number_input(
+                "Duration business days",
+                0,
+                3650,
+                1,
+                help="Dependency-only duration before resource allocation is applied.",
+            )
+            dependencies = st.multiselect(
+                "Dependencies",
+                catalog["process_ids"],
+                help="Defined predecessor processes that must finish first.",
+            )
+            effective_date = st.date_input(
+                "Effective date",
+                controls["as_of"].date(),
+                help="Date this revision becomes active.",
+            )
+            effective_time = st.time_input(
+                "Effective time",
+                controls["as_of"].time(),
+                help="Time this revision becomes active.",
+            )
+            due_enabled = st.checkbox(
+                "Set process due date",
+                help="Enable an explicit process due datetime.",
+            )
+            due_date = st.date_input(
+                "Process due date",
+                controls["as_of"].date(),
+                help="Explicit due date for this process.",
+            )
+            due_time = st.time_input(
+                "Process due time",
+                dt.time(17, 0),
+                help="Explicit due time for this process.",
+            )
+            earliest_enabled = st.checkbox(
+                "Set earliest start",
+                help="Enable a not-before datetime for this process.",
+            )
+            earliest_date = st.date_input(
+                "Earliest start date",
+                controls["as_of"].date(),
+                help="Earliest allowed start date.",
+            )
+            earliest_time = st.time_input(
+                "Earliest start time",
+                dt.time(9, 0),
+                help="Earliest allowed start time.",
+            )
+            role_id = st.selectbox(
+                "Required role id",
+                [""] + catalog["role_ids"],
+                help="Defined role required by this process revision.",
+            )
+            effort = st.number_input(
+                "Effort hours for role",
+                0.0,
+                10000.0,
+                0.0,
+                help="Total effort required from the selected role.",
+            )
             submitted = st.form_submit_button("Save revision")
         if submitted:
             payload = {
@@ -415,15 +609,31 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
 def _render_process_status_form(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
     with st.expander("Set process status"):
         with st.form("process_status"):
-            process_id = st.selectbox("Process id", [""] + catalog["process_ids"])
+            process_id = st.selectbox(
+                "Process id",
+                [""] + catalog["process_ids"],
+                help="Defined process to update.",
+            )
             status = st.selectbox(
                 "Status",
                 ["planned", "in_progress", "paused", "done", "canceled"],
+                help="Lifecycle status for the selected process.",
             )
-            finished_enabled = st.checkbox("Set finished time")
-            finished_date = st.date_input("Finished date", controls["as_of"].date())
-            finished_time = st.time_input("Finished time", controls["as_of"].time())
-            note = st.text_input("Note")
+            finished_enabled = st.checkbox(
+                "Set finished time",
+                help="Record a completion datetime when applicable.",
+            )
+            finished_date = st.date_input(
+                "Finished date",
+                controls["as_of"].date(),
+                help="Completion date.",
+            )
+            finished_time = st.time_input(
+                "Finished time",
+                controls["as_of"].time(),
+                help="Completion time.",
+            )
+            note = st.text_input("Note", help="Optional status note.")
             submitted = st.form_submit_button("Set status")
         if submitted and process_id:
             _apply_command(
@@ -449,10 +659,28 @@ def _render_process_status_form(service, controls: dict[str, Any], catalog: dict
 def _render_process_due_form(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
     with st.expander("Set or clear due date"):
         with st.form("process_due"):
-            process_id = st.selectbox("Process id", [""] + catalog["process_ids"], key="due_pid")
-            clear_due = st.checkbox("Clear due date")
-            due_date = st.date_input("Due date", controls["as_of"].date(), key="due_d")
-            due_time = st.time_input("Due time", dt.time(17, 0), key="due_t")
+            process_id = st.selectbox(
+                "Process id",
+                [""] + catalog["process_ids"],
+                key="due_pid",
+                help="Defined process whose due datetime will change.",
+            )
+            clear_due = st.checkbox(
+                "Clear due date",
+                help="Remove the explicit due datetime.",
+            )
+            due_date = st.date_input(
+                "Due date",
+                controls["as_of"].date(),
+                key="due_d",
+                help="Explicit process due date.",
+            )
+            due_time = st.time_input(
+                "Due time",
+                dt.time(17, 0),
+                key="due_t",
+                help="Explicit process due time.",
+            )
             submitted = st.form_submit_button("Save due date")
         if submitted and process_id:
             _apply_command(
@@ -472,10 +700,19 @@ def _render_process_due_form(service, controls: dict[str, Any], catalog: dict[st
 def _render_blocker_forms(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
     with st.expander("Blockers"):
         with st.form("add_blocker"):
-            process_id = st.selectbox("Process id", [""] + catalog["process_ids"], key="blk_pid")
-            summary = st.text_input("Summary")
-            details = st.text_area("Details")
-            severity = st.selectbox("Severity", ["blocking", "warning", "info"])
+            process_id = st.selectbox(
+                "Process id",
+                [""] + catalog["process_ids"],
+                key="blk_pid",
+                help="Defined process that is blocked.",
+            )
+            summary = st.text_input("Summary", help="Short blocker summary.")
+            details = st.text_area("Details", help="Optional blocker detail.")
+            severity = st.selectbox(
+                "Severity",
+                ["blocking", "warning", "info"],
+                help="Whether this blocker prevents work or is informational.",
+            )
             add = st.form_submit_button("Add blocker")
         if add and process_id:
             _apply_command(
@@ -491,8 +728,12 @@ def _render_blocker_forms(service, controls: dict[str, Any], catalog: dict[str, 
                 },
             )
         with st.form("resolve_blocker"):
-            blocker_id = st.selectbox("Blocker id", [""] + catalog["blocker_ids"])
-            resolution = st.text_input("Resolution")
+            blocker_id = st.selectbox(
+                "Blocker id",
+                [""] + catalog["blocker_ids"],
+                help="Defined blocker to resolve.",
+            )
+            resolution = st.text_input("Resolution", help="Optional resolution note.")
             resolve = st.form_submit_button("Resolve blocker")
         if resolve and blocker_id:
             _apply_command(
@@ -536,15 +777,17 @@ def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]
         use_container_width=True,
         hide_index=True,
     )
-    _render_calendar_forms(service, controls, catalog)
+    _render_calendar_forms(service, controls, context, catalog)
     _render_resource_forms(service, controls, context, catalog)
 
 
 def _render_role_forms(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
     with st.expander("Role commands"):
         with st.form("create_role"):
-            name = st.text_input("Role name")
-            role_id = st.text_input("Role id")
+            name = st.text_input(
+                "Role name",
+                help="Human-readable role name. The role id is generated from this name.",
+            )
             create = st.form_submit_button("Create role")
         if create:
             _apply_command(
@@ -552,13 +795,18 @@ def _render_role_forms(service, controls: dict[str, Any], catalog: dict[str, lis
                 {
                     "action": "create_role",
                     "project_id": controls["project_id"],
-                    "role_id": role_id or stable_id("role", name),
+                    "role_id": scoped_id(controls["project_id"], "role", name),
                     "name": name,
                 },
             )
         with st.form("rename_role"):
-            old_role = st.selectbox("Role id", [""] + catalog["role_ids"], key="ren_role")
-            new_name = st.text_input("New role name")
+            old_role = st.selectbox(
+                "Role id",
+                [""] + catalog["role_ids"],
+                key="ren_role",
+                help="Defined role to rename.",
+            )
+            new_name = st.text_input("New role name", help="New human-readable role name.")
             rename = st.form_submit_button("Rename role")
         if rename and old_role:
             _apply_command(
@@ -571,8 +819,16 @@ def _render_role_forms(service, controls: dict[str, Any], catalog: dict[str, lis
                 },
             )
         with st.form("deactivate_role"):
-            role_id = st.selectbox("Role id", [""] + catalog["role_ids"], key="deact_role")
-            force = st.checkbox("Force")
+            role_id = st.selectbox(
+                "Role id",
+                [""] + catalog["role_ids"],
+                key="deact_role",
+                help="Defined role to deactivate.",
+            )
+            force = st.checkbox(
+                "Force",
+                help="Allow deactivation even when references would otherwise block it.",
+            )
             deactivate = st.form_submit_button("Deactivate role")
         if deactivate and role_id:
             _apply_command(
@@ -586,22 +842,71 @@ def _render_role_forms(service, controls: dict[str, Any], catalog: dict[str, lis
             )
 
 
-def _render_calendar_forms(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
+def _render_calendar_forms(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+    catalog: dict[str, list[str]],
+):
+    catalog_data = context.get("catalog") or {}
+    calendars_by_id = {
+        calendar["calendar_id"]: calendar
+        for calendar in catalog_data.get("calendars", [])
+    }
     with st.expander("Calendar commands"):
+        calendar_choices = calendar_options(catalog_data.get("calendars", []))
+        calendar_ids = [option.calendar_id for option in calendar_choices]
+        selected_calendar_id = st.selectbox(
+            "Existing calendar",
+            [""] + calendar_ids,
+            format_func=lambda value: _calendar_label(value, calendar_choices),
+            help="Choose a defined calendar to update, or leave blank to create one.",
+        )
+        selected_calendar = calendars_by_id.get(selected_calendar_id, {})
         with st.form("upsert_calendar"):
-            calendar_id = st.text_input("Calendar id", "cal_default")
-            name = st.text_input("Calendar name", "Default weekday calendar")
+            name = st.text_input(
+                "Calendar name",
+                selected_calendar.get("name", "Weekday calendar"),
+                help=(
+                    "Human-readable calendar name. New calendar ids are generated "
+                    "from this name and the project id."
+                ),
+            )
             weekdays = st.multiselect(
                 "Weekdays",
                 [0, 1, 2, 3, 4, 5, 6],
                 default=[0, 1, 2, 3, 4],
+                help="Local weekdays where this recurring working window applies.",
             )
-            start_time = st.time_input("Window start", dt.time(9, 0))
-            end_time = st.time_input("Window end", dt.time(17, 0))
-            capacity = st.number_input("Capacity hours", 0.0, 24.0, 8.0)
-            active = st.checkbox("Active", True)
+            start_time = st.time_input(
+                "Window start",
+                dt.time(9, 0),
+                help="Local start time for the recurring working window.",
+            )
+            end_time = st.time_input(
+                "Window end",
+                dt.time(17, 0),
+                help="Local end time for the recurring working window.",
+            )
+            capacity = st.number_input(
+                "Capacity hours",
+                0.0,
+                24.0,
+                8.0,
+                help="Available working capacity during each selected window.",
+            )
+            active = st.checkbox(
+                "Active",
+                selected_calendar.get("active", True),
+                help="Inactive calendars cannot provide active resource capacity.",
+            )
             upsert = st.form_submit_button("Save calendar")
         if upsert:
+            calendar_id = selected_calendar_id or scoped_id(
+                controls["project_id"],
+                "cal",
+                name,
+            )
             _apply_command(
                 service,
                 {
@@ -624,13 +929,36 @@ def _render_calendar_forms(service, controls: dict[str, Any], catalog: dict[str,
                 "Calendar id",
                 [""] + catalog["calendar_ids"],
                 key="exc_cal",
+                help="Defined calendar receiving this one-off capacity exception.",
             )
-            starts_date = st.date_input("Starts", controls["as_of"].date())
-            starts_time = st.time_input("Starts time", dt.time(0, 0))
-            ends_date = st.date_input("Ends", controls["as_of"].date())
-            ends_time = st.time_input("Ends time", dt.time(23, 59))
-            exc_capacity = st.number_input("Exception capacity hours", 0.0, 24.0, 0.0)
-            reason = st.text_input("Reason")
+            starts_date = st.date_input(
+                "Starts",
+                controls["as_of"].date(),
+                help="Exception start date.",
+            )
+            starts_time = st.time_input(
+                "Starts time",
+                dt.time(0, 0),
+                help="Exception start time.",
+            )
+            ends_date = st.date_input(
+                "Ends",
+                controls["as_of"].date(),
+                help="Exception end date.",
+            )
+            ends_time = st.time_input(
+                "Ends time",
+                dt.time(23, 59),
+                help="Exception end time.",
+            )
+            exc_capacity = st.number_input(
+                "Exception capacity hours",
+                0.0,
+                24.0,
+                0.0,
+                help="Replacement capacity for overlapping working windows.",
+            )
+            reason = st.text_input("Reason", help="Optional exception note.")
             add = st.form_submit_button("Add exception")
         if add and calendar:
             _apply_command(
@@ -667,19 +995,19 @@ def _render_resource_forms(
             "Existing resource",
             [""] + catalog["resource_ids"],
             key="resource_editor_selected_id",
+            help="Choose a defined resource to update, or leave blank to create one.",
         )
         selected_resource = resources_by_id.get(selected_resource_id, {})
         form_key = selected_resource_id or "new"
         with st.form(f"upsert_resource_{form_key}"):
-            resource_id = st.text_input(
-                "Resource id",
-                selected_resource.get("resource_id", ""),
-                key=f"resource_id_{form_key}",
-            )
             name = st.text_input(
                 "Resource name",
                 selected_resource.get("name", ""),
                 key=f"resource_name_{form_key}",
+                help=(
+                    "Human-readable resource name. New resource ids are generated "
+                    "from this name and the project id."
+                ),
             )
             role_ids = st.multiselect(
                 "Role ids",
@@ -690,10 +1018,7 @@ def _render_resource_forms(
                     if role_id in catalog["role_ids"]
                 ],
                 key=f"resource_roles_{form_key}",
-            )
-            extra_roles = st.text_input(
-                "Additional role ids",
-                key=f"resource_extra_roles_{form_key}",
+                help="Defined roles this resource can fill.",
             )
             calendar_options = [""] + catalog["calendar_ids"]
             selected_calendar = selected_resource.get("calendar_id", "")
@@ -707,6 +1032,7 @@ def _render_resource_forms(
                 calendar_options,
                 index=calendar_index,
                 key=f"resource_calendar_{form_key}",
+                help="Defined calendar controlling this resource's working hours.",
             )
             available_from = _parse_iso_datetime(
                 selected_resource.get("available_from_at"),
@@ -716,22 +1042,26 @@ def _render_resource_forms(
                 "Available from",
                 available_from.date(),
                 key=f"resource_available_date_{form_key}",
+                help="First date the resource is available.",
             )
             available_time = st.time_input(
                 "Available from time",
                 available_from.timetz().replace(tzinfo=None),
                 key=f"resource_available_time_{form_key}",
+                help="First time the resource is available.",
             )
             cost_rate = st.text_input(
                 "Cost rate",
                 str(selected_resource.get("cost_rate", "0")),
                 key=f"resource_cost_rate_{form_key}",
+                help="Cost amount for this resource in the selected cost unit.",
             )
             cost_currency = st.text_input(
                 "Cost currency",
                 selected_resource.get("cost_currency", "USD"),
                 max_chars=3,
                 key=f"resource_cost_currency_{form_key}",
+                help="ISO 4217 currency for this resource cost rate.",
             )
             cost_units = ["hour", "day", "week", "fixed"]
             selected_unit = selected_resource.get("cost_unit", "hour")
@@ -740,49 +1070,54 @@ def _render_resource_forms(
                 cost_units,
                 index=cost_units.index(selected_unit) if selected_unit in cost_units else 0,
                 key=f"resource_cost_unit_{form_key}",
-            )
-            holidays = st.text_area(
-                "Holidays",
-                _holiday_lines(selected_resource.get("holidays", [])),
-                key=f"resource_holidays_{form_key}",
+                help="Unit for interpreting the resource cost rate.",
             )
             active = st.checkbox(
                 "Active resource",
                 selected_resource.get("active", True),
                 key=f"resource_active_{form_key}",
+                help="Inactive resources do not contribute schedulable capacity.",
             )
             save = st.form_submit_button("Save resource")
         if save:
-            try:
-                all_roles = [*role_ids, *split_csv(extra_roles)]
-                parsed_holidays = parse_holiday_lines(holidays, controls["timezone"])
-            except ValueError as exc:
-                st.error(str(exc))
-            else:
-                _apply_command(
-                    service,
-                    {
-                        "action": "upsert_resource",
-                        "project_id": controls["project_id"],
-                        "resource_id": resource_id or stable_id("res", name),
-                        "name": name,
-                        "role_ids": all_roles,
-                        "calendar_id": calendar_id,
-                        "available_from_at": combine_datetime(
-                            available_date,
-                            available_time,
-                            controls["timezone"],
-                        ),
-                        "cost_rate": cost_rate,
-                        "cost_unit": cost_unit,
-                        "cost_currency": cost_currency or None,
-                        "holidays": parsed_holidays,
-                        "active": active,
-                    },
-                )
+            resource_id = selected_resource_id or scoped_id(
+                controls["project_id"],
+                "res",
+                name,
+            )
+            _apply_command(
+                service,
+                {
+                    "action": "upsert_resource",
+                    "project_id": controls["project_id"],
+                    "resource_id": resource_id,
+                    "name": name,
+                    "role_ids": role_ids,
+                    "calendar_id": calendar_id,
+                    "available_from_at": combine_datetime(
+                        available_date,
+                        available_time,
+                        controls["timezone"],
+                    ),
+                    "cost_rate": cost_rate,
+                    "cost_unit": cost_unit,
+                    "cost_currency": cost_currency or None,
+                    "holidays": selected_resource.get("holidays", []),
+                    "active": active,
+                },
+            )
         with st.form("resource_active"):
-            rid = st.selectbox("Resource id", [""] + catalog["resource_ids"])
-            active_state = st.checkbox("Active", True, key="res_active_state")
+            rid = st.selectbox(
+                "Resource id",
+                [""] + catalog["resource_ids"],
+                help="Defined resource to activate or deactivate.",
+            )
+            active_state = st.checkbox(
+                "Active",
+                True,
+                key="res_active_state",
+                help="Whether the resource contributes capacity.",
+            )
             set_active = st.form_submit_button("Set active")
         if set_active and rid:
             _apply_command(
@@ -794,6 +1129,119 @@ def _render_resource_forms(
                     "active": active_state,
                 },
             )
+        _render_resource_holiday_forms(service, controls, resources_by_id, catalog)
+
+
+def _render_resource_holiday_forms(
+    service,
+    controls: dict[str, Any],
+    resources_by_id: dict[str, dict[str, Any]],
+    catalog: dict[str, list[str]],
+) -> None:
+    if not catalog["resource_ids"]:
+        return
+    resource_id = st.selectbox(
+        "Holiday resource",
+        [""] + catalog["resource_ids"],
+        key="holiday_resource_id",
+        help="Defined resource whose holiday list will be edited.",
+    )
+    resource = resources_by_id.get(resource_id)
+    if not resource:
+        return
+
+    holidays = resource.get("holidays", [])
+    with st.form("add_resource_holiday"):
+        starts_date = st.date_input(
+            "Holiday starts",
+            controls["as_of"].date(),
+            help="Holiday start date.",
+        )
+        starts_time = st.time_input(
+            "Holiday starts time",
+            dt.time(0, 0),
+            help="Holiday start time.",
+        )
+        ends_date = st.date_input(
+            "Holiday ends",
+            controls["as_of"].date(),
+            help="Holiday end date.",
+        )
+        ends_time = st.time_input(
+            "Holiday ends time",
+            dt.time(23, 59),
+            help="Holiday end time.",
+        )
+        reason = st.text_input("Holiday reason", help="Optional holiday note.")
+        add = st.form_submit_button("Add resource holiday")
+    if add:
+        starts_at = combine_datetime(starts_date, starts_time, controls["timezone"])
+        ends_at = combine_datetime(ends_date, ends_time, controls["timezone"])
+        holiday_id = scoped_id(
+            resource_id,
+            "holiday",
+            f"{starts_at.isoformat()}_{reason or 'holiday'}",
+        )
+        next_holidays = [
+            *holidays,
+            {
+                "holiday_id": holiday_id,
+                "starts_at": starts_at,
+                "ends_at": ends_at,
+                "reason": reason or None,
+            },
+        ]
+        _apply_command(
+            service,
+            _resource_payload_with_holidays(
+                controls["project_id"],
+                resource,
+                next_holidays,
+            ),
+        )
+
+    holiday_ids = [holiday["holiday_id"] for holiday in holidays]
+    with st.form("remove_resource_holiday"):
+        holiday_id = st.selectbox(
+            "Holiday id",
+            [""] + holiday_ids,
+            help="Defined holiday interval to remove from this resource.",
+        )
+        remove = st.form_submit_button("Remove resource holiday")
+    if remove and holiday_id:
+        next_holidays = [
+            holiday for holiday in holidays if holiday["holiday_id"] != holiday_id
+        ]
+        _apply_command(
+            service,
+            _resource_payload_with_holidays(
+                controls["project_id"],
+                resource,
+                next_holidays,
+            ),
+        )
+
+
+def _resource_payload_with_holidays(
+    project_id: str,
+    resource: dict[str, Any],
+    holidays: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "action": "upsert_resource",
+        "project_id": project_id,
+        "resource_id": resource["resource_id"],
+        "name": resource["name"],
+        "role_ids": resource["role_ids"],
+        "calendar_id": resource["calendar_id"],
+        "available_from_at": resource["available_from_at"],
+        "available_until_at": resource.get("available_until_at"),
+        "cost_rate": resource["cost_rate"],
+        "cost_unit": resource["cost_unit"],
+        "cost_currency": resource.get("cost_currency"),
+        "holidays": holidays,
+        "active": resource.get("active", True),
+    }
 
 
 def _render_schedule(context: dict[str, Any]) -> None:
@@ -880,13 +1328,41 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
 
     with st.expander("Replace process with subgraph"):
         with st.form("replace_subgraph"):
-            target = st.selectbox("Parent process id", [""] + catalog["process_ids"])
-            children = st.text_area("Children", "A | First child | 8\nB | Second child | 8")
-            dependencies = st.text_area("Internal dependencies", "A -> B")
-            roots = st.text_input("Root symbols", "A")
-            leaves = st.text_input("Leaf symbols", "B")
-            alias_target = st.text_input("Parent alias target symbol", "A")
-            preserve_alias = st.checkbox("Preserve parent symbol as alias", True)
+            target = st.selectbox(
+                "Parent process id",
+                [""] + catalog["process_ids"],
+                help="Defined process to replace with a detailed subgraph.",
+            )
+            children = st.text_area(
+                "Children",
+                "A | First child | 8\nB | Second child | 8",
+                help="Rows of new process symbol, name, and duration hours.",
+            )
+            dependencies = st.text_area(
+                "Internal dependencies",
+                "A -> B",
+                help="Dependencies between child process symbols.",
+            )
+            roots = st.text_input(
+                "Root symbols",
+                "A",
+                help="Comma-separated child symbols that receive original parents.",
+            )
+            leaves = st.text_input(
+                "Leaf symbols",
+                "B",
+                help="Comma-separated child symbols that receive original children.",
+            )
+            alias_target = st.text_input(
+                "Parent alias target symbol",
+                "A",
+                help="Child symbol that should keep the parent process symbol as an alias.",
+            )
+            preserve_alias = st.checkbox(
+                "Preserve parent symbol as alias",
+                True,
+                help="Keep the replaced process symbol as an alias for a child process.",
+            )
             replace = st.form_submit_button("Replace")
         if replace and target:
             try:
@@ -919,10 +1395,26 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
 
     with st.expander("Collapse subgraph into process"):
         with st.form("collapse_subgraph"):
-            symbols = st.multiselect("Process symbols", catalog["process_symbols"])
-            new_symbol = st.text_input("New process symbol")
-            new_name = st.text_input("New process name")
-            duration = st.number_input("Duration hours", 0.0, 10000.0, 8.0)
+            symbols = st.multiselect(
+                "Process symbols",
+                catalog["process_symbols"],
+                help="Defined process symbols to summarize into one process.",
+            )
+            new_symbol = st.text_input(
+                "New process symbol",
+                help="Canonical symbol for the replacement process.",
+            )
+            new_name = st.text_input(
+                "New process name",
+                help="Human-readable name for the replacement process.",
+            )
+            duration = st.number_input(
+                "Duration hours",
+                0.0,
+                10000.0,
+                8.0,
+                help="Dependency-only duration for the replacement process.",
+            )
             collapse = st.form_submit_button("Collapse")
         if collapse and symbols:
             _apply_command(
@@ -941,13 +1433,20 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
             )
 
 
-def _query(service, payload: dict[str, Any], *, key: str | None = None) -> Any:
+def _query(
+    service,
+    payload: dict[str, Any],
+    *,
+    key: str | None = None,
+    render: bool = True,
+) -> Any:
     try:
         result = service.handle_query(query_payload_envelope(payload))
     except (ValidationError, ValueError) as exc:
         st.error(str(exc))
         return None
-    _render_result(result)
+    if render:
+        _render_result(result)
     if not result.ok:
         return None
     if key is not None:

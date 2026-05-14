@@ -9,6 +9,7 @@ from projdash.ui.adapters import (
 )
 from projdash.ui.service_client import (
     batch_payload_envelope,
+    calendar_options,
     combine_datetime,
     command_payload_envelope,
     parse_dependency_lines,
@@ -16,7 +17,9 @@ from projdash.ui.service_client import (
     parse_resource_lines,
     parse_role_lines,
     parse_subgraph_process_lines,
+    project_options,
     query_payload_envelope,
+    scoped_id,
     validate_timezone,
 )
 
@@ -77,6 +80,29 @@ def test_command_payload_envelope_validates_service_command():
     assert envelope.command.start_at.tzinfo is not None
 
 
+def test_project_management_payloads_validate_against_service_contract():
+    update = command_payload_envelope(
+        {
+            "action": "update_project",
+            "project_id": "project-ui",
+            "name": "Renamed",
+            "default_currency": "eur",
+        }
+    )
+    delete = command_payload_envelope(
+        {
+            "action": "delete_project",
+            "project_id": "project-ui",
+            "confirm_project_id": "project-ui",
+        }
+    )
+    projects = query_payload_envelope({"action": "query_projects"})
+
+    assert update.command.default_currency == "EUR"
+    assert delete.command.action == "delete_project"
+    assert projects.query.action == "query_projects"
+
+
 def test_batch_payload_envelope_validates_atomic_first_run_payloads():
     envelope = batch_payload_envelope(
         [
@@ -116,6 +142,34 @@ def test_validate_timezone_reports_invalid_names():
     assert validate_timezone("America/New_York") == "America/New_York"
     with pytest.raises(ValueError):
         validate_timezone("Mars/Base")
+
+
+def test_ui_selection_helpers_use_defined_options_and_project_scoped_ids():
+    projects = project_options(
+        [
+            {"project_id": "project-beta", "name": "Beta"},
+            {"project_id": "project-alpha", "name": "Alpha"},
+        ]
+    )
+    calendars = calendar_options(
+        [
+            {"calendar_id": "calendar-night", "name": "Night Shift"},
+            {"calendar_id": "calendar-day", "name": "Day Shift"},
+        ]
+    )
+
+    assert [project.project_id for project in projects] == [
+        "project-alpha",
+        "project-beta",
+    ]
+    assert projects[0].label == "Alpha (project-alpha)"
+    assert [calendar.calendar_id for calendar in calendars] == [
+        "calendar-day",
+        "calendar-night",
+    ]
+    assert scoped_id("project-alpha", "role", "Engineer") == (
+        "role_project_alpha_engineer"
+    )
 
 
 def test_catalog_extracts_ids_from_query_data():

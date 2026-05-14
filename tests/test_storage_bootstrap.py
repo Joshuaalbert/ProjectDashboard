@@ -1515,3 +1515,62 @@ def test_ladybug_command_replay_survives_reopen(tmp_path: Path):
         """
     ).get_all() == [[1]]
     _close(reopened)
+
+
+def test_ladybug_projects_can_be_listed_updated_deleted_and_reopened(
+    tmp_path: Path,
+):
+    pytest.importorskip("real_ladybug")
+    db_path = tmp_path / "project-management.lbug"
+    repository = LadybugProjectRepository(db_path)
+    service = ProjectService(repository)
+    _handle_ok(
+        service,
+        {
+            "action": "create_project",
+            "project_id": "project-alpha",
+            "name": "Alpha",
+            "start_at": _aware_iso(13, 9, UTC_MINUS_FOUR),
+        },
+    )
+    _handle_ok(
+        service,
+        {
+            "action": "create_project",
+            "project_id": "project-beta",
+            "name": "Beta",
+            "start_at": _aware_iso(14, 9, UTC_MINUS_FOUR),
+        },
+    )
+    _handle_ok(
+        service,
+        {
+            "action": "update_project",
+            "project_id": "project-beta",
+            "name": "Beta Updated",
+            "default_currency": "gbp",
+        },
+    )
+    _handle_ok(
+        service,
+        {
+            "action": "delete_project",
+            "project_id": "project-alpha",
+            "confirm_project_id": "project-alpha",
+        },
+    )
+    _close(repository)
+
+    reopened = LadybugProjectRepository(db_path)
+    reopened_service = ProjectService(reopened)
+    result = reopened_service.handle_query(
+        QueryEnvelope.model_validate({"query": {"action": "query_projects"}}),
+    )
+
+    assert result.ok is True
+    assert [project["project_id"] for project in result.data["projects"]] == [
+        "project-beta",
+    ]
+    assert result.data["projects"][0]["name"] == "Beta Updated"
+    assert result.data["projects"][0]["default_currency"] == "GBP"
+    _close(reopened)

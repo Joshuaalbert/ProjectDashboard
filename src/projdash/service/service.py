@@ -27,6 +27,7 @@ from projdash.service.commands import (
     CreateProject,
     CreateRole,
     DeactivateRole,
+    DeleteProject,
     RemoveCalendarException,
     RemoveDependencyOperation,
     RemoveRoleRequirementOperation,
@@ -44,6 +45,7 @@ from projdash.service.commands import (
     SetResourceCalendarOperation,
     SetResourceRoles,
     SetResourceRolesOperation,
+    UpdateProject,
     UpsertProcessRevision,
     UpsertResource,
     UpsertResourceCalendar,
@@ -65,6 +67,7 @@ from projdash.service.queries import (
     QueryEnvelope,
     QueryProcessGraph,
     QueryProjectCatalog,
+    QueryProjects,
     QueryResourceCapacity,
     QueryResourceSchedule,
     QuerySchedule,
@@ -210,6 +213,24 @@ class ProjectService:
             return CommandResult(
                 command_id=envelope.command_id,
                 entity_ids={"project_id": project.project_id},
+            )
+        if isinstance(command, UpdateProject):
+            project = self._repository_call(
+                "update_project",
+                project_id=command.project_id,
+                name=command.name,
+                start_at=command.start_at,
+                default_currency=command.default_currency,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"project_id": project.project_id},
+            )
+        if isinstance(command, DeleteProject):
+            self._repository_call("delete_project", project_id=command.project_id)
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"project_id": command.project_id},
             )
         if isinstance(command, SetProjectDefaultCurrency):
             self._repository_call(
@@ -698,6 +719,13 @@ class ProjectService:
         if isinstance(query, GetProject):
             project = self._repository.get_project(query.project_id)
             data = {"project": project.model_dump(mode="json")}
+        elif isinstance(query, QueryProjects):
+            data = {
+                "projects": [
+                    project.model_dump(mode="json")
+                    for project in self._repository.list_projects()
+                ]
+            }
         elif isinstance(query, QueryProjectCatalog):
             data = self._project_catalog_data(query)
         elif isinstance(query, QuerySchedule):

@@ -33,6 +33,22 @@ class ResourceSeed:
     cost_rate: str
 
 
+@dataclass(frozen=True)
+class CalendarSeed:
+    """Calendar option used by project management forms."""
+
+    calendar_id: str
+    label: str
+
+
+@dataclass(frozen=True)
+class ProjectOption:
+    """Project option used by the sidebar selector."""
+
+    project_id: str
+    label: str
+
+
 def create_project_service(db_path: str) -> ProjectService:
     """Create the in-process service backed by the LadybugDB repository."""
     repository = LadybugProjectRepository(db_path)
@@ -78,6 +94,39 @@ def stable_id(prefix: str, label: str) -> str:
     if slug.startswith(f"{prefix}_"):
         return slug
     return f"{prefix}_{slug}"
+
+
+def scoped_id(project_id: str, prefix: str, label: str) -> str:
+    """Create a globally stable id namespaced by project."""
+    return stable_id(prefix, f"{project_id}_{label}")
+
+
+def project_options(projects: list[dict[str, Any]]) -> list[ProjectOption]:
+    """Build display options for project selection."""
+    return [
+        ProjectOption(
+            project_id=project["project_id"],
+            label=f"{project['name']} ({project['project_id']})",
+        )
+        for project in sorted(
+            projects,
+            key=lambda item: (str(item["name"]).casefold(), item["project_id"]),
+        )
+    ]
+
+
+def calendar_options(calendars: list[dict[str, Any]]) -> list[CalendarSeed]:
+    """Build display options for calendar selection."""
+    return [
+        CalendarSeed(
+            calendar_id=calendar["calendar_id"],
+            label=f"{calendar['name']} ({calendar['calendar_id']})",
+        )
+        for calendar in sorted(
+            calendars,
+            key=lambda item: (str(item["name"]).casefold(), item["calendar_id"]),
+        )
+    ]
 
 
 def parse_role_lines(value: str) -> list[RoleSeed]:

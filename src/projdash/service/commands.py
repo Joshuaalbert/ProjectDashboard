@@ -75,6 +75,41 @@ class SetProjectDefaultCurrency(CommandModel):
         return value.upper()
 
 
+class UpdateProject(CommandModel):
+    """Update mutable project metadata."""
+
+    action: Literal["update_project"] = "update_project"
+    project_id: str = Field(min_length=1)
+    name: str | None = Field(default=None, min_length=1)
+    start_at: AwareDatetime | None = None
+    default_currency: str | None = Field(default=None, min_length=3, max_length=3)
+
+    @field_validator("default_currency")
+    @classmethod
+    def _normalize_currency(cls, value: str | None) -> str | None:
+        return value.upper() if value is not None else None
+
+    @model_validator(mode="after")
+    def _validate_update(self) -> UpdateProject:
+        if self.name is None and self.start_at is None and self.default_currency is None:
+            raise ValueError("At least one project field must be provided.")
+        return self
+
+
+class DeleteProject(CommandModel):
+    """Delete a project and all project-owned facts."""
+
+    action: Literal["delete_project"] = "delete_project"
+    project_id: str = Field(min_length=1)
+    confirm_project_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_confirmation(self) -> DeleteProject:
+        if self.confirm_project_id != self.project_id:
+            raise ValueError("confirm_project_id must exactly match project_id.")
+        return self
+
+
 class SetProjectDueAt(CommandModel):
     """Set the explicit project due datetime."""
 
@@ -581,6 +616,8 @@ class CollapseSubgraph(CommandModel):
 Command = Annotated[
     CreateProject
     | SetProjectDefaultCurrency
+    | UpdateProject
+    | DeleteProject
     | SetProjectDueAt
     | ClearProjectDueAt
     | UpsertProcessRevision

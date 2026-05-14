@@ -11,7 +11,13 @@ from projdash.service.commands import (
     CreateProject,
     UpsertProcessRevision,
 )
-from projdash.service.queries import GetProject, QueryEnvelope, QueryProcessGraph, QuerySchedule
+from projdash.service.queries import (
+    GetProject,
+    QueryEnvelope,
+    QueryProcessGraph,
+    QueryProjects,
+    QuerySchedule,
+)
 from projdash.service.repository import InMemoryProjectRepository
 from projdash.service.service import ProjectService
 
@@ -183,6 +189,77 @@ def test_service_create_project_accepts_explicit_id_and_rejects_reuse():
     assert first.entity_ids == {"project_id": "project-stable"}
     assert second.ok is False
     assert second.error.code == "project_conflict"
+
+
+def test_service_lists_updates_and_deletes_projects_with_confirmation():
+    service = ProjectService(InMemoryProjectRepository())
+    service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "create_project",
+                    "project_id": "project-alpha",
+                    "name": "Alpha",
+                    "start_at": _at(13).isoformat(),
+                }
+            }
+        )
+    )
+    service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "create_project",
+                    "project_id": "project-beta",
+                    "name": "Beta",
+                    "start_at": _at(14).isoformat(),
+                }
+            }
+        )
+    )
+
+    update = service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "update_project",
+                    "project_id": "project-beta",
+                    "name": "Beta Updated",
+                    "default_currency": "gbp",
+                }
+            }
+        )
+    )
+    with pytest.raises(ValidationError):
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "delete_project",
+                    "project_id": "project-alpha",
+                    "confirm_project_id": "not-alpha",
+                }
+            }
+        )
+    deleted = service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "delete_project",
+                    "project_id": "project-alpha",
+                    "confirm_project_id": "project-alpha",
+                }
+            }
+        )
+    )
+    listed = service.handle_query(QueryEnvelope(query=QueryProjects()))
+
+    assert update.ok is True
+    assert deleted.ok is True
+    assert [project["project_id"] for project in listed.data["projects"]] == [
+        "project-beta",
+    ]
+    assert listed.data["projects"][0]["name"] == "Beta Updated"
+    assert listed.data["projects"][0]["default_currency"] == "GBP"
 
 
 def test_batch_commands_are_applied_in_order():

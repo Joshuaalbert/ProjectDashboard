@@ -61,6 +61,22 @@ class ProjectRepository(Protocol):
     ) -> ProjectRecord:
         """Create and persist a project."""
 
+    def list_projects(self) -> list[ProjectRecord]:
+        """Return all projects."""
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        start_at: dt.datetime | None = None,
+        default_currency: str | None = None,
+    ) -> ProjectRecord:
+        """Update mutable project metadata."""
+
+    def delete_project(self, project_id: str) -> None:
+        """Delete a project and all project-owned data."""
+
     def create_role(
         self,
         project_id: str,
@@ -287,6 +303,86 @@ class InMemoryProjectRepository:
         )
         self.projects[project.project_id] = project
         return project
+
+    def list_projects(self) -> list[ProjectRecord]:
+        """Return all projects sorted for stable UI selection."""
+        return sorted(
+            self.projects.values(),
+            key=lambda project: (project.name.casefold(), project.project_id),
+        )
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        start_at: dt.datetime | None = None,
+        default_currency: str | None = None,
+    ) -> ProjectRecord:
+        """Update mutable project metadata."""
+        project = self.get_project(project_id)
+        updates: dict[str, Any] = {}
+        if name is not None:
+            updates["name"] = name
+        if start_at is not None:
+            updates["start_at"] = start_at
+        if default_currency is not None:
+            updates["default_currency"] = default_currency
+        updated = project.model_copy(update=updates)
+        self.projects[project_id] = updated
+        return updated
+
+    def delete_project(self, project_id: str) -> None:
+        """Delete a project and every project-owned fact."""
+        self.get_project(project_id)
+        process_ids = list(self.process_ids_by_project.get(project_id, []))
+        role_ids = list(self.role_ids_by_project.get(project_id, []))
+        resource_ids = list(self.resource_ids_by_project.get(project_id, []))
+        calendar_ids = list(self.calendar_ids_by_project.get(project_id, []))
+        blocker_ids = list(self.blocker_ids_by_project.get(project_id, []))
+
+        for process_id in process_ids:
+            self.processes.pop(process_id, None)
+            for revision in self.revisions_by_process.pop(process_id, []):
+                for requirement in revision.role_requirements:
+                    if requirement.requirement_id is not None:
+                        self.role_requirements.pop(requirement.requirement_id, None)
+            self.retired_processes.pop(process_id, None)
+        for role_id in role_ids:
+            self.roles.pop(role_id, None)
+        for resource_id in resource_ids:
+            self.resources.pop(resource_id, None)
+        for calendar_id in calendar_ids:
+            self.calendars.pop(calendar_id, None)
+        for blocker_id in blocker_ids:
+            self.blockers.pop(blocker_id, None)
+
+        self.projects.pop(project_id, None)
+        self.process_ids_by_project.pop(project_id, None)
+        self.role_ids_by_project.pop(project_id, None)
+        self.resource_ids_by_project.pop(project_id, None)
+        self.calendar_ids_by_project.pop(project_id, None)
+        self.blocker_ids_by_project.pop(project_id, None)
+        self.project_due_at.pop(project_id, None)
+        self.process_aliases.pop(project_id, None)
+        self.process_alias_sources.pop(project_id, None)
+        self.due_history_events = [
+            event
+            for event in self.due_history_events
+            if event["project_id"] != project_id
+        ]
+        self.dependency_edge_ids = {
+            key: edge_id
+            for key, edge_id in self.dependency_edge_ids.items()
+            if key[0] != project_id
+        }
+        self.role_requirements = {
+            requirement.requirement_id: requirement
+            for revisions in self.revisions_by_process.values()
+            for revision in revisions
+            for requirement in revision.role_requirements
+            if requirement.requirement_id is not None
+        }
 
     def create_role(
         self,

@@ -1044,6 +1044,8 @@ Command field tables:
 | Action | Required fields | Optional fields | Result `entity_ids` |
 | --- | --- | --- | --- |
 | `create_project` | existing required fields | `project_id`, `default_currency` default `USD` | `project_id` |
+| `update_project` | `project_id` plus at least one mutable field | `name`, `start_at`, `default_currency` | `project_id` |
+| `delete_project` | `project_id`, `confirm_project_id` matching `project_id` | none | `project_id` |
 | `set_project_default_currency` | `project_id`, `default_currency` | none | `project_id` |
 | `set_project_due_at` | `project_id`, `due_at`, `edit_at` | none | `project_id`, `due_history_event_id` |
 | `clear_project_due_at` | `project_id`, `edit_at` | none | `project_id`, `due_history_event_id` |
@@ -1127,6 +1129,7 @@ Query field tables:
 
 | Action | Required fields | Optional fields | Data shape |
 | --- | --- | --- | --- |
+| `query_projects` | none | none | project metadata list for UI selection |
 | `query_schedule` | `project_id`, `as_of`, `now` | `scope` | dependency-only CPM schedule graph |
 | `query_critical_path` | `project_id`, `as_of`, `now` | `scope` | dependency-only critical path and slack |
 | `query_process_graph` | `project_id`, `as_of`, `now` | `scope`, `include_resource_fields`, `horizon_starts_at`, `horizon_ends_at`, shared resource query options, `include_allocation_slices` | process graph nodes/edges with CPM and optional resource-aware fields |

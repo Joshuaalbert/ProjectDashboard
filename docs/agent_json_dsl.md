@@ -99,6 +99,8 @@ Commands create or update authoritative facts. Extra fields are rejected.
 Initial project/process actions:
 
 - `create_project`
+- `update_project`
+- `delete_project`
 - `set_project_default_currency`
 - `set_project_due_at`
 - `clear_project_due_at`
@@ -658,6 +660,10 @@ Resource planning actions:
 
 `create_project.project_id` is optional; when omitted, the service generates an
 id. UI bootstrapping and agents that need stable references should provide it.
+Creating a project does not create default roles, calendars, or resources; the
+operator or agent must define all of them explicitly. `update_project` accepts
+`project_id` plus at least one of `name`, `start_at`, or `default_currency`.
+`delete_project` requires `project_id` and matching `confirm_project_id`.
 `create_project.default_currency` is optional and defaults to `USD`.
 `set_project_default_currency` requires `project_id` and `default_currency`.
 Currencies are ISO 4217 codes.
@@ -750,6 +756,7 @@ Legacy `required_roles` transition is controlled by service configuration
 Initial dependency-only queries:
 
 - `get_project`
+- `query_projects`
 - `query_schedule`
 - `query_critical_path`
 - `query_process_graph`
@@ -761,6 +768,7 @@ Process query field tables:
 
 | Action | Required fields | Optional fields | Data shape |
 | --- | --- | --- | --- |
+| `query_projects` | none | none | project metadata list for UI selection |
 | `query_schedule` | `project_id`, `as_of`, `now` | `scope` | `DependencyScheduleData` |
 | `query_critical_path` | `project_id`, `as_of`, `now` | `scope` | `CriticalPathData` |
 | `query_process_graph` | `project_id`, `as_of`, `now` | `scope`, `include_resource_fields` default `false`, `horizon_starts_at`, `horizon_ends_at`, shared resource query options, `include_allocation_slices` default `false` | `ProcessGraphData` |
