@@ -1,4 +1,5 @@
 import datetime as dt
+import math
 
 import matplotlib.dates as mdates
 import pytest
@@ -9,6 +10,7 @@ from projdash.ui.adapters import (
     allowed_shared_dependency_symbols,
     allowed_successor_symbols,
     ancestor_scope_symbols,
+    blocker_table_rows,
     build_process_graph_dot,
     catalog_from_query_data,
     cost_time_series_rows,
@@ -158,6 +160,95 @@ def test_process_table_rows_and_role_defaults_include_pm_description_and_effort(
         "role_eng": 5.0,
         "role_qa": 1.0,
     }
+
+
+def test_blocker_table_rows_join_process_priority_roles_and_resources():
+    now = dt.datetime(2026, 5, 13, 12, tzinfo=dt.UTC)
+    blockers = {
+        "blockers": [
+            {
+                "blocker_id": "blocker-review",
+                "process_id": "p1",
+                "process_symbol": "A",
+                "summary": "Reviewer unavailable",
+                "details": "Waiting for security review.",
+                "severity": "blocking",
+                "created_at": "2026-05-13T11:00:00+00:00",
+                "resolved_at": None,
+                "resolution": None,
+                "is_blocking_as_of": True,
+                "is_resolved_as_of": False,
+            },
+            {
+                "blocker_id": "blocker-archive",
+                "process_id": "p2",
+                "process_symbol": "B",
+                "summary": "Old issue",
+                "details": None,
+                "severity": "blocking",
+                "created_at": "2026-05-12T11:00:00+00:00",
+                "resolved_at": "2026-05-13T09:00:00+00:00",
+                "resolution": "Closed.",
+                "is_blocking_as_of": False,
+                "is_resolved_as_of": True,
+            },
+        ],
+    }
+    graph = {
+        "nodes": [
+            {
+                "process_id": "p1",
+                "process_symbol": "A",
+                "name": "Design",
+                "status": "planned",
+                "computed_status": "work_now",
+                "role_requirements": [
+                    {"role_id": "role_eng", "effort_hours": 4},
+                    {"role_id": "role_qa", "effort_hours": 2},
+                ],
+                "dependency_only": {
+                    "es_at": "2026-05-13T09:00:00+00:00",
+                    "ef_at": "2026-05-13T11:00:00+00:00",
+                    "ls_at": "2026-05-13T13:00:00+00:00",
+                    "lf_at": "2026-05-13T15:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "p2",
+                "process_symbol": "B",
+                "name": "Done",
+                "status": "done",
+                "computed_status": "done",
+                "role_requirements": [{"role_id": "role_ops", "effort_hours": 1}],
+                "dependency_only": {
+                    "es_at": "2026-05-12T09:00:00+00:00",
+                    "ef_at": "2026-05-12T10:00:00+00:00",
+                    "ls_at": "2026-05-12T09:00:00+00:00",
+                    "lf_at": "2026-05-12T10:00:00+00:00",
+                },
+            },
+        ],
+    }
+    schedule = {
+        "allocation_slices": [
+            {"process_id": "p1", "resource_id": "res_ada"},
+            {"process_id": "p1", "resource_id": "res_grace"},
+            {"process_id": "p2", "resource_id": "res_ops"},
+        ]
+    }
+
+    rows = blocker_table_rows(blockers, graph, schedule, now)
+
+    assert rows[0]["blocker_id"] == "blocker-review"
+    assert rows[0]["blocker_status"] == "blocking"
+    assert rows[0]["priority"] == "P2"
+    assert rows[0]["process_status"] == "planned"
+    assert rows[0]["computed_status"] == "work_now"
+    assert rows[0]["role_ids"] == "role_eng, role_qa"
+    assert rows[0]["resource_ids"] == "res_ada, res_grace"
+    assert rows[1]["blocker_id"] == "blocker-archive"
+    assert rows[1]["blocker_status"] == "resolved"
+    assert rows[1]["priority"] == "-"
 
 
 def test_display_datetime_helpers_use_selected_timezone_and_visible_format():
@@ -463,7 +554,7 @@ def test_process_aggregation_and_priority_rows_use_schedule_windows():
                 "process_id": "p1",
                 "resource_id": "res_alice",
                 "role_id": "role_eng",
-                "effort_hours": 1.5,
+                "effort_hours": 2,
             }
         ]
     }
@@ -478,6 +569,7 @@ def test_process_aggregation_and_priority_rows_use_schedule_windows():
     assert aggregate["blocker_ids"] == ["b1"]
     assert role_rows[0]["priority"] == "P2"
     assert role_rows[0]["process_symbol"] == "A"
+    assert role_rows[0]["hours_until_ls"] == 1.0
     assert role_rows[-1]["priority"] == "P3"
     assert resource_rows == [
         {
@@ -485,12 +577,9 @@ def test_process_aggregation_and_priority_rows_use_schedule_windows():
             "priority_rank": 2,
             "process_symbol": "A",
             "process_name": "Design",
-            "es_at": dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC),
-            "ls_at": dt.datetime(2026, 5, 13, 13, tzinfo=dt.UTC),
-            "lf_at": dt.datetime(2026, 5, 13, 15, tzinfo=dt.UTC),
-            "hours_until_lf": 3.0,
+            "hours_until_ls": 1.0,
             "resource_id": "res_alice",
-            "allocated_hours": 1.5,
+            "effort_hours": 2.0,
             "role_ids": "role_eng",
         }
     ]
@@ -554,6 +643,43 @@ def test_gantt_rows_use_terminal_ancestor_scope():
     assert all(row["critical"] for row in rows)
 
 
+def test_gantt_rows_use_explicit_critical_path_over_criticality_labels():
+    graph = {
+        "critical_path_process_ids": ["p2"],
+        "nodes": [
+            {
+                "process_id": "p1",
+                "process_symbol": "A",
+                "dependency_only": {
+                    "es_at": "2026-05-13T09:00:00+00:00",
+                    "ef_at": "2026-05-13T10:00:00+00:00",
+                    "ls_at": "2026-05-13T09:00:00+00:00",
+                    "lf_at": "2026-05-13T10:00:00+00:00",
+                    "slack_hours": 0,
+                    "criticality_label": "critical",
+                },
+            },
+            {
+                "process_id": "p2",
+                "process_symbol": "B",
+                "dependency_only": {
+                    "es_at": "2026-05-13T10:00:00+00:00",
+                    "ef_at": "2026-05-13T11:00:00+00:00",
+                    "ls_at": "2026-05-13T10:00:00+00:00",
+                    "lf_at": "2026-05-13T11:00:00+00:00",
+                    "slack_hours": 0,
+                    "criticality_label": "non_critical",
+                },
+            },
+        ],
+    }
+
+    rows = gantt_rows(graph)
+
+    assert [row["symbol"] for row in rows] == ["A", "B"]
+    assert [row["critical"] for row in rows] == [False, True]
+
+
 def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
     utilization = {
         "time_series": [
@@ -584,6 +710,15 @@ def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
                 "allocated_hours": 0,
                 "utilization_ratio": 0,
             },
+            {
+                "starts_at": "2026-05-13T10:00:00+00:00",
+                "ends_at": "2026-05-13T11:00:00+00:00",
+                "resource_id": "res_b",
+                "role_ids": ["role_ops"],
+                "capacity_hours": 1,
+                "allocated_hours": 0.25,
+                "utilization_ratio": 0.25,
+            },
         ]
     }
     schedule = {
@@ -608,12 +743,16 @@ def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
     )
     role_labels, role_times, role_matrix = role_utilization_heatmap(utilization, schedule)
 
-    assert resource_labels == ["res_a"]
+    assert resource_labels == ["res_a", "res_b"]
     assert [time.hour for time in resource_times] == [9, 10]
-    assert resource_matrix == [[0.5, 1.0]]
-    assert role_labels == ["role_dev"]
+    assert resource_matrix[0] == [0.5, 1.0]
+    assert math.isnan(resource_matrix[1][0])
+    assert resource_matrix[1][1] == 0.25
+    assert role_labels == ["role_dev", "role_ops"]
     assert [time.hour for time in role_times] == [9, 10]
-    assert role_matrix == [[0.5, 0.5]]
+    assert role_matrix[0] == [0.5, 0.5]
+    assert math.isnan(role_matrix[1][0])
+    assert role_matrix[1][1] == 0.0
     span = schedule_time_span(schedule)
     assert span is not None
     assert [span[0].hour, span[0].minute] == [9, 30]
@@ -630,13 +769,34 @@ def test_graph_adapter_marks_critical_path_and_collapsed_nodes():
                     "process_symbol": "A",
                     "name": "Start",
                     "computed_status": "work_now",
-                    "resource_aware": {"inferred_duration_hours": 2},
+                    "dependency_only": {
+                        "es_at": "2026-05-13T09:00:00+00:00",
+                        "ls_at": "2026-05-13T09:00:00+00:00",
+                        "lf_at": "2026-05-13T11:00:00+00:00",
+                    },
                 },
                 {
                     "process_id": "p2",
                     "process_symbol": "B",
                     "name": "Finish",
                     "computed_status": "ready",
+                    "dependency_only": {
+                        "es_at": "2026-05-13T11:00:00+00:00",
+                        "ls_at": "2026-05-13T11:00:00+00:00",
+                        "lf_at": "2026-05-13T13:00:00+00:00",
+                    },
+                },
+                {
+                    "process_id": "p3",
+                    "process_symbol": "C",
+                    "name": "Optional",
+                    "computed_status": "planned",
+                    "dependency_only": {
+                        "es_at": "2026-05-13T09:00:00+00:00",
+                        "ef_at": "2026-05-13T12:00:00+00:00",
+                        "ls_at": "2026-05-13T14:00:00+00:00",
+                        "lf_at": "2026-05-13T17:00:00+00:00",
+                    },
                 },
             ],
             "edges": [
@@ -651,7 +811,8 @@ def test_graph_adapter_marks_critical_path_and_collapsed_nodes():
 
     assert "penwidth=3" in dot
     assert "[+]B" in dot
-    assert "2h" in dot
+    assert "duration: 2h" in dot
+    assert "duration: 8h; slack: 3h" in dot
     assert "p1 -> p2" in dot
 
 

@@ -175,7 +175,7 @@ class RoleRequirementCommand(StrictModel):
 
     requirement_id: str | None = Field(default=None, min_length=1)
     role_id: str = Field(min_length=1)
-    effort_hours: PositiveFloat
+    effort_hours: PositiveInt
     min_allocation_hours_per_day: NonNegativeFloat | None = None
     max_allocation_hours_per_day: PositiveFloat | None = None
     required_resource_count: PositiveInt = 1
@@ -254,6 +254,22 @@ class ResourceHolidayCommand(StrictModel):
         return self
 
 
+class ResourceCalendarOverrideCommand(StrictModel):
+    """Time-ranged replacement calendar for a resource."""
+
+    rule_id: str | None = Field(default=None, min_length=1)
+    calendar_id: str = Field(min_length=1)
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime | None = None
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_override_interval(self) -> ResourceCalendarOverrideCommand:
+        if self.ends_at is not None and self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at.")
+        return self
+
+
 class UpsertResourcePayload(StrictModel):
     """Resource payload used by top-level and batch upsert commands."""
 
@@ -267,6 +283,9 @@ class UpsertResourcePayload(StrictModel):
     cost_unit: CostUnit
     cost_currency: str | None = Field(default=None, min_length=3, max_length=3)
     holidays: list[ResourceHolidayCommand] = Field(default_factory=list)
+    calendar_overrides: list[ResourceCalendarOverrideCommand] = Field(
+        default_factory=list,
+    )
     active: bool = True
 
     @field_validator("cost_currency")
@@ -289,6 +308,17 @@ class UpsertResourcePayload(StrictModel):
             raise ValueError("holiday_id values must be unique.")
         return value
 
+    @field_validator("calendar_overrides")
+    @classmethod
+    def _validate_calendar_override_ids(
+        cls,
+        value: list[ResourceCalendarOverrideCommand],
+    ) -> list[ResourceCalendarOverrideCommand]:
+        rule_ids = [rule.rule_id for rule in value if rule.rule_id is not None]
+        if len(rule_ids) != len(set(rule_ids)):
+            raise ValueError("calendar override rule_id values must be unique.")
+        return value
+
     @model_validator(mode="after")
     def _validate_availability_interval(self) -> UpsertResourcePayload:
         if (
@@ -296,6 +326,18 @@ class UpsertResourcePayload(StrictModel):
             and self.available_until_at <= self.available_from_at
         ):
             raise ValueError("available_until_at must be after available_from_at.")
+        ordered_rules = sorted(
+            self.calendar_overrides,
+            key=lambda rule: rule.starts_at,
+        )
+        previous_end: dt.datetime | None = None
+        for index, rule in enumerate(ordered_rules):
+            if previous_end is None:
+                if index > 0:
+                    raise ValueError("calendar overrides must not overlap.")
+            elif rule.starts_at < previous_end:
+                raise ValueError("calendar overrides must not overlap.")
+            previous_end = rule.ends_at
         return self
 
 

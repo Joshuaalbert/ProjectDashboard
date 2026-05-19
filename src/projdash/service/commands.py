@@ -214,6 +214,16 @@ class ResolveBlocker(CommandModel):
     resolution: str | None = None
 
 
+class ReopenBlocker(CommandModel):
+    """Clear a blocker resolution so it becomes unresolved again."""
+
+    action: Literal["reopen_blocker"] = "reopen_blocker"
+    project_id: str = Field(min_length=1)
+    blocker_id: str = Field(min_length=1)
+    edit_at: AwareDatetime
+    note: str | None = None
+
+
 class RenameProcess(CommandModel, ProcessIdentityMixin):
     """Rename a process symbol."""
 
@@ -661,6 +671,7 @@ Command = Annotated[
     | CommitProjectState
     | AddBlocker
     | ResolveBlocker
+    | ReopenBlocker
     | RenameProcess
     | AddProcessAliases
     | BatchUpdateProcessGraph

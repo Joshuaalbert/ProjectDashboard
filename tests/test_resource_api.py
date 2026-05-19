@@ -213,7 +213,7 @@ def _calendar_exceptions(
 
 def test_agent_context_query_returns_concise_project_management_json():
     service = ProjectService(InMemoryProjectRepository())
-    project_id, role_id, _calendar_id, _resource_id, process_id = (
+    project_id, role_id, _calendar_id, resource_id, process_id = (
         _seed_allocatable_project(service)
     )
     ship_id = _handle(
@@ -305,6 +305,15 @@ def test_agent_context_query_returns_concise_project_management_json():
     assert priority_by_role[role_id][0]["process_symbol"] == "process-api"
     assert priority_by_role[role_id][0]["priority"] in {"P1", "P2"}
     assert priority_by_role[role_id][0]["effort_hours"] == 8
+    assert "hours_until_ls" in priority_by_role[role_id][0]
+
+    priority_by_resource = {
+        row["resource_id"]: row["processes"]
+        for row in data["prioritized_work"]["by_resource"]
+    }
+    assert priority_by_resource[resource_id][0]["process_symbol"] == "process-api"
+    assert priority_by_resource[resource_id][0]["effort_hours"] == 8
+    assert priority_by_resource[resource_id][0]["role_ids"] == [role_id]
 
 
 def test_agent_context_terminal_scope_filters_blockers_and_accepts_aliases():

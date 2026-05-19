@@ -109,6 +109,7 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
         _mapping(item, "role requirement")
         for item in _sequence(input_data.get("role_requirements", ()))
     ]
+    _validate_integral_effort_hours(requirements)
     roles = [_mapping(item, "role") for item in _sequence(input_data.get("roles", ()))]
     resources = [
         _mapping(item, "resource") for item in _sequence(input_data.get("resources", ()))
@@ -899,27 +900,13 @@ def _water_fill_requirement_candidates(
     candidates: list[_RequirementCandidate],
     capacity_hours: float,
 ) -> list[tuple[_RequirementCandidate, float]]:
-    if not candidates or capacity_hours <= EPSILON:
+    if not candidates or capacity_hours + EPSILON < 1:
         return []
-    remaining_capacity = capacity_hours
-    assignments = {id(candidate): 0.0 for candidate in candidates}
     for tier in _role_availability_tiers(candidates):
-        if remaining_capacity <= EPSILON:
-            break
-        demand = min(remaining_capacity, sum(item.headroom_hours for item in tier))
-        tier_assignments = _water_fill_candidate_tier(tier, demand)
-        consumed = 0.0
-        for candidate, amount in tier_assignments:
-            assignments[id(candidate)] += amount
-            consumed += amount
-        if consumed <= EPSILON:
-            break
-        remaining_capacity -= consumed
-    return [
-        (candidate, assignments[id(candidate)])
-        for candidate in candidates
-        if assignments[id(candidate)] > EPSILON
-    ]
+        for candidate in tier:
+            if candidate.headroom_hours + EPSILON >= 1:
+                return [(candidate, 1.0)]
+    return []
 
 
 def _role_availability_tiers(
@@ -946,31 +933,10 @@ def _water_fill_candidate_tier(
     candidates: list[_RequirementCandidate],
     capacity_hours: float,
 ) -> list[tuple[_RequirementCandidate, float]]:
-    assignments = {index: 0.0 for index in range(len(candidates))}
-    unfrozen = [
-        (index, candidate, candidate.headroom_hours)
-        for index, candidate in enumerate(candidates)
-    ]
-    demand = capacity_hours
-    while demand > EPSILON and unfrozen:
-        share = demand / len(unfrozen)
-        consumed = 0.0
-        next_unfrozen = []
-        for index, candidate, headroom in unfrozen:
-            assignable = min(share, headroom)
-            assignments[index] += assignable
-            consumed += assignable
-            residual_headroom = headroom - assignable
-            if residual_headroom > EPSILON:
-                next_unfrozen.append((index, candidate, residual_headroom))
-        if consumed <= EPSILON:
-            break
-        demand -= consumed
-        unfrozen = next_unfrozen
     return [
-        (candidate, assignments[index])
-        for index, candidate in enumerate(candidates)
-        if assignments[index] > EPSILON
+        (candidate, 1.0)
+        for candidate in candidates[: int(capacity_hours)]
+        if candidate.headroom_hours + EPSILON >= 1
     ]
 
 
@@ -1496,25 +1462,16 @@ def _water_fill(
     selected: list[tuple[_LedgerBucket, float]],
     remaining: float,
 ) -> list[tuple[_LedgerBucket, float]]:
-    demand = min(remaining, sum(headroom for _, headroom in selected))
-    assignments = {id(bucket): 0.0 for bucket, _ in selected}
-    unfrozen = [(bucket, headroom) for bucket, headroom in selected]
-    while demand > EPSILON and unfrozen:
-        share = demand / len(unfrozen)
-        next_unfrozen = []
-        consumed = 0.0
-        for bucket, headroom in unfrozen:
-            assignable = min(share, headroom)
-            assignments[id(bucket)] += assignable
-            consumed += assignable
-            residual_headroom = headroom - assignable
-            if residual_headroom > EPSILON:
-                next_unfrozen.append((bucket, residual_headroom))
-        if consumed <= EPSILON:
+    demand = int(remaining + EPSILON)
+    assignments = []
+    for bucket, headroom in selected:
+        if demand <= 0:
             break
-        demand -= consumed
-        unfrozen = next_unfrozen
-    return [(bucket, assignments[id(bucket)]) for bucket, _ in selected]
+        if headroom + EPSILON < 1:
+            continue
+        assignments.append((bucket, 1.0))
+        demand -= 1
+    return assignments
 
 
 def _candidate_headroom(
@@ -1531,10 +1488,14 @@ def _candidate_headroom(
         key = _daily_allocation_key(requirement, bucket.resource_id, bucket.local_date)
         daily_residual = max(0.0, float(cap) - daily_allocated[key])
     available_after_ready = _bucket_capacity_after(bucket, ready_at)
-    return max(
-        0.0,
-        min(bucket.remaining_hours, available_after_ready, daily_residual, remaining),
-    )
+    if (
+        bucket.remaining_hours + EPSILON < 1
+        or available_after_ready + EPSILON < 1
+        or daily_residual + EPSILON < 1
+        or remaining + EPSILON < 1
+    ):
+        return 0.0
+    return 1.0
 
 
 def _block_headroom(
@@ -1573,9 +1534,7 @@ def _consume_bucket(
     daily_allocated: dict[tuple[str, str, str, str], float],
     requirement: Mapping[str, object],
 ) -> None:
-    bucket.remaining_hours = max(0.0, bucket.remaining_hours - amount)
-    if bucket.remaining_hours < EPSILON:
-        bucket.remaining_hours = 0.0
+    bucket.remaining_hours = 0.0
     key = _daily_allocation_key(requirement, bucket.resource_id, bucket.local_date)
     daily_allocated[key] += amount
 
@@ -2025,15 +1984,27 @@ def _resource_has_recurring_capacity(
     resource: Mapping[str, object],
     calendar_by_id: dict[str, Mapping[str, object]],
 ) -> bool:
-    calendar = calendar_by_id.get(str(resource.get("calendar_id")))
-    if calendar is None:
-        return False
-    for window in _sequence(calendar.get("weekly_windows", ())):
-        if not isinstance(window, Mapping):
+    for calendar_id in _resource_calendar_ids(resource):
+        calendar = calendar_by_id.get(calendar_id)
+        if calendar is None:
             continue
-        if float(window.get("capacity_hours", 0) or 0) > EPSILON:
-            return True
+        for window in _sequence(calendar.get("weekly_windows", ())):
+            if not isinstance(window, Mapping):
+                continue
+            if float(window.get("capacity_hours", 0) or 0) > EPSILON:
+                return True
     return False
+
+
+def _resource_calendar_ids(resource: Mapping[str, object]) -> tuple[str, ...]:
+    calendar_ids = [str(resource.get("calendar_id"))]
+    for override in _sequence(resource.get("calendar_overrides", ())):
+        if not isinstance(override, Mapping):
+            continue
+        calendar_id = override.get("calendar_id")
+        if calendar_id is not None:
+            calendar_ids.append(str(calendar_id))
+    return tuple(dict.fromkeys(calendar_ids))
 
 
 def _is_done_process(process: Mapping[str, object]) -> bool:
@@ -2073,32 +2044,89 @@ def _expand_capacity_buckets(
     for resource in resources:
         if not bool(resource.get("active", True)):
             continue
-        calendar = calendar_by_id.get(str(resource.get("calendar_id")))
-        if calendar is None or not bool(calendar.get("active", True)):
-            continue
-        timezone = ZoneInfo(str(calendar.get("timezone", "UTC")))
-        for bucket in expand_resource_calendar(
-            calendar=calendar,
-            resource=resource,
-            horizon_starts_at=horizon_starts_at,
-            horizon_ends_at=horizon_ends_at,
-            planning_granularity=planning_granularity,
-        ):
-            output.append(
-                _LedgerBucket(
-                    resource_id=bucket.resource_id,
-                    calendar_id=bucket.calendar_id,
-                    starts_at=bucket.starts_at,
-                    ends_at=bucket.ends_at,
-                    capacity_hours=float(bucket.capacity_hours),
-                    remaining_hours=float(bucket.capacity_hours),
-                    role_ids=tuple(bucket.role_ids),
-                    local_date=bucket.local_date,
-                    local_week=bucket.local_week,
-                    window_id=_window_id_for_bucket(bucket, calendar, timezone),
-                )
+        for calendar, segment_starts_at, segment_ends_at in (
+            _resource_calendar_segments(
+                resource,
+                calendar_by_id,
+                horizon_starts_at,
+                horizon_ends_at,
             )
+        ):
+            if calendar is None or not bool(calendar.get("active", True)):
+                continue
+            timezone = ZoneInfo(str(calendar.get("timezone", "UTC")))
+            for bucket in expand_resource_calendar(
+                calendar=calendar,
+                resource=resource,
+                horizon_starts_at=segment_starts_at,
+                horizon_ends_at=segment_ends_at,
+                planning_granularity=planning_granularity,
+            ):
+                output.append(
+                    _LedgerBucket(
+                        resource_id=bucket.resource_id,
+                        calendar_id=bucket.calendar_id,
+                        starts_at=bucket.starts_at,
+                        ends_at=bucket.ends_at,
+                        capacity_hours=float(bucket.capacity_hours),
+                        remaining_hours=float(bucket.capacity_hours),
+                        role_ids=tuple(bucket.role_ids),
+                        local_date=bucket.local_date,
+                        local_week=bucket.local_week,
+                        window_id=_window_id_for_bucket(bucket, calendar, timezone),
+                    )
+                )
     return tuple(sorted(output, key=_bucket_sort_key))
+
+
+def _resource_calendar_segments(
+    resource: Mapping[str, object],
+    calendar_by_id: dict[str, Mapping[str, object]],
+    starts_at: dt.datetime,
+    ends_at: dt.datetime,
+) -> list[tuple[Mapping[str, object] | None, dt.datetime, dt.datetime]]:
+    default_calendar = calendar_by_id.get(str(resource.get("calendar_id")))
+    segments: list[tuple[Mapping[str, object] | None, dt.datetime, dt.datetime]] = []
+    cursor = starts_at
+    previous_override_end: dt.datetime | None = None
+    for override in sorted(
+        (
+            _mapping(item, "calendar override")
+            for item in _sequence(resource.get("calendar_overrides", ()))
+        ),
+        key=lambda item: _as_utc(item["starts_at"]),
+    ):
+        override_starts_at = _as_utc(override["starts_at"])
+        override_ends_value = override.get("ends_at")
+        override_ends_at = (
+            _as_utc(override_ends_value)
+            if override_ends_value is not None
+            else ends_at
+        )
+        if override_ends_at <= override_starts_at:
+            raise ValueError("resource calendar override ends_at must be after starts_at")
+        if previous_override_end is None:
+            if segments and override_starts_at < cursor:
+                raise ValueError("resource calendar overrides must not overlap")
+        elif override_starts_at < previous_override_end:
+            raise ValueError("resource calendar overrides must not overlap")
+        previous_override_end = override_ends_at
+        segment_starts_at = max(override_starts_at, starts_at)
+        segment_ends_at = min(override_ends_at, ends_at)
+        if segment_ends_at <= starts_at or segment_starts_at >= ends_at:
+            continue
+        if segment_starts_at > cursor:
+            segments.append((default_calendar, cursor, segment_starts_at))
+        calendar = calendar_by_id.get(str(override.get("calendar_id")))
+        segments.append((calendar, max(cursor, segment_starts_at), segment_ends_at))
+        cursor = max(cursor, segment_ends_at)
+    if cursor < ends_at:
+        segments.append((default_calendar, cursor, ends_at))
+    return [
+        (calendar, segment_starts_at, segment_ends_at)
+        for calendar, segment_starts_at, segment_ends_at in segments
+        if segment_ends_at > segment_starts_at
+    ]
 
 
 def _fresh_ledger(
@@ -3015,6 +3043,19 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
     if isinstance(value, Mapping):
         return value
     raise ValueError(f"{name} must be an object")
+
+
+def _validate_integral_effort_hours(
+    requirements: list[Mapping[str, object]],
+) -> None:
+    for requirement in requirements:
+        effort = float(requirement.get("effort_hours", 0))
+        if effort <= 0 or not math.isclose(effort, round(effort), abs_tol=EPSILON):
+            requirement_id = requirement.get("requirement_id", "<unknown>")
+            raise ValueError(
+                "role requirement effort_hours must be a positive whole number "
+                f"for {requirement_id!r}"
+            )
 
 
 def _sequence(value: object) -> tuple[object, ...]:

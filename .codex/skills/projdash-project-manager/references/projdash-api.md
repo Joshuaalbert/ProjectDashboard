@@ -39,9 +39,13 @@ selection.
 - Schedules have no user-supplied horizon. Recurring resource calendars extend
   indefinitely.
 - Process effort is stored as `role_requirements`: one row per role with
-  `effort_hours`.
+  whole-number `effort_hours`.
 - A resource can fill one process per resource-hour bucket, may switch between
-  adjacent buckets, and may hold multiple roles.
+  adjacent buckets, and may hold multiple roles. Resource-hour allocation is
+  binary: 0 or 1, never fractional.
+- A resource's `calendar_id` is its default unbounded calendar. Use
+  `calendar_overrides` on the resource for bounded replacement calendar rules,
+  such as a different August or September availability pattern.
 - Blockers do not delay the schedule. They affect PM prioritization and status.
 - `earliest_start_at` is a not-before constraint.
 - `started_at` pins a process start: `ES == LS == started_at`.
@@ -66,7 +70,27 @@ Agent context, the default starting point:
 ```
 
 The response includes `project`, `summary`, `graph`, `schedule`, `slippage`,
-`prioritized_work`, `blockers`, and `available_queries`.
+`prioritized_work`, `blockers`, and `available_queries`. `prioritized_work`
+contains `by_role` and `by_resource` groups. Each priority process includes the
+priority label, process symbol and name, latest-start timing, effort hours, and
+status fields needed for action planning.
+
+Use the JSON response as the canonical state for command construction. Markdown
+context summaries should be generated from this JSON for briefing and hand-off;
+Markdown is more expressive for explaining why work is urgent, which calendars
+apply, and how slippage changed, but it should remain a derived view rather
+than the source used to build mutation payloads.
+
+Recommended Markdown context summary sections:
+
+- Snapshot: project id, `as_of`, `now`, scope, terminal targets, completion,
+  status counts, blocked count, and schedule convergence.
+- Critical path.
+- Role priorities and resource priorities, grouped by entity.
+- Schedule watchlist with LS/end times, slack, allocation state, and status.
+- Open blockers.
+- Resource calendar rules, including default calendars and bounded overrides.
+- Follow-up queries available for deeper evidence.
 
 Use narrower queries for evidence:
 
@@ -139,6 +163,15 @@ Create or update core capacity before adding process effort that depends on it:
   "cost_rate": "100",
   "cost_unit": "hour",
   "cost_currency": "USD",
+  "calendar_overrides": [
+    {
+      "rule_id": "august-2026",
+      "calendar_id": "cal_josh_august_cet",
+      "starts_at": "2026-08-01T00:00:00+02:00",
+      "ends_at": "2026-09-01T00:00:00+02:00",
+      "reason": "Temporary August availability pattern from planning notes."
+    }
+  ],
   "holidays": [
     {
       "holiday_id": "holiday_2026_05_25",

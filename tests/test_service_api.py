@@ -1,4 +1,7 @@
 import datetime as dt
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 import pytest
@@ -146,6 +149,61 @@ def test_service_creates_project_and_process_revision():
     assert project_query_result.data["project"]["name"] == "Agentic Rewrite"
     assert graph_query_result.data["project_id"] == project_id
     assert graph_query_result.data["nodes"][0]["name"] == "Define service API"
+
+
+def test_service_serializes_concurrent_mutating_commands():
+    class TrackingRepository(InMemoryProjectRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self._replace_counter_lock = threading.Lock()
+            self.active_replace_count = 0
+            self.max_active_replace_count = 0
+            self.replace_call_count = 0
+
+        def __getstate__(self):
+            state = self.__dict__.copy()
+            state.pop("_replace_counter_lock", None)
+            return state
+
+        def __setstate__(self, state):
+            self.__dict__.update(state)
+            self._replace_counter_lock = threading.Lock()
+
+        def replace_with(self, other):
+            with self._replace_counter_lock:
+                self.active_replace_count += 1
+                self.replace_call_count += 1
+                self.max_active_replace_count = max(
+                    self.max_active_replace_count,
+                    self.active_replace_count,
+                )
+            try:
+                time.sleep(0.02)
+                return super().replace_with(other)
+            finally:
+                with self._replace_counter_lock:
+                    self.active_replace_count -= 1
+
+    repository = TrackingRepository()
+    service = ProjectService(repository)
+    envelopes = [
+        CommandEnvelope(
+            command_id=f"00000000-0000-4000-8000-00000000020{index}",
+            command=CreateProject(
+                project_id=f"project-concurrent-{index}",
+                name=f"Concurrent {index}",
+                start_at=_at(13),
+            ),
+        )
+        for index in range(2)
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(service.handle_command, envelopes))
+
+    assert all(result.ok for result in results)
+    assert repository.replace_call_count == 2
+    assert repository.max_active_replace_count == 1
 
 
 def test_service_create_project_accepts_explicit_id_and_rejects_reuse():
@@ -774,6 +832,7 @@ def test_resource_command_defaults_are_applied():
             "effort_hours": 8,
             "allocation_policy": "parallel",
         },
+        {"role_id": "role-engineer", "effort_hours": 1.5},
     ],
 )
 def test_role_requirement_validation_rejects_invalid_values(requirement):
@@ -1429,6 +1488,18 @@ def test_error_result_wrappers_use_single_structured_error():
             ),
         ),
         ApiCase(
+            "reopen_blocker",
+            _command_payload(
+                {
+                    "action": "reopen_blocker",
+                    "project_id": "project-alpha",
+                    "blocker_id": "blocker-vendor",
+                    "edit_at": _at(14, 12).isoformat(),
+                    "note": "Resolution was clicked accidentally.",
+                }
+            ),
+        ),
+        ApiCase(
             "rename_process",
             _command_payload(
                 {
@@ -1550,6 +1621,17 @@ def test_lifecycle_due_blocker_and_alias_command_payloads_round_trip(case):
                     "project_id": "project-alpha",
                     "blocker_id": "blocker-vendor",
                     "resolved_at": "2026-05-14T11:00:00",
+                }
+            ),
+        ),
+        ApiCase(
+            "reopen_blocker_naive_edit_at",
+            _command_payload(
+                {
+                    "action": "reopen_blocker",
+                    "project_id": "project-alpha",
+                    "blocker_id": "blocker-vendor",
+                    "edit_at": "2026-05-14T12:00:00",
                 }
             ),
         ),

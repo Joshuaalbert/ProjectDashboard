@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import inspect
 import json
+import threading
 from collections import defaultdict
 from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal
@@ -107,6 +108,7 @@ class ProjectService:
             required_roles_transition_mode=required_roles_transition_mode,
         )
         self._resource_scheduler = resource_scheduler
+        self._command_lock = threading.RLock()
         self._command_replay_cache: dict[
             object,
             dict[str, CommandResult | CommandErrorResult],
@@ -124,6 +126,14 @@ class ProjectService:
         Returns:
             Structured command result.
         """
+        with self._command_lock:
+            return self._handle_command_transaction(envelope)
+
+    def _handle_command_transaction(
+        self,
+        envelope: CommandEnvelope,
+    ) -> CommandResult | CommandErrorResult:
+        """Apply a mutating command while the service command lock is held."""
         fingerprint = envelope.command.model_dump_json()
         cached = self._command_replay_cache.get(envelope.command_id)
         if cached is not None:
@@ -396,6 +406,7 @@ class ProjectService:
                 cost_unit=command.cost_unit,
                 cost_currency=cost_currency,
                 holidays=command.holidays,
+                calendar_overrides=command.calendar_overrides,
                 active=command.active,
             )
             return CommandResult(
@@ -1483,7 +1494,7 @@ class ProjectService:
             now=query.now,
             scope=context_scope,
             include_resource_fields=True,
-            include_allocation_slices=False,
+            include_allocation_slices=True,
             planning_granularity=query.planning_granularity,
             max_iterations=query.max_iterations,
             convergence_tolerance_hours=query.convergence_tolerance_hours,
@@ -1540,6 +1551,11 @@ class ProjectService:
                 ),
                 "prioritized_work": {
                     "by_role": self._agent_role_priority_context(
+                        graph,
+                        query.now,
+                        priority_terminal_symbols,
+                    ),
+                    "by_resource": self._agent_resource_priority_context(
                         graph,
                         query.now,
                         priority_terminal_symbols,
@@ -1803,6 +1819,76 @@ class ProjectService:
             for role_id, rows in sorted(role_rows.items())
         ]
 
+    def _agent_resource_priority_context(
+        self,
+        graph: dict[str, object],
+        now: dt.datetime,
+        terminal_symbols: list[str],
+    ) -> list[dict[str, object]]:
+        resource_rows: dict[str, list[dict[str, object]]] = defaultdict(list)
+        resource_names = {
+            str(resource["resource_id"]): str(
+                resource.get("name", resource["resource_id"])
+            )
+            for resource in getattr(self._repository, "resources", {}).values()
+            if resource["project_id"] == graph.get("project_id")
+        }
+        priority_by_process = {
+            str(node["process_id"]): (node, priority)
+            for node, priority in self._agent_priority_nodes(
+                graph,
+                now,
+                terminal_symbols,
+            )
+            if node.get("process_id")
+        }
+        assignments: dict[tuple[str, str], dict[str, object]] = {}
+        for slice_data in graph.get("allocation_slices", []):
+            process_id = slice_data.get("process_id")
+            resource_id = slice_data.get("resource_id")
+            if process_id not in priority_by_process or not resource_id:
+                continue
+            node, priority = priority_by_process[str(process_id)]
+            key = (str(resource_id), str(process_id))
+            assignment = assignments.setdefault(
+                key,
+                {
+                    **priority,
+                    "effort_hours": 0.0,
+                    "role_ids": set(),
+                    "status": node.get("status"),
+                    "computed_status": node.get("computed_status"),
+                    "blocking_count": (
+                        (node.get("blocker_summary") or {}).get("blocking_count")
+                        or 0
+                    ),
+                },
+            )
+            assignment["effort_hours"] = float(assignment["effort_hours"]) + float(
+                slice_data.get("effort_hours") or 0
+            )
+            role_id = slice_data.get("role_id")
+            if role_id:
+                assignment["role_ids"].add(str(role_id))
+
+        for (resource_id, _process_id), assignment in assignments.items():
+            role_ids = assignment.pop("role_ids")
+            resource_rows[resource_id].append(
+                {
+                    **assignment,
+                    "effort_hours": self._clean_number(assignment["effort_hours"]),
+                    "role_ids": sorted(role_ids),
+                }
+            )
+        return [
+            {
+                "resource_id": resource_id,
+                "resource_name": resource_names.get(resource_id, resource_id),
+                "processes": self._sort_agent_priority_rows(rows),
+            }
+            for resource_id, rows in sorted(resource_rows.items())
+        ]
+
     def _agent_priority_nodes(
         self,
         graph: dict[str, object],
@@ -1849,6 +1935,9 @@ class ProjectService:
                         "es_at": es_at.isoformat(),
                         "ls_at": ls_at.isoformat(),
                         "lf_at": lf_at.isoformat(),
+                        "hours_until_ls": self._clean_number(
+                            (ls_at - now).total_seconds() / 3600
+                        ),
                         "hours_until_lf": self._clean_number(
                             (lf_at - now).total_seconds() / 3600
                         ),
@@ -1893,7 +1982,7 @@ class ProjectService:
             rows,
             key=lambda row: (
                 row["priority_rank"],
-                row["hours_until_lf"],
+                row.get("hours_until_ls", row["hours_until_lf"]),
                 str(row.get("process_symbol") or ""),
             ),
         )
@@ -1930,6 +2019,10 @@ class ProjectService:
             query.resource_ids,
             query.role_ids,
         )
+        self._overlay_allocations_on_capacity_buckets(
+            query,
+            buckets,
+        )
         return {
             "project_id": query.project_id,
             "as_of": query.as_of.isoformat(),
@@ -1938,6 +2031,59 @@ class ProjectService:
             "planning_granularity": self._enum_value(query.planning_granularity),
             "buckets": [self._bucket_json(bucket) for bucket in buckets],
         }
+
+    def _overlay_allocations_on_capacity_buckets(
+        self,
+        query: QueryResourceCapacity,
+        buckets: list[dict[str, Any]],
+    ) -> None:
+        for bucket in buckets:
+            bucket["allocated_hours"] = 0.0
+            bucket["remaining_hours"] = bucket["capacity_hours"]
+        if not buckets:
+            return
+
+        schedule_query = QueryResourceSchedule(
+            project_id=query.project_id,
+            as_of=query.as_of,
+            now=query.as_of,
+            planning_granularity=query.planning_granularity,
+            include_allocation_slices=True,
+        )
+        try:
+            schedule = self._compute_resource_schedule(
+                schedule_query,
+                include_allocation_slices=True,
+            )
+        except ServiceValidationError:
+            return
+
+        slices = [self._parse_slice(item) for item in schedule["allocation_slices"]]
+        for slice_data in slices:
+            for bucket in buckets:
+                if (
+                    bucket["resource_id"] != slice_data["resource_id"]
+                    or bucket["starts_at"] >= slice_data["ends_at"]
+                    or bucket["ends_at"] <= slice_data["starts_at"]
+                ):
+                    continue
+                overlap = self._overlap_hours(
+                    bucket["starts_at"],
+                    bucket["ends_at"],
+                    slice_data["starts_at"],
+                    slice_data["ends_at"],
+                )
+                slice_hours = self._overlap_hours(
+                    slice_data["starts_at"],
+                    slice_data["ends_at"],
+                    slice_data["starts_at"],
+                    slice_data["ends_at"],
+                )
+                if slice_hours <= 0:
+                    continue
+                allocated = float(slice_data["capacity_hours"]) * overlap / slice_hours
+                bucket["allocated_hours"] += allocated
+                bucket["remaining_hours"] -= allocated
 
     def _resource_schedule_data(
         self,
@@ -3408,6 +3554,7 @@ class ProjectService:
                         cost_unit=operation.resource.cost_unit,
                         cost_currency=cost_currency,
                         holidays=operation.resource.holidays,
+                        calendar_overrides=operation.resource.calendar_overrides,
                         active=operation.resource.active,
                     )
                 resource_ids.append(resource_id)
@@ -3693,6 +3840,10 @@ class ProjectService:
             operation.resource.resource_id,
             role_ids=operation.resource.role_ids,
             calendar_id=operation.resource.calendar_id,
+            calendar_ids=[
+                override.calendar_id
+                for override in operation.resource.calendar_overrides
+            ],
             index=index,
             resource_field=True,
         )
@@ -3707,6 +3858,7 @@ class ProjectService:
         calendar_id: str | None,
         index: int,
         resource_field: bool = False,
+        calendar_ids: list[str] | None = None,
     ) -> None:
         roles = getattr(repository, "roles", {})
         calendars = getattr(repository, "calendars", {})
@@ -3742,8 +3894,16 @@ class ProjectService:
                         )
                     ],
                 )
-        if calendar_id is not None:
-            calendar = calendars.get(calendar_id)
+        for calendar_field, candidate_calendar_id in [
+            ("calendar_id", calendar_id),
+            *[
+                ("calendar_overrides", override_calendar_id)
+                for override_calendar_id in calendar_ids or []
+            ],
+        ]:
+            if candidate_calendar_id is None:
+                continue
+            calendar = calendars.get(candidate_calendar_id)
             if (
                 calendar is None
                 or calendar["project_id"] != project_id
@@ -3754,7 +3914,7 @@ class ProjectService:
                     message="Calendar id was not found.",
                     validation_errors=[
                         ValidationIssue(
-                            loc=[*loc_prefix, "calendar_id"],
+                            loc=[*loc_prefix, calendar_field],
                             msg="Calendar id was not found.",
                             type="calendar_reference",
                             ctx={},
@@ -3905,6 +4065,10 @@ class ProjectService:
         if any(holiday.holiday_id is None for holiday in resource.holidays):
             return False
         holiday_records = [holiday.model_dump() for holiday in resource.holidays]
+        calendar_override_records = [
+            override.model_dump()
+            for override in resource.calendar_overrides
+        ]
         return (
             existing.get("name") == resource.name
             and existing.get("role_ids") == resource.role_ids
@@ -3915,6 +4079,7 @@ class ProjectService:
             and existing.get("cost_unit") == cost_unit
             and existing.get("cost_currency") == cost_currency
             and existing.get("holidays", []) == holiday_records
+            and existing.get("calendar_overrides", []) == calendar_override_records
             and existing.get("active") == resource.active
         )
 

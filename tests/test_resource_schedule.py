@@ -306,6 +306,14 @@ def _assert_resource_utilization_never_exceeds_capacity(
 ) -> None:
     allocations_by_resource: dict[str, list[object]] = {}
     for allocation in data["allocation_slices"]:
+        starts_at = _as_datetime(_value(allocation, "starts_at"))
+        ends_at = _as_datetime(_value(allocation, "ends_at"))
+        duration_hours = _overlap_hours(starts_at, ends_at, starts_at, ends_at)
+        effort_hours = float(_value(allocation, "effort_hours"))
+        capacity_hours = float(_value(allocation, "capacity_hours"))
+        assert effort_hours == pytest.approx(round(effort_hours))
+        assert capacity_hours == pytest.approx(round(capacity_hours))
+        assert capacity_hours == pytest.approx(duration_hours)
         resource_id = str(_value(allocation, "resource_id"))
         allocations_by_resource.setdefault(resource_id, []).append(allocation)
 
@@ -1017,8 +1025,6 @@ def test_ready_queue_ties_by_topological_order_then_requirement_id():
     assert _allocation_order(requirement_id_data) == [
         ("multi_requirement", "req_a", "res_alex"),
         ("multi_requirement", "req_z", "res_alex"),
-        ("multi_requirement", "req_a", "res_alex"),
-        ("multi_requirement", "req_z", "res_alex"),
     ]
 
 
@@ -1515,7 +1521,7 @@ def test_water_filling_redistributes_after_selected_candidate_hits_daily_cap():
     rows = _rows_by_id(data)
     assert _value(rows["build"], "allocation_state") == "complete"
     assert _iso(_value(rows["build"], "starts_at")) == "2026-05-13T09:00:00+00:00"
-    assert _iso(_value(rows["build"], "ends_at")) == "2026-05-13T11:00:00+00:00"
+    assert _iso(_value(rows["build"], "ends_at")) == "2026-05-13T12:00:00+00:00"
     assert _allocation_effort_by_resource(data) == {
         "res_alex": 3.0,
         "res_blair": 2.0,
@@ -1526,7 +1532,7 @@ def test_water_filling_redistributes_after_selected_candidate_hits_daily_cap():
         resource_id="res_alex",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(2.0)
+    ) == pytest.approx(1.0)
     assert _allocated_effort_in_window(
         data,
         resource_id="res_alex",
@@ -1538,13 +1544,13 @@ def test_water_filling_redistributes_after_selected_candidate_hits_daily_cap():
         resource_id="res_blair",
         starts_at=_at(13, 10),
         ends_at=_at(13, 11),
-    ) == pytest.approx(2.0)
+    ) == pytest.approx(1.0)
     assert _allocated_effort_in_window(
         data,
         resource_id="res_casey",
         starts_at=_at(13, 10),
         ends_at=_at(13, 11),
-    ) == pytest.approx(2.0)
+    ) == pytest.approx(1.0)
     assert all(
         allocated <= 3.0001
         for allocated in _allocation_effort_by_resource(data).values()
@@ -1904,19 +1910,19 @@ def test_multi_role_resource_breadth_first_slices_share_one_bucket_ledger():
         requirement_id="req_release_dev",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(1.0)
     assert _allocated_effort_for_requirement_in_window(
         data,
         requirement_id="req_release_qa",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(0.0)
     assert _allocated_effort_for_requirement_in_window(
         data,
         requirement_id="req_release_dev",
         starts_at=_at(13, 10),
         ends_at=_at(13, 11),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(1.0)
     assert _allocation_effort_by_resource(data) == {"res_alex": 4.0}
     _assert_resource_utilization_never_exceeds_capacity(data)
 
@@ -1990,14 +1996,14 @@ def test_cup_filling_reuses_residual_capacity_after_scarce_role_is_filled():
                 role_requirements=[
                     _requirement(
                         "release",
-                        1.5,
+                        3,
                         requirement_id="req_release_dev",
                         role_id="role_dev",
                         required_resource_count=2,
                     ),
                     _requirement(
                         "release",
-                        0.5,
+                        1,
                         requirement_id="req_release_qa",
                         role_id="role_qa",
                     ),
@@ -2016,19 +2022,19 @@ def test_cup_filling_reuses_residual_capacity_after_scarce_role_is_filled():
 
     rows = _rows_by_id(data)
     assert _value(rows["release"], "allocation_state") == "complete"
-    assert _iso(_value(rows["release"], "ends_at")) == "2026-05-13T10:00:00+00:00"
+    assert _iso(_value(rows["release"], "ends_at")) == "2026-05-13T11:00:00+00:00"
     assert _allocated_effort_for_requirement_in_window(
         data,
         requirement_id="req_release_qa",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(1.0)
     assert _allocated_effort_for_requirement_in_window(
         data,
         requirement_id="req_release_dev",
         starts_at=_at(13),
         ends_at=_at(13, 10),
-    ) == pytest.approx(1.5)
+    ) == pytest.approx(1.0)
     assert _allocated_effort_in_window(
         data,
         resource_id="res_alex",
@@ -2091,6 +2097,16 @@ def test_unknown_required_role_fails_validation():
                 role_requirements=[
                     _requirement("build", 2, role_id="role_missing"),
                 ],
+            )
+        )
+
+
+def test_fractional_role_effort_fails_validation():
+    with pytest.raises(ValueError, match="positive whole number"):
+        _compute_resource_schedule(
+            _base_input(
+                processes=[_process("build")],
+                role_requirements=[_requirement("build", 1.5)],
             )
         )
 
@@ -2724,12 +2740,12 @@ def test_resource_critical_path_terminal_tie_uses_tolerance_window():
                         requirement_id="req_topo_first",
                         role_id="role_first",
                     ),
-                    _requirement(
-                        "topo_second",
-                        8.5,
-                        requirement_id="req_topo_second",
-                        role_id="role_second",
-                    ),
+                        _requirement(
+                            "topo_second",
+                            9,
+                            requirement_id="req_topo_second",
+                            role_id="role_second",
+                        ),
                 ],
                 roles=[
                     _role("role_first", "First"),

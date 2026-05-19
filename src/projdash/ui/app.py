@@ -18,6 +18,7 @@ from projdash.ui.adapters import (
     allowed_dependency_symbols,
     allowed_shared_dependency_symbols,
     allowed_successor_symbols,
+    blocker_table_rows,
     build_process_graph_dot,
     catalog_from_query_data,
     cost_time_series_rows,
@@ -87,8 +88,10 @@ def main() -> None:
         [
             "Dashboard",
             "Project",
+            "Context",
             "Processes",
             "Graph",
+            "Blockers",
             "Resources",
             "Schedule",
             "Slippage",
@@ -102,20 +105,24 @@ def main() -> None:
     with tabs[1]:
         _render_project_settings(service, controls, context)
     with tabs[2]:
-        _render_processes(service, controls, context)
+        _render_context_summary(controls, context)
     with tabs[3]:
-        _render_graph(context)
+        _render_processes(service, controls, context)
     with tabs[4]:
-        _render_resources(service, controls, context)
+        _render_graph(context)
     with tabs[5]:
-        _render_schedule(controls, context)
+        _render_blockers(controls, context)
     with tabs[6]:
-        _render_slippage(service, controls, context)
+        _render_resources(service, controls, context)
     with tabs[7]:
-        _render_costs(controls, context)
+        _render_schedule(service, controls, context)
     with tabs[8]:
-        _render_history(controls, context)
+        _render_slippage(service, controls, context)
     with tabs[9]:
+        _render_costs(controls, context)
+    with tabs[10]:
+        _render_history(controls, context)
+    with tabs[11]:
         _render_topology(service, controls, context)
 
 
@@ -290,23 +297,24 @@ def _role_requirement_inputs(
         if role_id not in selected_roles:
             effort_key = f"{key_prefix}_{role_id}_effort"
             if effort_key in st.session_state:
-                st.session_state[effort_key] = 0.0
+                st.session_state[effort_key] = 0
     requirements = []
     for role_id in selected_roles:
         effort_key = f"{key_prefix}_{role_id}_effort"
         effort_kwargs = {}
         if effort_key not in st.session_state:
-            effort_kwargs["value"] = float(defaults.get(role_id, 0.0))
+            effort_kwargs["value"] = int(round(defaults.get(role_id, 0.0)))
         effort = st.number_input(
             f"{role_id} effort hours",
-            0.0,
-            10000.0,
+            0,
+            10000,
+            step=1,
             key=effort_key,
-            help="Total effort required from this role.",
+            help="Total whole-number effort hours required from this role.",
             **effort_kwargs,
         )
         if effort > 0:
-            requirements.append({"role_id": role_id, "effort_hours": effort})
+            requirements.append({"role_id": role_id, "effort_hours": int(effort)})
     return requirements
 
 
@@ -389,6 +397,7 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         "capacity": None,
         "utilization": None,
         "costs": None,
+        "agent_context": None,
         "scope": None,
         "terminal_symbols": [],
         "now": controls["now"],
@@ -409,6 +418,8 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "project_id": project_id,
             "as_of": controls["as_of"],
             "now": controls["now"],
+            "include_resource_fields": True,
+            "include_allocation_slices": True,
         },
     )
     base["full_graph"] = dependency_graph
@@ -420,18 +431,21 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
     base["scope"] = scope
     base["terminal_symbols"] = terminal_symbols
     scoped_query = {"scope": scope} if scope else {}
-    base["graph"] = _query(
-        service,
-        {
-            "action": "query_process_graph",
-            "project_id": project_id,
-            "as_of": controls["as_of"],
-            "now": controls["now"],
-            **scoped_query,
-            "include_resource_fields": True,
-            "include_allocation_slices": True,
-        },
-    )
+    if scoped_query:
+        base["graph"] = _query(
+            service,
+            {
+                "action": "query_process_graph",
+                "project_id": project_id,
+                "as_of": controls["as_of"],
+                "now": controls["now"],
+                **scoped_query,
+                "include_resource_fields": True,
+                "include_allocation_slices": True,
+            },
+        )
+    else:
+        base["graph"] = dependency_graph
     base["blockers"] = _query(
         service,
         {
@@ -486,6 +500,15 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
     base["costs"] = _query(
         service,
         {"action": "query_costs", **resource_query},
+    )
+    base["agent_context"] = _query(
+        service,
+        {
+            "action": "query_agent_context",
+            **resource_query,
+            "terminal_process_symbols": terminal_symbols,
+            "snapshot_limit": 5,
+        },
     )
     return base
 
@@ -580,6 +603,261 @@ def _render_project_settings(
         if result is not None and result.ok:
             st.session_state.pop("project_id", None)
             st.rerun()
+
+
+def _render_context_summary(
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> None:
+    markdown = _project_context_markdown(controls, context)
+    st.markdown(markdown)
+    st.text_area(
+        "Markdown",
+        markdown,
+        height=420,
+        help="Agent-readable project context summary.",
+    )
+
+
+def _project_context_markdown(
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> str:
+    agent_context = context.get("agent_context") or {}
+    project = agent_context.get("project") or {}
+    summary = agent_context.get("summary") or {}
+    slippage = agent_context.get("slippage") or {}
+    schedule = agent_context.get("schedule") or {}
+    prioritized_work = agent_context.get("prioritized_work") or {}
+    blockers = agent_context.get("blockers") or []
+    project_name = project.get("name") or controls.get("project_id") or "Project"
+    timezone_name = controls.get("timezone", DEFAULT_TIMEZONE)
+    as_of = agent_context.get("as_of") or controls.get("as_of")
+    now = agent_context.get("now") or controls.get("now") or as_of
+    terminal_symbols = (
+        agent_context.get("canonical_terminal_process_symbols")
+        or agent_context.get("terminal_process_symbols")
+        or context.get("terminal_symbols")
+        or []
+    )
+    scope_json = _markdown_json(
+        agent_context.get("scope")
+        or context.get("scope")
+        or {"type": "project"}
+    )
+    completion_at = (
+        summary.get("projected_completion_at")
+        or schedule.get("completion_at")
+        or None
+    )
+    completion = (
+        _markdown_datetime(completion_at, timezone_name)
+        if completion_at
+        else "unresolved"
+    )
+    lines = [
+        f"# {project_name}",
+        "",
+        "## Snapshot",
+        f"- Project id: `{project.get('project_id', controls.get('project_id', ''))}`",
+        f"- As of: {_markdown_datetime(as_of, timezone_name)}",
+        f"- Now: {_markdown_datetime(now, timezone_name)}",
+        f"- Scope: `{scope_json}`",
+        (
+            "- Completion targets: "
+            f"{_markdown_code_list(terminal_symbols) or 'all terminal processes'}"
+        ),
+        f"- Projected completion: {completion}",
+        (
+            "- Completion change: "
+            f"{_markdown_duration_hours(slippage.get('completion_change_hours', 0))}"
+        ),
+        (
+            "- Total role effort: "
+            f"{_markdown_duration_hours(summary.get('total_role_effort_hours', 0))}"
+        ),
+        (
+            "- Processes: "
+            f"{summary.get('process_count', 0)} "
+            f"({summary.get('blocked_process_count', 0)} blocked)"
+        ),
+        f"- Dependencies: {summary.get('edge_count', 0)}",
+        f"- Status counts: {_markdown_status_counts(summary)}",
+        f"- Resource schedule converged: {summary.get('converged', '-')}",
+        "",
+        "## Critical Path",
+    ]
+    critical_path = summary.get("critical_path") or schedule.get("critical_path") or []
+    if critical_path:
+        lines.extend(f"- `{symbol}`" for symbol in critical_path)
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Role Priorities"])
+    lines.extend(
+        _agent_priority_group_lines(
+            prioritized_work.get("by_role") or [],
+            id_field="role_id",
+            name_field="role_name",
+        )
+    )
+    lines.extend(["", "## Resource Priorities"])
+    lines.extend(
+        _agent_priority_group_lines(
+            prioritized_work.get("by_resource") or [],
+            id_field="resource_id",
+            name_field="resource_name",
+        )
+    )
+    lines.extend(["", "## Schedule Watchlist"])
+    lines.extend(_schedule_watchlist_lines(schedule, timezone_name))
+    lines.extend(["", "## Open Blockers"])
+    unresolved = [
+        blocker for blocker in blockers if not blocker.get("is_resolved_as_of")
+    ]
+    if unresolved:
+        for blocker in unresolved:
+            process_symbol = blocker.get("process_symbol") or blocker.get("process_id")
+            lines.append(
+                "- "
+                f"[{blocker.get('severity', 'blocking')}] "
+                f"`{process_symbol}`: {blocker.get('summary', '')}"
+            )
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Resource Calendar Rules"])
+    lines.append(
+        _resource_calendar_rules_markdown(
+            context.get("catalog") or {},
+            timezone_name,
+        )
+    )
+    available_queries = agent_context.get("available_queries") or []
+    if available_queries:
+        lines.extend(["", "## Follow-up Queries"])
+        lines.extend(f"- `{query_name}`" for query_name in available_queries)
+    return "\n".join(lines)
+
+
+def _markdown_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=_json_default)
+
+
+def _markdown_code_list(values: list[Any] | tuple[Any, ...]) -> str:
+    return ", ".join(f"`{value}`" for value in values if value)
+
+
+def _markdown_status_counts(summary: dict[str, Any]) -> str:
+    counts = summary.get("status_counts") or {}
+    if not counts:
+        return "unknown"
+    return ", ".join(f"{status}: {count}" for status, count in sorted(counts.items()))
+
+
+def _markdown_duration_hours(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    return _format_priority_hours(value, "hour")
+
+
+def _agent_priority_group_lines(
+    groups: list[dict[str, Any]],
+    *,
+    id_field: str,
+    name_field: str,
+    limit: int = 6,
+) -> list[str]:
+    if not groups:
+        return ["- None"]
+
+    lines = []
+    for group in groups:
+        group_id = group.get(id_field) or "unassigned"
+        name = group.get(name_field) or group_id
+        processes = group.get("processes") or []
+        lines.append(f"- **{name}** (`{group_id}`)")
+        if not processes:
+            lines.append("  - No active priorities")
+            continue
+        for process in processes[:limit]:
+            lines.append(f"  - {_agent_priority_process_markdown(process)}")
+        remaining = len(processes) - limit
+        if remaining > 0:
+            lines.append(f"  - {remaining} more")
+    return lines
+
+
+def _agent_priority_process_markdown(row: dict[str, Any]) -> str:
+    priority = row.get("priority") or "-"
+    symbol = row.get("process_symbol") or "-"
+    name = row.get("process_name") or ""
+    label = f"**{priority}** `{symbol}`{f' - {name}' if name else ''}"
+    details = [
+        f"start window: {_format_time_until_ls(row.get('hours_until_ls'))}",
+        f"effort: {_format_priority_hours(row.get('effort_hours'), 'hour')}",
+    ]
+    status = row.get("computed_status") or row.get("status")
+    if status:
+        details.append(f"status: {status}")
+    role_ids = row.get("role_ids") or []
+    if role_ids:
+        details.append(f"roles: {_markdown_code_list(role_ids)}")
+    blocking_count = int(row.get("blocking_count") or 0)
+    if blocking_count:
+        details.append(f"blockers: {blocking_count}")
+    return f"{label}; {'; '.join(details)}"
+
+
+def _schedule_watchlist_lines(
+    schedule: dict[str, Any],
+    timezone_name: str,
+    *,
+    limit: int = 12,
+) -> list[str]:
+    rows = [
+        row
+        for row in schedule.get("processes", [])
+        if row.get("status") not in {"done", "canceled"}
+    ]
+    if not rows:
+        return ["- None"]
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            not bool(row.get("critical")),
+            _parse_iso_datetime(row.get("ls_at"), dt.datetime.max.replace(tzinfo=dt.UTC)),
+            str(row.get("symbol") or ""),
+        ),
+    )
+    lines = []
+    for row in rows[:limit]:
+        label = "critical" if row.get("critical") else "watch"
+        symbol = row.get("symbol") or "-"
+        name = row.get("name") or ""
+        status = row.get("computed_status") or row.get("status") or "-"
+        ls_at = _markdown_datetime(row.get("ls_at"), timezone_name)
+        ends_at = _markdown_datetime(row.get("ends_at"), timezone_name)
+        slack = _markdown_duration_hours(row.get("slack_hours"))
+        allocation = row.get("allocation_state") or "-"
+        lines.append(
+            "- "
+            f"**{label}** `{symbol}`"
+            f"{f' - {name}' if name else ''}; "
+            f"status: {status}; "
+            f"LS: {ls_at}; "
+            f"ends: {ends_at}; "
+            f"slack: {slack}; "
+            f"allocation: {allocation}"
+        )
+    remaining = len(rows) - limit
+    if remaining > 0:
+        lines.append(f"- {remaining} more")
+    return lines
+
+
+def _markdown_datetime(value: Any, timezone_name: str) -> str:
+    if value is None or value == "":
+        return "-"
+    return to_display_timezone(value, timezone_name).strftime("%Y-%m-%d %H:%M %Z")
 
 
 def _render_process_table(
@@ -1249,16 +1527,56 @@ def _batch_role_requirements_by_symbol(
         for role_id, target_total in sorted(target_totals.items()):
             current_total = current_totals.get(role_id, 0.0)
             if current_total > 0:
-                effort_hours = target_total * (
-                    current_by_symbol.get(symbol, {}).get(role_id, 0.0)
-                    / current_total
+                shares = _integer_effort_shares(
+                    selected_symbols,
+                    int(round(target_total)),
+                    {
+                        item: current_by_symbol.get(item, {}).get(role_id, 0.0)
+                        for item in selected_symbols
+                    },
                 )
             else:
-                effort_hours = target_total / len(selected_symbols)
+                shares = _integer_effort_shares(
+                    selected_symbols,
+                    int(round(target_total)),
+                    {},
+                )
+            effort_hours = shares[symbol]
             if effort_hours > 0:
                 output[symbol].append(
                     {"role_id": role_id, "effort_hours": effort_hours}
                 )
+    return output
+
+
+def _integer_effort_shares(
+    symbols: list[str],
+    total_effort: int,
+    weights: dict[str, float],
+) -> dict[str, int]:
+    if total_effort <= 0 or not symbols:
+        return {symbol: 0 for symbol in symbols}
+    weight_total = sum(max(0.0, weights.get(symbol, 0.0)) for symbol in symbols)
+    if weight_total <= 0:
+        weight_total = float(len(symbols))
+        weights = {symbol: 1.0 for symbol in symbols}
+
+    raw_shares = [
+        (
+            symbol,
+            total_effort * max(0.0, weights.get(symbol, 0.0)) / weight_total,
+        )
+        for symbol in symbols
+    ]
+    output = {symbol: int(share) for symbol, share in raw_shares}
+    remainder = total_effort - sum(output.values())
+    fractional_order = sorted(
+        raw_shares,
+        key=lambda item: (item[1] - int(item[1]), item[0]),
+        reverse=True,
+    )
+    for symbol, _share in fractional_order[:remainder]:
+        output[symbol] += 1
     return output
 
 
@@ -1289,6 +1607,54 @@ def _render_graph(context: dict[str, Any]) -> None:
     st.dataframe(edge_table_rows(graph), use_container_width=True, hide_index=True)
 
 
+def _render_blockers(controls: dict[str, Any], context: dict[str, Any]) -> None:
+    blockers = context.get("blockers") or {}
+    graph = context.get("full_graph") or context.get("graph") or {}
+    schedule = (
+        graph
+        if graph.get("allocation_slices")
+        else context.get("resource_schedule") or {}
+    )
+    rows = blocker_table_rows(
+        blockers,
+        graph,
+        schedule,
+        context.get("now") or controls["now"],
+    )
+    open_rows = [row for row in rows if not row.get("is_resolved_as_of")]
+    blocking_rows = [row for row in rows if row.get("is_blocking_as_of")]
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Blockers", len(rows))
+    col2.metric("Open", len(open_rows))
+    col3.metric("Blocking now", len(blocking_rows))
+
+    if not rows:
+        st.write("No blockers recorded.")
+        return
+    display_columns = [
+        "blocker_status",
+        "severity",
+        "priority",
+        "process_symbol",
+        "process_name",
+        "process_status",
+        "computed_status",
+        "role_ids",
+        "resource_ids",
+        "summary",
+        "details",
+        "created_at",
+        "resolved_at",
+        "resolution",
+        "blocker_id",
+    ]
+    display_rows = [
+        {column: row.get(column) for column in display_columns}
+        for row in format_display_datetimes(rows, controls["timezone"])
+    ]
+    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+
+
 def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
     catalog = catalog_from_query_data(
         context.get("catalog"),
@@ -1308,17 +1674,121 @@ def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]
         timezone_name=controls["timezone"],
     )
 
-    st.subheader("Capacity")
-    st.dataframe(
-        format_display_datetimes(
-            (context.get("capacity") or {}).get("buckets", []),
+    st.subheader("Resource calendar rules")
+    st.markdown(
+        _resource_calendar_rules_markdown(
+            context.get("catalog") or {},
             controls["timezone"],
-        ),
-        use_container_width=True,
-        hide_index=True,
+        )
     )
     _render_calendar_forms(service, controls, context, catalog)
     _render_resource_forms(service, controls, context, catalog)
+
+
+def _resource_calendar_rules_markdown(
+    catalog_data: dict[str, Any],
+    timezone_name: str,
+) -> str:
+    calendars = {
+        calendar["calendar_id"]: calendar
+        for calendar in catalog_data.get("calendars", [])
+    }
+    resources = sorted(
+        catalog_data.get("resources", []),
+        key=lambda resource: (
+            str(resource.get("name", "")).casefold(),
+            str(resource.get("resource_id", "")),
+        ),
+    )
+    if not resources:
+        return "_No resources configured._"
+    sections = []
+    for resource in resources:
+        resource_id = resource.get("resource_id", "")
+        name = resource.get("name") or resource_id
+        default_calendar = calendars.get(resource.get("calendar_id"), {})
+        available_from = format_display_datetime(
+            resource.get("available_from_at"),
+            timezone_name,
+        )
+        available_until = (
+            format_display_datetime(resource.get("available_until_at"), timezone_name)
+            if resource.get("available_until_at")
+            else "unbounded"
+        )
+        lines = [
+            f"### {name} (`{resource_id}`)",
+            (
+                "- Availability: "
+                f"{available_from} to {available_until}"
+            ),
+            (
+                "- Default: "
+                f"**{default_calendar.get('name', resource.get('calendar_id'))}** "
+                f"(`{resource.get('calendar_id')}`)"
+                f" in {default_calendar.get('timezone', timezone_name)}"
+            ),
+        ]
+        overrides = sorted(
+            resource.get("calendar_overrides") or [],
+            key=lambda rule: str(rule.get("starts_at", "")),
+        )
+        if overrides:
+            for override in overrides:
+                calendar = calendars.get(override.get("calendar_id"), {})
+                starts_at = format_display_datetime(
+                    override.get("starts_at"),
+                    timezone_name,
+                )
+                ends_at = (
+                    format_display_datetime(override.get("ends_at"), timezone_name)
+                    if override.get("ends_at")
+                    else "unbounded"
+                )
+                reason = override.get("reason")
+                suffix = f" - {reason}" if reason else ""
+                lines.append(
+                    "- "
+                    f"Override `{override.get('rule_id')}`: "
+                    f"**{calendar.get('name', override.get('calendar_id'))}** "
+                    f"(`{override.get('calendar_id')}`), "
+                    f"{starts_at} to {ends_at}{suffix}"
+                )
+        else:
+            lines.append("- Overrides: none")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def _capacity_buckets_for_display(
+    buckets: list[dict[str, Any]],
+    utilization: dict[str, Any],
+) -> list[dict[str, Any]]:
+    utilization_by_bucket = {
+        (
+            row.get("resource_id"),
+            row.get("starts_at"),
+            row.get("ends_at"),
+        ): row
+        for row in utilization.get("time_series", [])
+    }
+    rows = []
+    for bucket in buckets:
+        row = dict(bucket)
+        utilization_row = utilization_by_bucket.get(
+            (
+                row.get("resource_id"),
+                row.get("starts_at"),
+                row.get("ends_at"),
+            ),
+        )
+        if utilization_row is not None:
+            allocated_hours = float(utilization_row.get("allocated_hours") or 0)
+            capacity_hours = float(row.get("capacity_hours") or 0)
+            row["allocated_hours"] = allocated_hours
+            row["remaining_hours"] = capacity_hours - allocated_hours
+        rows.append(row)
+    return rows
 
 
 def _render_role_forms(service, controls: dict[str, Any], catalog: dict[str, list[str]]):
@@ -1677,6 +2147,10 @@ def _render_resource_forms(
                     "cost_unit": cost_unit,
                     "cost_currency": project_currency,
                     "holidays": selected_resource.get("holidays", []),
+                    "calendar_overrides": selected_resource.get(
+                        "calendar_overrides",
+                        [],
+                    ),
                     "active": active,
                 },
             )
@@ -1826,11 +2300,12 @@ def _resource_payload_with_holidays(
         "cost_unit": resource["cost_unit"],
         "cost_currency": resource.get("cost_currency"),
         "holidays": holidays,
+        "calendar_overrides": resource.get("calendar_overrides", []),
         "active": resource.get("active", True),
     }
 
 
-def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
+def _render_schedule(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
     graph = context.get("graph") or {}
     full_graph = context.get("full_graph") or graph
     schedule = context.get("resource_schedule") or {}
@@ -1882,44 +2357,444 @@ def _render_schedule(controls: dict[str, Any], context: dict[str, Any]) -> None:
         terminal_symbols=terminal_symbols,
         timezone_name=controls["timezone"],
     )
-    st.subheader("Role priorities")
-    st.dataframe(
-        format_display_datetimes(
-            role_priority_rows(
-                graph,
-                context.get("now") or controls["now"],
-                terminal_symbols=terminal_symbols,
-            ),
-            controls["timezone"],
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
     st.subheader("Resource priorities")
-    st.dataframe(
-        format_display_datetimes(
-            resource_priority_rows(
-                graph,
-                schedule,
-                context.get("now") or controls["now"],
-                terminal_symbols=terminal_symbols,
-            ),
-            controls["timezone"],
+    resource_rows = resource_priority_rows(
+        graph,
+        schedule,
+        context.get("now") or controls["now"],
+        terminal_symbols=terminal_symbols,
+    )
+    resource_options = sorted(
+        {row["resource_id"] for row in resource_rows if row.get("resource_id")},
+    )
+    resource_filter_key = "resource_priority_filter"
+    st.session_state[resource_filter_key] = [
+        resource_id
+        for resource_id in st.session_state.get(resource_filter_key, [])
+        if resource_id in resource_options
+    ]
+    selected_resource_ids = st.multiselect(
+        "Resource priority filter",
+        resource_options,
+        key=resource_filter_key,
+        help="Leave empty to show all resource priorities.",
+    )
+    enriched_resource_rows = _enrich_priority_rows(
+        resource_rows,
+        graph,
+        context.get("blockers") or {},
+    )
+    _render_priority_expanders(
+        service,
+        controls,
+        enriched_resource_rows,
+        "resource_id",
+        selected_resource_ids,
+        id_label="Resource",
+    )
+    st.subheader("Role priorities")
+    role_rows = role_priority_rows(
+        graph,
+        context.get("now") or controls["now"],
+        terminal_symbols=terminal_symbols,
+    )
+    role_options = sorted({row["role_id"] for row in role_rows if row.get("role_id")})
+    role_filter_key = "role_priority_filter"
+    st.session_state[role_filter_key] = [
+        role_id
+        for role_id in st.session_state.get(role_filter_key, [])
+        if role_id in role_options
+    ]
+    selected_role_ids = st.multiselect(
+        "Role priority filter",
+        role_options,
+        key=role_filter_key,
+        help="Leave empty to show all role priorities.",
+    )
+    enriched_role_rows = _enrich_priority_rows(
+        role_rows,
+        graph,
+        context.get("blockers") or {},
+    )
+    _render_priority_expanders(
+        service,
+        controls,
+        enriched_role_rows,
+        "role_id",
+        selected_role_ids,
+        id_label="Role",
+    )
+
+
+def _render_priority_expanders(
+    service,
+    controls: dict[str, Any],
+    rows: list[dict[str, Any]],
+    id_field: str,
+    selected_ids: list[str] | tuple[str, ...],
+    *,
+    id_label: str,
+) -> None:
+    sections = _priority_expander_sections(
+        rows,
+        id_field,
+        selected_ids,
+        id_label=id_label,
+    )
+    if not sections:
+        st.markdown("_No matching priorities._")
+        return
+
+    for section in sections:
+        with st.expander(section["label"], expanded=False):
+            for row in section["rows"]:
+                with st.expander(_priority_process_header(row), expanded=False):
+                    _render_priority_process_entry(service, controls, row)
+
+
+def _priority_markdown(
+    rows: list[dict[str, Any]],
+    id_field: str,
+    selected_ids: list[str] | tuple[str, ...],
+    *,
+    id_label: str,
+) -> str:
+    sections = _priority_expander_sections(
+        rows,
+        id_field,
+        selected_ids,
+        id_label=id_label,
+    )
+    if not sections:
+        return "_No matching priorities._"
+
+    chunks = []
+    for section in sections:
+        chunks.append(f"### {section['label']}")
+        for row in section["rows"]:
+            chunks.append(f"#### {_priority_process_header(row)}")
+            chunks.append(_priority_process_markdown(row, DEFAULT_TIMEZONE))
+    return "\n\n".join(chunks)
+
+
+def _priority_expander_sections(
+    rows: list[dict[str, Any]],
+    id_field: str,
+    selected_ids: list[str] | tuple[str, ...],
+    *,
+    id_label: str,
+) -> list[dict[str, Any]]:
+    groups = _priority_groups(rows, id_field, selected_ids)
+    sections = []
+    for group_id, group_rows in groups.items():
+        process_count = len(group_rows)
+        suffix = "process" if process_count == 1 else "processes"
+        sections.append(
+            {
+                "label": f"{id_label} `{group_id}` ({process_count} {suffix})",
+                "rows": group_rows,
+            }
+        )
+    return sections
+
+
+def _priority_groups(
+    rows: list[dict[str, Any]],
+    id_field: str,
+    selected_ids: list[str] | tuple[str, ...],
+) -> dict[str, list[dict[str, Any]]]:
+    visible_rows = _priority_rows(rows, id_field, selected_ids)
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in visible_rows:
+        group_id = str(row.get(id_field) or "unassigned")
+        groups.setdefault(group_id, []).append(row)
+    return groups
+
+
+def _priority_rows(
+    rows: list[dict[str, Any]],
+    id_field: str,
+    selected_ids: list[str] | tuple[str, ...],
+) -> list[dict[str, Any]]:
+    selected = {item for item in selected_ids if item}
+    visible_rows = []
+    for row in rows:
+        if selected and row.get(id_field) not in selected:
+            continue
+        visible_rows.append(
+            {
+                "priority": row.get("priority"),
+                "process_symbol": row.get("process_symbol"),
+                "process_name": row.get("process_name"),
+                "hours_until_ls": row.get("hours_until_ls"),
+                "effort_hours": row.get("effort_hours"),
+                "status": row.get("status"),
+                "computed_status": row.get("computed_status"),
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("finished_at"),
+                "description": row.get("description"),
+                "blockers": row.get("blockers") or [],
+                "blocking_count": row.get("blocking_count") or 0,
+                "role_ids": row.get("role_ids"),
+                id_field: row.get(id_field),
+            }
+        )
+    return visible_rows
+
+
+def _enrich_priority_rows(
+    rows: list[dict[str, Any]],
+    graph: dict[str, Any],
+    blockers: dict[str, Any],
+) -> list[dict[str, Any]]:
+    nodes_by_symbol = {
+        node.get("process_symbol"): node
+        for node in graph.get("nodes", [])
+        if node.get("process_symbol")
+    }
+    blockers_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for blocker in blockers.get("blockers", []):
+        if blocker.get("is_resolved_as_of"):
+            continue
+        process_symbol = blocker.get("process_symbol") or blocker.get("process_id")
+        if process_symbol:
+            blockers_by_symbol.setdefault(process_symbol, []).append(blocker)
+
+    enriched = []
+    for row in rows:
+        process_symbol = row.get("process_symbol")
+        node = nodes_by_symbol.get(process_symbol, {})
+        process_blockers = blockers_by_symbol.get(process_symbol, [])
+        blocker_summary = node.get("blocker_summary") or {}
+        blocking_count = (
+            sum(1 for blocker in process_blockers if blocker.get("is_blocking_as_of"))
+            or int(blocker_summary.get("blocking_count") or 0)
+        )
+        enriched.append(
+            {
+                **row,
+                "status": node.get("status"),
+                "computed_status": node.get("computed_status"),
+                "started_at": node.get("started_at"),
+                "finished_at": node.get("finished_at"),
+                "description": node.get("description"),
+                "blockers": process_blockers,
+                "blocking_count": blocking_count,
+            }
+        )
+    return enriched
+
+
+def _priority_process_header(row: dict[str, Any]) -> str:
+    priority = row.get("priority") or "-"
+    symbol = row.get("process_symbol") or "-"
+    name = row.get("process_name") or ""
+    return " | ".join(part for part in (priority, symbol, name) if part)
+
+
+def _render_priority_process_entry(
+    service,
+    controls: dict[str, Any],
+    row: dict[str, Any],
+) -> None:
+    st.markdown(_priority_process_markdown(row, controls["timezone"]))
+    _render_block_status(row)
+    _render_done_criteria(row)
+    _render_priority_status_controls(service, controls, row)
+
+
+def _priority_process_markdown(row: dict[str, Any], timezone_name: str) -> str:
+    details = [
+        f"- Start window: {_format_start_window(row.get('hours_until_ls'))}",
+        f"- Effort: {_format_priority_hours(row.get('effort_hours'), 'hour')}",
+    ]
+    status = row.get("computed_status") or row.get("status")
+    if status:
+        details.append(f"- Status: `{status}`")
+    role_ids = row.get("role_ids")
+    if role_ids:
+        role_text = (
+            role_ids
+            if isinstance(role_ids, str)
+            else ", ".join(f"`{role_id}`" for role_id in role_ids)
+        )
+        details.append(f"- Roles: {role_text}")
+    if row.get("started_at"):
+        started_at = _markdown_datetime(row.get("started_at"), timezone_name)
+        details.append(f"- Started: {started_at}")
+    if row.get("finished_at"):
+        finished_at = _markdown_datetime(row.get("finished_at"), timezone_name)
+        details.append(f"- Done: {finished_at}")
+    return "\n".join(details)
+
+
+def _render_block_status(row: dict[str, Any]) -> None:
+    blockers = row.get("blockers") or []
+    blocking_count = int(row.get("blocking_count") or 0)
+    blocked = blocking_count > 0
+    color = "#dc2626" if blocked else "#16a34a"
+    label = "Blocked" if blocked else "Unblocked"
+    st.markdown(
+        (
+            f"<span style='display:inline-block;width:0.72rem;height:0.72rem;"
+            f"border-radius:999px;background:{color};vertical-align:middle;"
+            f"margin-right:0.35rem;'></span><strong>{label}</strong>"
         ),
-        use_container_width=True,
-        hide_index=True,
+        unsafe_allow_html=True,
     )
-    st.dataframe(
-        format_display_datetimes(schedule.get("processes", []), controls["timezone"]),
-        use_container_width=True,
-        hide_index=True,
+    if blockers:
+        st.markdown("**Blockers**")
+        for blocker in blockers:
+            severity = blocker.get("severity", "blocking")
+            summary = blocker.get("summary", "")
+            details = blocker.get("details")
+            line = f"- `{severity}` {summary}"
+            if details:
+                line += f" - {details}"
+            st.markdown(line)
+
+
+def _render_done_criteria(row: dict[str, Any]) -> None:
+    st.markdown("**Done criteria**")
+    description = row.get("description")
+    st.write(description or "No done criteria recorded.")
+
+
+def _render_priority_status_controls(
+    service,
+    controls: dict[str, Any],
+    row: dict[str, Any],
+) -> None:
+    process_symbol = row.get("process_symbol")
+    if not process_symbol:
+        return
+    status = row.get("status")
+    already_started = bool(row.get("started_at")) or status in {
+        "in_progress",
+        "paused",
+        "done",
+    }
+    already_done = status == "done" or bool(row.get("finished_at"))
+    col1, col2 = st.columns(2)
+    started_clicked = col1.checkbox(
+        "Started",
+        value=already_started,
+        disabled=already_done,
+        key=(
+            f"schedule_started_{process_symbol}_{row.get('priority')}_"
+            f"{row.get('role_id')}_{row.get('resource_id')}"
+        ),
+        help=(
+            "Mark this process started using the current datetime, or clear the "
+            "start if it was marked accidentally."
+        ),
     )
-    st.subheader("Allocation slices")
-    st.dataframe(
-        format_display_datetimes(schedule.get("allocation_slices", []), controls["timezone"]),
-        use_container_width=True,
-        hide_index=True,
+    done_clicked = col2.checkbox(
+        "Done",
+        value=already_done,
+        key=(
+            f"schedule_done_{process_symbol}_{row.get('priority')}_"
+            f"{row.get('role_id')}_{row.get('resource_id')}"
+        ),
+        help=(
+            "Mark this process done using the current datetime, or reopen it if "
+            "it was marked accidentally."
+        ),
     )
+    if started_clicked and not already_started:
+        edit_at = _current_ui_datetime(controls["timezone"])
+        _apply_command(
+            service,
+            {
+                "action": "set_process_status",
+                "project_id": controls["project_id"],
+                "process_symbol": process_symbol,
+                "status": "in_progress",
+                "edit_at": edit_at,
+                "started_at": edit_at,
+                "note": "Marked started from the schedule priority view.",
+            },
+        )
+    if not started_clicked and already_started and not already_done:
+        edit_at = _current_ui_datetime(controls["timezone"])
+        _apply_command(
+            service,
+            {
+                "action": "set_process_status",
+                "project_id": controls["project_id"],
+                "process_symbol": process_symbol,
+                "status": "planned",
+                "edit_at": edit_at,
+                "note": "Cleared started state from the schedule priority view.",
+            },
+        )
+    if done_clicked and not already_done:
+        edit_at = _current_ui_datetime(controls["timezone"])
+        _apply_command(
+            service,
+            {
+                "action": "set_process_status",
+                "project_id": controls["project_id"],
+                "process_symbol": process_symbol,
+                "status": "done",
+                "edit_at": edit_at,
+                "started_at": row.get("started_at") or edit_at,
+                "finished_at": edit_at,
+                "note": "Marked done from the schedule priority view.",
+            },
+        )
+    if not done_clicked and already_done:
+        edit_at = _current_ui_datetime(controls["timezone"])
+        _apply_command(
+            service,
+            {
+                "action": "set_process_status",
+                "project_id": controls["project_id"],
+                "process_symbol": process_symbol,
+                "status": "in_progress",
+                "edit_at": edit_at,
+                "started_at": row.get("started_at") or edit_at,
+                "note": "Reopened from the schedule priority view.",
+            },
+        )
+
+
+def _current_ui_datetime(timezone_name: str) -> dt.datetime:
+    timezone = ZoneInfo(validate_timezone(timezone_name))
+    return dt.datetime.now(timezone).replace(microsecond=0)
+
+
+def _format_start_window(value: Any) -> str:
+    if value is None:
+        return "-"
+    hours = float(value)
+    if abs(hours) < 0.0001:
+        return "latest start is now"
+    days = _format_decimal_days(abs(hours))
+    if hours < 0:
+        return f"overdue by {days}"
+    return f"latest start in {days}"
+
+
+def _format_time_until_ls(value: Any) -> str:
+    return _format_start_window(value)
+
+
+def _format_decimal_days(hours: float) -> str:
+    days = hours / 24
+    rounded = round(days, 2)
+    display_value = int(rounded) if rounded.is_integer() else rounded
+    suffix = "day" if abs(days - 1) < 0.0001 else "days"
+    return f"{display_value} {suffix}"
+
+
+def _format_priority_hours(value: Any, unit: str) -> str:
+    if value is None:
+        return "-"
+    hours = float(value)
+    display_value = int(hours) if hours.is_integer() else round(hours, 1)
+    suffix = unit if abs(hours - 1) < 0.0001 else f"{unit}s"
+    return f"{display_value} {suffix}"
 
 
 def _schedule_debug_payload(
@@ -2061,11 +2936,11 @@ def _render_heatmap(
     y_edges = list(range(len(labels) + 1))
     fig_height = max(2.5, len(labels) * 0.35)
     fig, ax = plt.subplots(figsize=(12, fig_height))
-    image = ax.pcolormesh(
+    ax.pcolormesh(
         mdates.date2num(time_edges),
         y_edges,
         matrix,
-        cmap="jet",
+        cmap=_utilization_colormap(),
         vmin=0,
         vmax=1,
         shading="flat",
@@ -2074,7 +2949,6 @@ def _render_heatmap(
     ax.set_yticklabels(labels)
     _format_datetime_axis(ax.xaxis, timezone_name)
     ax.set_xlabel("Time")
-    fig.colorbar(image, ax=ax, label="Utilization")
     fig.tight_layout()
     st.pyplot(fig)
 
@@ -2112,16 +2986,15 @@ def _render_utilization_heatmaps(
         gridspec_kw={"height_ratios": height_ratios},
     )
     axes_list = list(axes.flat) if hasattr(axes, "flat") else [axes]
-    image = None
     for ax, (title, labels, times, matrix) in zip(axes_list, panels, strict=False):
         step = times[1] - times[0] if len(times) > 1 else dt.timedelta(hours=1)
         time_edges = [*times, times[-1] + step]
         y_edges = list(range(len(labels) + 1))
-        image = ax.pcolormesh(
+        ax.pcolormesh(
             mdates.date2num(time_edges),
             y_edges,
             matrix,
-            cmap="jet",
+            cmap=_utilization_colormap(),
             vmin=0,
             vmax=1,
             shading="flat",
@@ -2136,10 +3009,14 @@ def _render_utilization_heatmaps(
         axes_list[-1].set_xlim(mdates.date2num(span[0]), mdates.date2num(span[1]))
     _format_datetime_axis(axes_list[-1].xaxis, timezone_name)
     axes_list[-1].set_xlabel("Time")
-    if image is not None:
-        fig.colorbar(image, ax=axes_list, label="Utilization")
     fig.autofmt_xdate(rotation=30, ha="right")
     st.pyplot(fig)
+
+
+def _utilization_colormap():
+    cmap = plt.get_cmap("jet").copy()
+    cmap.set_bad("#f8fafc")
+    return cmap
 
 
 def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any]) -> None:

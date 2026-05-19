@@ -117,6 +117,18 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE NODE TABLE IF NOT EXISTS ResourceCalendarOverride(
+        rule_id STRING PRIMARY KEY,
+        logical_rule_id STRING,
+        resource_id STRING,
+        project_id STRING,
+        calendar_id STRING,
+        starts_at STRING,
+        ends_at STRING,
+        reason STRING
+    )
+    """,
+    """
     CREATE NODE TABLE IF NOT EXISTS ResourceCalendar(
         calendar_id STRING PRIMARY KEY,
         project_id STRING,
@@ -259,6 +271,16 @@ SCHEMA_STATEMENTS = (
     CREATE REL TABLE IF NOT EXISTS HAS_HOLIDAY(FROM Resource TO ResourceHoliday)
     """,
     """
+    CREATE REL TABLE IF NOT EXISTS HAS_CALENDAR_OVERRIDE(
+        FROM Resource TO ResourceCalendarOverride
+    )
+    """,
+    """
+    CREATE REL TABLE IF NOT EXISTS OVERRIDE_USES_CALENDAR(
+        FROM ResourceCalendarOverride TO ResourceCalendar
+    )
+    """,
+    """
     CREATE REL TABLE IF NOT EXISTS REQUIRES_ROLE(
         FROM ProcessRevision TO RoleRequirement
     )
@@ -282,6 +304,7 @@ SNAPSHOT_NODE_TABLES = (
     "CalendarException",
     "CalendarWeeklyWindow",
     "ResourceHoliday",
+    "ResourceCalendarOverride",
     "Resource",
     "ResourceCalendar",
     "Role",
@@ -302,6 +325,8 @@ SNAPSHOT_REL_TABLES = (
     "HAS_WINDOW",
     "HAS_EXCEPTION",
     "HAS_HOLIDAY",
+    "HAS_CALENDAR_OVERRIDE",
+    "OVERRIDE_USES_CALENDAR",
     "CAN_FILL",
     "USES_CALENDAR",
     "REQUIRES_ROLE",
@@ -585,6 +610,7 @@ class LadybugProjectRepository:
         cost_currency: str | None = None,
         available_until_at: dt.datetime | None = None,
         holidays: list[Any] | None = None,
+        calendar_overrides: list[Any] | None = None,
         active: bool = True,
     ) -> str:
         """Create or replace the resource fields needed by storage bootstrap."""
@@ -645,6 +671,11 @@ class LadybugProjectRepository:
             resolved_resource_id,
             holidays or [],
         )
+        self._replace_resource_calendar_overrides(
+            project_id,
+            resolved_resource_id,
+            calendar_overrides or [],
+        )
         return resolved_resource_id
 
     def _replace_resource_holidays(
@@ -692,6 +723,76 @@ class LadybugProjectRepository:
                 CREATE (resource)-[:HAS_HOLIDAY]->(holiday)
                 """,
                 {"resource_id": resource_id, "holiday_id": stored_holiday_id},
+            )
+
+    def _replace_resource_calendar_overrides(
+        self,
+        project_id: str,
+        resource_id: str,
+        calendar_overrides: list[Any],
+    ) -> None:
+        self._conn.execute(
+            """
+            MATCH (:Resource)-[relation:HAS_CALENDAR_OVERRIDE]->
+                  (override:ResourceCalendarOverride)
+            WHERE override.resource_id = $resource_id
+            DELETE relation
+            """,
+            {"resource_id": resource_id},
+        )
+        self._conn.execute(
+            """
+            MATCH (override:ResourceCalendarOverride)-[relation:OVERRIDE_USES_CALENDAR]->
+                  (:ResourceCalendar)
+            WHERE override.resource_id = $resource_id
+            DELETE relation
+            """,
+            {"resource_id": resource_id},
+        )
+        self._conn.execute(
+            """
+            MATCH (override:ResourceCalendarOverride)
+            WHERE override.resource_id = $resource_id
+            DELETE override
+            """,
+            {"resource_id": resource_id},
+        )
+        for override in calendar_overrides:
+            rule_id = _field(override, "rule_id") or new_id()
+            stored_rule_id = _stored_scoped_child_id(resource_id, rule_id)
+            override_properties = {
+                "rule_id": stored_rule_id,
+                "resource_id": resource_id,
+                "project_id": project_id,
+                "calendar_id": _field(override, "calendar_id"),
+                "starts_at": _isoformat_or_string(_field(override, "starts_at")),
+                "ends_at": _isoformat_or_none(_field(override, "ends_at")),
+                "reason": _field(override, "reason"),
+            }
+            if self._has_column("ResourceCalendarOverride", "logical_rule_id"):
+                override_properties["logical_rule_id"] = rule_id
+            self._create_node("ResourceCalendarOverride", override_properties)
+            self._conn.execute(
+                """
+                MATCH (resource:Resource), (override:ResourceCalendarOverride)
+                WHERE resource.resource_id = $resource_id
+                  AND override.rule_id = $rule_id
+                CREATE (resource)-[:HAS_CALENDAR_OVERRIDE]->(override)
+                """,
+                {"resource_id": resource_id, "rule_id": stored_rule_id},
+            )
+            self._conn.execute(
+                """
+                MATCH (override:ResourceCalendarOverride),
+                      (calendar:ResourceCalendar)
+                WHERE override.rule_id = $rule_id
+                  AND calendar.calendar_id = $calendar_id
+                CREATE (override)-[:OVERRIDE_USES_CALENDAR]->(calendar)
+                """,
+                {
+                    "rule_id": stored_rule_id,
+                    "calendar_id": _field(override, "calendar_id"),
+                },
             )
 
     def set_resource_active(
@@ -1140,6 +1241,11 @@ class LadybugProjectRepository:
                 for resource in repository.resources.values()
                 for holiday in resource.get("holidays", [])
             ],
+            "ResourceCalendarOverride.rule_id": [
+                _stored_scoped_child_id(resource["resource_id"], rule["rule_id"])
+                for resource in repository.resources.values()
+                for rule in resource.get("calendar_overrides", [])
+            ],
             "ScheduleSnapshot.snapshot_id": [
                 snapshot.snapshot_id for snapshot in repository.schedule_snapshots
             ],
@@ -1413,6 +1519,41 @@ class LadybugProjectRepository:
                     "ResourceHoliday",
                     "holiday_id",
                     stored_holiday_id,
+                )
+            for override in resource.get("calendar_overrides", []):
+                stored_rule_id = _stored_scoped_child_id(
+                    resource["resource_id"],
+                    override["rule_id"],
+                )
+                override_properties = {
+                    "rule_id": stored_rule_id,
+                    "resource_id": resource["resource_id"],
+                    "project_id": resource["project_id"],
+                    "calendar_id": override["calendar_id"],
+                    "starts_at": _isoformat_or_string(override["starts_at"]),
+                    "ends_at": _isoformat_or_none(override.get("ends_at")),
+                    "reason": override.get("reason"),
+                }
+                if self._has_column("ResourceCalendarOverride", "logical_rule_id"):
+                    override_properties["logical_rule_id"] = override["rule_id"]
+                self._create_node("ResourceCalendarOverride", override_properties)
+                self._create_relationship(
+                    "Resource",
+                    "resource_id",
+                    resource["resource_id"],
+                    "HAS_CALENDAR_OVERRIDE",
+                    "ResourceCalendarOverride",
+                    "rule_id",
+                    stored_rule_id,
+                )
+                self._create_relationship(
+                    "ResourceCalendarOverride",
+                    "rule_id",
+                    stored_rule_id,
+                    "OVERRIDE_USES_CALENDAR",
+                    "ResourceCalendar",
+                    "calendar_id",
+                    override["calendar_id"],
                 )
 
     def _persist_aliases(self, repository: InMemoryProjectRepository) -> None:
@@ -1720,6 +1861,30 @@ class LadybugProjectRepository:
                     "reason": row[4],
                 },
             )
+        overrides_by_resource: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        logical_rule_expression = (
+            "override.logical_rule_id"
+            if self._has_column("ResourceCalendarOverride", "logical_rule_id")
+            else "NULL"
+        )
+        for row in self._rows(
+            f"""
+            MATCH (override:ResourceCalendarOverride)
+            RETURN override.rule_id, override.resource_id, override.calendar_id,
+                   override.starts_at, override.ends_at, override.reason,
+                   {logical_rule_expression}
+            ORDER BY override.resource_id, override.starts_at
+            """
+        ):
+            overrides_by_resource[row[1]].append(
+                {
+                    "rule_id": _logical_scoped_child_id(row[1], row[0], row[6]),
+                    "calendar_id": row[2],
+                    "starts_at": _datetime_from_storage(row[3]),
+                    "ends_at": _datetime_or_none(row[4]),
+                    "reason": row[5],
+                },
+            )
         for row in self._rows(
             """
             MATCH (resource:Resource)
@@ -1742,6 +1907,7 @@ class LadybugProjectRepository:
                 "cost_unit": row[7],
                 "cost_currency": row[8],
                 "holidays": holidays_by_resource.get(row[0], []),
+                "calendar_overrides": overrides_by_resource.get(row[0], []),
                 "active": True if row[9] is None else bool(row[9]),
             })
             projection.resources[resource["resource_id"]] = resource

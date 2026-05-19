@@ -893,6 +893,25 @@ def test_ladybug_service_projection_reopens_persisted_project_graph(
     _handle_ok(
         service,
         {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-nyc-august",
+            "name": "NYC August",
+            "timezone": "America/New_York",
+            "weekly_windows": [
+                {
+                    "window_id": "window-august-monday",
+                    "weekday": 0,
+                    "start_local_time": "09:00",
+                    "end_local_time": "10:30",
+                    "capacity_hours": 1.5,
+                },
+            ],
+        },
+    )
+    _handle_ok(
+        service,
+        {
             "action": "upsert_resource",
             "project_id": project_id,
             "resource_id": "resource-ada",
@@ -909,6 +928,15 @@ def test_ladybug_service_projection_reopens_persisted_project_graph(
                     "ends_at": holiday_end,
                     "reason": "PTO",
                 },
+            ],
+            "calendar_overrides": [
+                {
+                    "rule_id": "resource-ada-august",
+                    "calendar_id": "calendar-nyc-august",
+                    "starts_at": "2026-08-01T00:00:00-04:00",
+                    "ends_at": "2026-09-01T00:00:00-04:00",
+                    "reason": "August availability.",
+                }
             ],
         },
     )
@@ -975,6 +1003,27 @@ def test_ladybug_service_projection_reopens_persisted_project_graph(
     assert resource["role_ids"] == ["role-engineer"]
     assert resource["holidays"][0]["holiday_id"] == "holiday-ada-pto"
     assert resource["holidays"][0]["starts_at"].isoformat() == holiday_start
+    assert resource["calendar_overrides"] == [
+        {
+            "rule_id": "resource-ada-august",
+            "calendar_id": "calendar-nyc-august",
+            "starts_at": dt.datetime(
+                2026,
+                8,
+                1,
+                0,
+                tzinfo=UTC_MINUS_FOUR,
+            ),
+            "ends_at": dt.datetime(
+                2026,
+                9,
+                1,
+                0,
+                tzinfo=UTC_MINUS_FOUR,
+            ),
+            "reason": "August availability.",
+        }
+    ]
     assert reopened._conn.execute(
         """
         MATCH (:RoleRequirement)-[:REQUIREMENT_ROLE]->(:Role)

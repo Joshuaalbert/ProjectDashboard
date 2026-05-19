@@ -5,7 +5,9 @@ from __future__ import annotations
 import datetime as dt
 import fnmatch
 import re
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -39,6 +41,8 @@ DISPLAY_DATETIME_KEYS = {
     "started_at",
     "starts_at",
 }
+_SERVICE_CACHE_LOCK = threading.RLock()
+_PROJECT_SERVICE_CACHE: dict[str, ProjectService] = {}
 
 
 @dataclass(frozen=True)
@@ -76,9 +80,25 @@ class ProjectOption:
 
 def create_project_service(db_path: str) -> ProjectService:
     """Create the in-process service backed by the LadybugDB repository."""
-    repository = LadybugProjectRepository(db_path)
-    repository.initialize_schema()
-    return ProjectService(repository)
+    cache_key = _service_cache_key(db_path)
+    with _SERVICE_CACHE_LOCK:
+        service = _PROJECT_SERVICE_CACHE.get(cache_key)
+        if service is not None:
+            return service
+        repository = LadybugProjectRepository(cache_key)
+        service = ProjectService(repository)
+        _PROJECT_SERVICE_CACHE[cache_key] = service
+        return service
+
+
+def _clear_project_service_cache() -> None:
+    """Clear cached UI service instances for tests."""
+    with _SERVICE_CACHE_LOCK:
+        _PROJECT_SERVICE_CACHE.clear()
+
+
+def _service_cache_key(db_path: str) -> str:
+    return str(Path(db_path).expanduser().resolve())
 
 
 def combine_datetime(

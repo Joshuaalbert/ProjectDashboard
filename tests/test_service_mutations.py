@@ -1028,6 +1028,72 @@ def test_blockers_add_resolve_derivation_and_resolved_history_retention():
     assert history["blockers"][0]["is_blocking_as_of"] is False
 
 
+def test_reopen_blocker_restores_unresolved_state():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    process_id = _create_process(service, project_id, name="Wait for Review")
+
+    blocker_id = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": process_id,
+            "blocker_id": "blocker-review",
+            "summary": "Reviewer unavailable",
+            "details": "Primary reviewer is out this week.",
+            "severity": "blocking",
+            "created_at": _iso(14, 9),
+        },
+    ).entity_ids["blocker_id"]
+    _handle(
+        service,
+        {
+            "action": "resolve_blocker",
+            "project_id": project_id,
+            "blocker_id": blocker_id,
+            "resolved_at": _iso(15, 10),
+            "resolution": "Review reassigned.",
+        },
+    )
+
+    _handle(
+        service,
+        {
+            "action": "reopen_blocker",
+            "project_id": project_id,
+            "blocker_id": blocker_id,
+            "edit_at": _iso(15, 11),
+            "note": "Resolution was clicked accidentally.",
+        },
+    )
+
+    active = _query(
+        service,
+        {
+            "action": "query_blockers",
+            "project_id": project_id,
+            "as_of": _iso(16, 9),
+        },
+    ).data
+    history = _query(
+        service,
+        {
+            "action": "query_blockers",
+            "project_id": project_id,
+            "as_of": _iso(16, 9),
+            "include_resolved": True,
+        },
+    ).data
+
+    assert active["blocked_process_ids"] == [process_id]
+    assert active["blockers"][0]["blocker_id"] == blocker_id
+    assert active["blockers"][0]["is_resolved_as_of"] is False
+    assert active["blockers"][0]["is_blocking_as_of"] is True
+    assert history["blockers"][0]["resolved_at"] is None
+    assert history["blockers"][0]["resolution"] is None
+
+
 @pytest.mark.parametrize("severity", ["warning", "info"])
 def test_non_blocking_blocker_severities_do_not_derive_blocked_state(
     severity: str,

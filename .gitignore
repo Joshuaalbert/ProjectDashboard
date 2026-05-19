@@ -1,4 +1,6 @@
-secrets.toml
+data/
+.streamlit/secrets.toml
+.idea/
 *.json
 *.lbug
 *.lbug.shadow

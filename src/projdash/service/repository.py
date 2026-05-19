@@ -22,6 +22,7 @@ from projdash.service.models import (
     ProcessRevisionRecord,
     ProcessStatus,
     ProjectRecord,
+    ResourceCalendarOverrideCommand,
     ResourceHolidayCommand,
     RoleRequirementCommand,
     ScheduleSnapshotRecord,
@@ -188,6 +189,7 @@ class ProjectRepository(Protocol):
         cost_currency: str | None = None,
         available_until_at: dt.datetime | None = None,
         holidays: list[ResourceHolidayCommand] | None = None,
+        calendar_overrides: list[ResourceCalendarOverrideCommand] | None = None,
         active: bool = True,
     ) -> str:
         """Create or replace a resource."""
@@ -241,8 +243,16 @@ class ProjectRepository(Protocol):
         project_id: str,
         blocker_id: str,
         resolved_at: dt.datetime,
+        resolution: str | None = None,
     ) -> BlockerRecord:
         """Resolve a process blocker."""
+
+    def reopen_blocker(
+        self,
+        project_id: str,
+        blocker_id: str,
+    ) -> BlockerRecord:
+        """Clear a blocker resolution."""
 
     def list_blockers(
         self,
@@ -785,6 +795,7 @@ class InMemoryProjectRepository:
         cost_currency: str | None = None,
         available_until_at: dt.datetime | None = None,
         holidays: list[ResourceHolidayCommand] | None = None,
+        calendar_overrides: list[ResourceCalendarOverrideCommand] | None = None,
         active: bool = True,
     ) -> str:
         self.get_project(project_id)
@@ -812,6 +823,11 @@ class InMemoryProjectRepository:
             project_id,
             role_ids=role_ids,
             calendar_id=calendar_id,
+            active=active,
+        )
+        calendar_override_records = self._validated_calendar_overrides(
+            project_id,
+            calendar_overrides or [],
             active=active,
         )
         holiday_records = []
@@ -847,6 +863,7 @@ class InMemoryProjectRepository:
             "cost_unit": getattr(cost_unit, "value", cost_unit),
             "cost_currency": cost_currency or project.default_currency,
             "holidays": holiday_records,
+            "calendar_overrides": calendar_override_records,
             "active": active,
         })
         if resolved_resource_id not in self.resource_ids_by_project[project_id]:
@@ -963,6 +980,32 @@ class InMemoryProjectRepository:
             )
         updated = blocker.model_copy(
             update={"resolved_at": resolved_at, "resolution": resolution},
+        )
+        self.blockers[blocker_id] = updated
+        return updated
+
+    def reopen_blocker(
+        self,
+        project_id: str,
+        blocker_id: str,
+    ) -> BlockerRecord:
+        if blocker_id not in self.blockers:
+            raise ServiceValidationError(
+                code="blocker_not_found",
+                message=f"Blocker {blocker_id!r} does not exist.",
+                entity_id=blocker_id,
+            )
+        blocker = self.blockers[blocker_id]
+        if blocker.project_id != project_id:
+            raise ServiceValidationError(
+                code="cross_project_blocker",
+                message="Blocker does not belong to the requested project.",
+                entity_id=blocker_id,
+            )
+        if blocker.resolved_at is None and blocker.resolution is None:
+            return blocker
+        updated = blocker.model_copy(
+            update={"resolved_at": None, "resolution": None},
         )
         self.blockers[blocker_id] = updated
         return updated
@@ -1645,17 +1688,23 @@ class InMemoryProjectRepository:
                 continue
             if role_filter is not None and not role_filter.intersection(resource["role_ids"]):
                 continue
-            calendar = self.calendars.get(resource["calendar_id"])
-            if calendar is None or not calendar["active"]:
-                continue
-            buckets.extend(
-                self._expand_resource_calendar(
+            for calendar, segment_starts_at, segment_ends_at in (
+                self._resource_calendar_segments(
                     resource,
-                    calendar,
                     horizon_starts_at,
                     horizon_ends_at,
                 )
-            )
+            ):
+                if calendar is None or not calendar["active"]:
+                    continue
+                buckets.extend(
+                    self._expand_resource_calendar(
+                        resource,
+                        calendar,
+                        segment_starts_at,
+                        segment_ends_at,
+                    )
+                )
         return sorted(
             buckets,
             key=lambda bucket: (
@@ -1933,6 +1982,41 @@ class InMemoryProjectRepository:
             )
         ]
 
+    def _resource_calendar_segments(
+        self,
+        resource: dict[str, Any],
+        starts_at: dt.datetime,
+        ends_at: dt.datetime,
+    ) -> list[tuple[dict[str, Any] | None, dt.datetime, dt.datetime]]:
+        default_calendar = self.calendars.get(resource["calendar_id"])
+        segments: list[tuple[dict[str, Any] | None, dt.datetime, dt.datetime]] = []
+        cursor = starts_at
+        for override in sorted(
+            resource.get("calendar_overrides", []),
+            key=lambda rule: rule["starts_at"],
+        ):
+            override_starts_at = max(override["starts_at"], starts_at)
+            override_ends_at = min(override.get("ends_at") or ends_at, ends_at)
+            if override_ends_at <= starts_at or override_starts_at >= ends_at:
+                continue
+            if override_starts_at > cursor:
+                segments.append((default_calendar, cursor, override_starts_at))
+            segments.append(
+                (
+                    self.calendars.get(override["calendar_id"]),
+                    max(cursor, override_starts_at),
+                    override_ends_at,
+                )
+            )
+            cursor = max(cursor, override_ends_at)
+        if cursor < ends_at:
+            segments.append((default_calendar, cursor, ends_at))
+        return [
+            (calendar, segment_starts_at, segment_ends_at)
+            for calendar, segment_starts_at, segment_ends_at in segments
+            if segment_ends_at > segment_starts_at
+        ]
+
     def _get_process(self, project_id: str, process_id: str) -> ProcessRecord:
         if process_id not in self.processes:
             raise ServiceValidationError(
@@ -2122,6 +2206,71 @@ class InMemoryProjectRepository:
                 entity_id=calendar_id,
             )
 
+    def _validated_calendar_overrides(
+        self,
+        project_id: str,
+        overrides: list[ResourceCalendarOverrideCommand],
+        *,
+        active: bool,
+    ) -> list[dict[str, Any]]:
+        records = []
+        seen_ids: set[str] = set()
+        for override in overrides:
+            rule_id = override.rule_id or new_id()
+            if rule_id in seen_ids:
+                raise ServiceValidationError(
+                    code="duplicate_calendar_override",
+                    message="Resource calendar override rule ids must be unique.",
+                    entity_id=rule_id,
+                    field_path="calendar_overrides",
+                )
+            seen_ids.add(rule_id)
+            calendar = self._get_calendar(project_id, override.calendar_id)
+            if active and not calendar["active"]:
+                raise ServiceValidationError(
+                    code="inactive_calendar",
+                    message=(
+                        "Inactive calendars cannot be assigned to active resources."
+                    ),
+                    entity_id=override.calendar_id,
+                    field_path="calendar_overrides",
+                )
+            records.append(
+                {
+                    "rule_id": rule_id,
+                    "calendar_id": override.calendar_id,
+                    "starts_at": override.starts_at,
+                    "ends_at": override.ends_at,
+                    "reason": override.reason,
+                }
+            )
+        self._validate_calendar_override_intervals(records)
+        return sorted(records, key=lambda rule: rule["starts_at"])
+
+    def _validate_calendar_override_intervals(
+        self,
+        overrides: list[dict[str, Any]],
+    ) -> None:
+        previous_end: dt.datetime | None = None
+        for index, override in enumerate(
+            sorted(overrides, key=lambda rule: rule["starts_at"]),
+        ):
+            starts_at = override["starts_at"]
+            if previous_end is None:
+                if index > 0:
+                    raise ServiceValidationError(
+                        code="calendar_override_overlap",
+                        message="Resource calendar overrides must not overlap.",
+                        field_path="calendar_overrides",
+                    )
+            elif starts_at < previous_end:
+                raise ServiceValidationError(
+                    code="calendar_override_overlap",
+                    message="Resource calendar overrides must not overlap.",
+                    field_path="calendar_overrides",
+                )
+            previous_end = override.get("ends_at")
+
     def _resolve_lifecycle_finished_at(
         self,
         *,
@@ -2252,7 +2401,16 @@ class InMemoryProjectRepository:
     def _calendar_in_use(self, project_id: str, calendar_id: str) -> bool:
         return any(
             self.resources[resource_id]["active"]
-            and self.resources[resource_id]["calendar_id"] == calendar_id
+            and (
+                self.resources[resource_id]["calendar_id"] == calendar_id
+                or any(
+                    override["calendar_id"] == calendar_id
+                    for override in self.resources[resource_id].get(
+                        "calendar_overrides",
+                        [],
+                    )
+                )
+            )
             for resource_id in self.resource_ids_by_project.get(project_id, [])
         )
 

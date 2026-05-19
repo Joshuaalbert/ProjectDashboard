@@ -1003,7 +1003,9 @@ def test_resource_schedule_capacity_and_utilization_contracts():
     }
     assert bucket["resource_id"] == ids["engineer_resource_id"]
     assert bucket["role_ids"] == [ids["engineer_id"]]
-    assert bucket["allocated_hours"] <= bucket["capacity_hours"] + 0.0001
+    assert bucket["capacity_hours"] == 1
+    assert bucket["allocated_hours"] == 1
+    assert bucket["remaining_hours"] == 0
 
     utilization = _query(
         service,
@@ -1028,6 +1030,252 @@ def test_resource_schedule_capacity_and_utilization_contracts():
     )
     assert utilization["by_role"][0]["role_id"] == ids["engineer_id"]
     assert utilization["overallocated_buckets"] == []
+
+
+def test_resource_capacity_uses_time_ranged_calendar_overrides():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    role_id = _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-engineer",
+            "name": "Engineer",
+        },
+    )["role_id"]
+    default_calendar = _handle(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-default-one-hour",
+            "name": "Default one hour",
+            "timezone": "UTC",
+            "weekly_windows": [
+                {
+                    "window_id": f"default-{weekday}",
+                    "weekday": weekday,
+                    "start_local_time": "09:00",
+                    "end_local_time": "10:00",
+                    "capacity_hours": 1,
+                }
+                for weekday in range(5)
+            ],
+        },
+    )["calendar_id"]
+    august_calendar = _handle(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-august-one-and-half",
+            "name": "August one and a half hours",
+            "timezone": "UTC",
+            "weekly_windows": [
+                {
+                    "window_id": f"august-{weekday}",
+                    "weekday": weekday,
+                    "start_local_time": "09:00",
+                    "end_local_time": "10:30",
+                    "capacity_hours": 1.5,
+                }
+                for weekday in range(5)
+            ],
+        },
+    )["calendar_id"]
+    september_calendar = _handle(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-september-two-hours",
+            "name": "September two hours",
+            "timezone": "UTC",
+            "weekly_windows": [
+                {
+                    "window_id": f"september-{weekday}",
+                    "weekday": weekday,
+                    "start_local_time": "09:00",
+                    "end_local_time": "11:00",
+                    "capacity_hours": 2,
+                }
+                for weekday in range(5)
+            ],
+        },
+    )["calendar_id"]
+    resource_id = _handle(
+        service,
+        {
+            "action": "upsert_resource",
+            "project_id": project_id,
+            "resource_id": "resource-josh",
+            "name": "Josh",
+            "role_ids": [role_id],
+            "calendar_id": default_calendar,
+            "available_from_at": "2026-05-14T09:00:00+00:00",
+            "cost_rate": "0",
+            "cost_unit": "hour",
+            "cost_currency": "USD",
+            "calendar_overrides": [
+                {
+                    "rule_id": "august-capacity",
+                    "calendar_id": august_calendar,
+                    "starts_at": "2026-08-01T00:00:00+00:00",
+                    "ends_at": "2026-09-01T00:00:00+00:00",
+                    "reason": "Expected August availability increase.",
+                },
+                {
+                    "rule_id": "september-capacity",
+                    "calendar_id": september_calendar,
+                    "starts_at": "2026-09-01T00:00:00+00:00",
+                    "ends_at": "2026-10-01T00:00:00+00:00",
+                    "reason": "Expected September availability increase.",
+                },
+            ],
+        },
+    )["resource_id"]
+
+    catalog = _query(
+        service,
+        {
+            "action": "query_project_catalog",
+            "project_id": project_id,
+        },
+    )
+    resource = next(
+        item for item in catalog["resources"] if item["resource_id"] == resource_id
+    )
+    assert resource["calendar_id"] == default_calendar
+    assert resource["calendar_overrides"] == [
+        {
+            "rule_id": "august-capacity",
+            "calendar_id": august_calendar,
+            "starts_at": "2026-08-01T00:00:00+00:00",
+            "ends_at": "2026-09-01T00:00:00+00:00",
+            "reason": "Expected August availability increase.",
+        },
+        {
+            "rule_id": "september-capacity",
+            "calendar_id": september_calendar,
+            "starts_at": "2026-09-01T00:00:00+00:00",
+            "ends_at": "2026-10-01T00:00:00+00:00",
+            "reason": "Expected September availability increase.",
+        },
+    ]
+
+    july = _query(
+        service,
+        {
+            "action": "query_resource_capacity",
+            "project_id": project_id,
+            "as_of": "2026-07-06T08:00:00+00:00",
+            "horizon_starts_at": "2026-07-06T09:00:00+00:00",
+            "horizon_ends_at": "2026-07-06T11:00:00+00:00",
+            "resource_ids": [resource_id],
+        },
+    )
+    august = _query(
+        service,
+        {
+            "action": "query_resource_capacity",
+            "project_id": project_id,
+            "as_of": "2026-08-03T08:00:00+00:00",
+            "horizon_starts_at": "2026-08-03T09:00:00+00:00",
+            "horizon_ends_at": "2026-08-03T11:00:00+00:00",
+            "resource_ids": [resource_id],
+        },
+    )
+    september = _query(
+        service,
+        {
+            "action": "query_resource_capacity",
+            "project_id": project_id,
+            "as_of": "2026-09-01T08:00:00+00:00",
+            "horizon_starts_at": "2026-09-01T09:00:00+00:00",
+            "horizon_ends_at": "2026-09-01T11:00:00+00:00",
+            "resource_ids": [resource_id],
+        },
+    )
+
+    assert [
+        (bucket["calendar_id"], bucket["starts_at"], bucket["capacity_hours"])
+        for bucket in july["buckets"]
+    ] == [
+        (
+            default_calendar,
+            "2026-07-06T09:00:00+00:00",
+            1.0,
+        )
+    ]
+    assert [
+        (bucket["calendar_id"], bucket["starts_at"], bucket["capacity_hours"])
+        for bucket in august["buckets"]
+    ] == [
+        (
+            august_calendar,
+            "2026-08-03T09:00:00+00:00",
+            1.0,
+        ),
+        (
+            august_calendar,
+            "2026-08-03T10:00:00+00:00",
+            0.5,
+        ),
+    ]
+    assert [
+        (bucket["calendar_id"], bucket["starts_at"], bucket["capacity_hours"])
+        for bucket in september["buckets"]
+    ] == [
+        (
+            september_calendar,
+            "2026-09-01T09:00:00+00:00",
+            1.0,
+        ),
+        (
+            september_calendar,
+            "2026-09-01T10:00:00+00:00",
+            1.0,
+        ),
+    ]
+
+    process_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-september-work",
+            "name": "September work",
+            "effective_at": "2026-05-14T09:00:00+00:00",
+            "earliest_start_at": "2026-09-01T09:00:00+00:00",
+            "role_requirements": [
+                {
+                    "role_id": role_id,
+                    "effort_hours": 2,
+                }
+            ],
+        },
+    )["process_id"]
+    schedule = _query(
+        service,
+        {
+            "action": "query_resource_schedule",
+            "project_id": project_id,
+            "as_of": "2026-09-01T08:00:00+00:00",
+            "now": "2026-09-01T08:00:00+00:00",
+            "include_allocation_slices": True,
+        },
+    )
+    row = next(
+        item for item in schedule["processes"] if item["process_id"] == process_id
+    )
+    assert row["starts_at"] == "2026-09-01T09:00:00+00:00"
+    assert row["ends_at"] == "2026-09-01T11:00:00+00:00"
+    assert [
+        slice_data["calendar_id"]
+        for slice_data in september["buckets"]
+        if slice_data["capacity_hours"] > 0
+    ] == [september_calendar, september_calendar]
 
 
 def test_terminal_topology_scope_filters_resource_schedule_and_utilization():
