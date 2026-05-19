@@ -316,6 +316,91 @@ def test_agent_context_query_returns_concise_project_management_json():
     assert priority_by_resource[resource_id][0]["role_ids"] == [role_id]
 
 
+def test_milestones_are_exposed_in_context_and_snapshot_queries():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, role_id, _calendar_id, _resource_id, process_id = (
+        _seed_allocatable_project(service)
+    )
+    _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-ship",
+            "name": "Ship API",
+            "effective_at": _iso(13),
+            "dependencies": [process_id],
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-ship-eng",
+                    "role_id": role_id,
+                    "effort_hours": 2,
+                }
+            ],
+        },
+    )
+    milestone_result = _handle(
+        service,
+        {
+            "action": "upsert_milestone",
+            "project_id": project_id,
+            "milestone_id": "milestone-api-release",
+            "name": "API release",
+            "description": "API release checkpoint.",
+            "process_symbols": ["process-ship"],
+            "edit_at": _iso(13, 10),
+        },
+    )
+    assert milestone_result.ok is True
+
+    commit_result = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "milestone_id": "milestone-api-release",
+            "committed_at": _iso(13, 12),
+            "note": "Milestone baseline",
+        },
+    )
+    assert commit_result.ok is True
+
+    catalog = _query(
+        service,
+        {
+            "action": "query_project_catalog",
+            "project_id": project_id,
+        },
+    ).data
+    assert catalog["milestones"][0]["milestone_id"] == "milestone-api-release"
+    assert catalog["milestones"][0]["process_symbols"] == ["process-ship"]
+
+    snapshot_data = _query(
+        service,
+        {
+            "action": "query_schedule_snapshots",
+            "project_id": project_id,
+            "milestone_id": "milestone-api-release",
+            "as_of": _iso(13, 12),
+        },
+    ).data
+    assert snapshot_data["terminal_process_symbols"] == ["process-ship"]
+    assert snapshot_data["snapshots"][0]["note"] == "Milestone baseline"
+
+    context = _query(
+        service,
+        {
+            "action": "query_agent_context",
+            "project_id": project_id,
+            "as_of": _iso(13, 12),
+            "now": _iso(13, 12),
+        },
+    ).data
+    assert context["milestones"][0]["name"] == "API release"
+    assert context["milestones"][0]["slippage"]["snapshot_count"] == 1
+
+
 def test_agent_context_terminal_scope_filters_blockers_and_accepts_aliases():
     service = ProjectService(InMemoryProjectRepository())
     project_id, role_id, _calendar_id, _resource_id, process_id = (

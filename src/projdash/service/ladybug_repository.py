@@ -20,11 +20,18 @@ from projdash.service.errors import ServiceValidationError
 from projdash.service.identifiers import new_id
 from projdash.service.models import (
     BlockerRecord,
+    MilestoneRecord,
     ProcessRecord,
     ProcessRevisionRecord,
     ProjectRecord,
     RoleRequirementCommand,
     ScheduleSnapshotRecord,
+    SlackCollectionCursorRecord,
+    SlackEncryptedTokenRecord,
+    SlackOutboxRecord,
+    SlackProjectConfigRecord,
+    SlackResourceMappingRecord,
+    SlackRunRecord,
 )
 from projdash.service.repository import (
     InMemoryProjectRepository,
@@ -69,6 +76,7 @@ SCHEMA_STATEMENTS = (
         earliest_start_at STRING,
         start_at_earliest BOOL,
         delay_after_dependencies_business_days INT64,
+        staked_resource_ids_json STRING,
         assumption_note STRING
     )
     """,
@@ -214,6 +222,114 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE NODE TABLE IF NOT EXISTS Milestone(
+        milestone_id STRING PRIMARY KEY,
+        project_id STRING,
+        name STRING,
+        description STRING,
+        process_symbols STRING[],
+        active BOOL,
+        created_at STRING,
+        updated_at STRING
+    )
+    """,
+    """
+    CREATE NODE TABLE IF NOT EXISTS SlackProjectConfig(
+        project_id STRING PRIMARY KEY,
+        enabled BOOL,
+        workspace_id STRING,
+        workspace_name STRING,
+        bot_token_secret_ref STRING,
+        signing_secret_ref STRING,
+        default_channel_id STRING,
+        continuity_note STRING,
+        continuity_updated_at STRING,
+        updated_at STRING
+    )
+    """,
+    """
+    CREATE NODE TABLE IF NOT EXISTS SlackResourceMapping(
+        mapping_id STRING PRIMARY KEY,
+        project_id STRING,
+        resource_id STRING,
+        slack_user_id STRING,
+        display_name STRING,
+        active BOOL,
+        updated_at STRING
+    )
+    """,
+    """
+    CREATE NODE TABLE IF NOT EXISTS SlackCollectionCursor(
+        cursor_id STRING PRIMARY KEY,
+        project_id STRING,
+        conversation_id STRING,
+        conversation_type STRING,
+        conversation_name STRING,
+        latest_collected_ts STRING,
+        last_run_id STRING,
+        last_run_status STRING,
+        updated_at STRING,
+        rate_limited_until_at STRING
+    )
+    """,
+    """
+    CREATE NODE TABLE IF NOT EXISTS SlackEncryptedToken(
+        project_id STRING PRIMARY KEY,
+        ciphertext STRING,
+        kdf STRING,
+        kdf_salt STRING,
+        kdf_iterations INT64,
+        cipher STRING,
+        created_at STRING,
+        updated_at STRING
+    )
+    """,
+    """
+    CREATE NODE TABLE IF NOT EXISTS SlackRun(
+        run_id STRING PRIMARY KEY,
+        project_id STRING,
+        status STRING,
+        trigger STRING,
+        codex_model STRING,
+        started_at STRING,
+        updated_at STRING,
+        finished_at STRING,
+        collected_message_count INT64,
+        draft_outbox_ids STRING[],
+        result_json STRING,
+        error_text STRING
+    )
+    """,
+    """
+    CREATE NODE TABLE IF NOT EXISTS SlackOutbox(
+        outbox_id STRING PRIMARY KEY,
+        project_id STRING,
+        status STRING,
+        resource_id STRING,
+        slack_user_id STRING,
+        body STRING,
+        content_hash STRING,
+        run_id STRING,
+        created_at STRING,
+        updated_at STRING,
+        sent_at STRING,
+        failed_at STRING,
+        slack_channel_id STRING,
+        slack_message_ts STRING,
+        error_text STRING
+    )
+    """,
+    """
+    CREATE NODE TABLE IF NOT EXISTS SlackOutboxMetadata(
+        outbox_id STRING PRIMARY KEY,
+        project_id STRING,
+        generated_body STRING,
+        edited_at STRING,
+        skipped_at STRING,
+        skip_reason STRING
+    )
+    """,
+    """
     CREATE NODE TABLE IF NOT EXISTS CommandReplay(
         command_id STRING PRIMARY KEY,
         payload_hash STRING,
@@ -297,6 +413,14 @@ SCHEMA_STATEMENTS = (
 )
 
 SNAPSHOT_NODE_TABLES = (
+    "SlackOutboxMetadata",
+    "SlackOutbox",
+    "SlackRun",
+    "SlackEncryptedToken",
+    "SlackCollectionCursor",
+    "SlackResourceMapping",
+    "SlackProjectConfig",
+    "Milestone",
     "ScheduleSnapshot",
     "Blocker",
     "ProcessAlias",
@@ -1064,8 +1188,13 @@ class LadybugProjectRepository:
                 process.process_id,
             )
 
+        staked_resource_ids_expr = (
+            "revision.staked_resource_ids_json"
+            if self._has_column("ProcessRevision", "staked_resource_ids_json")
+            else "NULL"
+        )
         for row in self._rows(
-            """
+            f"""
             MATCH (revision:ProcessRevision)
             RETURN revision.revision_id, revision.process_id, revision.project_id,
                    revision.effective_at, revision.name,
@@ -1073,6 +1202,7 @@ class LadybugProjectRepository:
                    revision.duration_business_days, revision.earliest_start_at,
                    revision.start_at_earliest,
                    revision.delay_after_dependencies_business_days,
+                   {staked_resource_ids_expr},
                    revision.assumption_note
             ORDER BY revision.process_id, revision.effective_at, revision.revision_id
             """
@@ -1094,7 +1224,8 @@ class LadybugProjectRepository:
                 delay_after_dependencies_business_days=row[9] or 0,
                 required_roles=self._load_required_roles(row[0]),
                 role_requirements=requirements_by_revision.get(row[0], []),
-                assumption_note=row[10],
+                staked_resource_ids=_json_from_storage_or_none(row[10]) or [],
+                assumption_note=row[11],
             )
             projection.revisions_by_process[revision.process_id].append(revision)
 
@@ -1103,6 +1234,8 @@ class LadybugProjectRepository:
         self._load_resources(projection)
         self._load_blockers(projection)
         self._load_schedule_snapshots(projection)
+        self._load_milestones(projection)
+        self._load_slack_state(projection)
         self._load_aliases(projection)
         self._load_retirements(projection)
         return projection
@@ -1205,6 +1338,8 @@ class LadybugProjectRepository:
         self._persist_aliases(repository)
         self._persist_blockers(repository)
         self._persist_schedule_snapshots(repository)
+        self._persist_milestones(repository)
+        self._persist_slack_state(repository)
 
     def _validate_snapshot_storage_keys(
         self,
@@ -1249,10 +1384,26 @@ class LadybugProjectRepository:
             "ScheduleSnapshot.snapshot_id": [
                 snapshot.snapshot_id for snapshot in repository.schedule_snapshots
             ],
+            "Milestone.milestone_id": list(repository.milestones),
             "ProcessRetirementEvent.retirement_event_id": [
                 retirement["retirement_event_id"]
                 for retirement in repository.retired_processes.values()
             ],
+            "SlackProjectConfig.project_id": list(
+                repository.slack_project_configs,
+            ),
+            "SlackResourceMapping.mapping_id": [
+                _stored_scoped_child_id(project_id, resource_id)
+                for project_id, resource_id in repository.slack_resource_mappings
+            ],
+            "SlackCollectionCursor.cursor_id": [
+                _stored_scoped_child_id(project_id, conversation_id)
+                for project_id, conversation_id in repository.slack_collection_cursors
+            ],
+            "SlackEncryptedToken.project_id": list(repository.slack_encrypted_tokens),
+            "SlackRun.run_id": list(repository.slack_runs),
+            "SlackOutbox.outbox_id": list(repository.slack_outbox),
+            "SlackOutboxMetadata.outbox_id": list(repository.slack_outbox),
         }
         role_requirement_ids = []
         for revisions in repository.revisions_by_process.values():
@@ -1306,6 +1457,10 @@ class LadybugProjectRepository:
             ),
             "assumption_note": revision.assumption_note,
         }
+        if self._has_column("ProcessRevision", "staked_resource_ids_json"):
+            properties["staked_resource_ids_json"] = _json_storage_or_none(
+                revision.staked_resource_ids,
+            )
         if self._has_column("ProcessRevision", "required_roles_json"):
             properties["required_roles_json"] = json.dumps(revision.required_roles)
         self._create_node("ProcessRevision", properties)
@@ -1640,6 +1795,143 @@ class LadybugProjectRepository:
                 },
             )
 
+    def _persist_milestones(self, repository: InMemoryProjectRepository) -> None:
+        for milestone in repository.milestones.values():
+            self._create_node(
+                "Milestone",
+                {
+                    "milestone_id": milestone.milestone_id,
+                    "project_id": milestone.project_id,
+                    "name": milestone.name,
+                    "description": milestone.description,
+                    "process_symbols": milestone.process_symbols,
+                    "active": milestone.active,
+                    "created_at": _isoformat_or_string(milestone.created_at),
+                    "updated_at": _isoformat_or_string(milestone.updated_at),
+                },
+            )
+
+    def _persist_slack_state(self, repository: InMemoryProjectRepository) -> None:
+        for config in repository.slack_project_configs.values():
+            self._create_node(
+                "SlackProjectConfig",
+                {
+                    "project_id": config.project_id,
+                    "enabled": config.enabled,
+                    "workspace_id": config.workspace_id,
+                    "workspace_name": config.workspace_name,
+                    "bot_token_secret_ref": config.bot_token_secret_ref,
+                    "signing_secret_ref": config.signing_secret_ref,
+                    "default_channel_id": config.default_channel_id,
+                    "continuity_note": config.continuity_note,
+                    "continuity_updated_at": _isoformat_or_none(
+                        config.continuity_updated_at,
+                    ),
+                    "updated_at": _isoformat_or_none(config.updated_at),
+                },
+            )
+        for mapping in repository.slack_resource_mappings.values():
+            self._create_node(
+                "SlackResourceMapping",
+                {
+                    "mapping_id": _stored_scoped_child_id(
+                        mapping.project_id,
+                        mapping.resource_id,
+                    ),
+                    "project_id": mapping.project_id,
+                    "resource_id": mapping.resource_id,
+                    "slack_user_id": mapping.slack_user_id,
+                    "display_name": mapping.display_name,
+                    "active": mapping.active,
+                    "updated_at": _isoformat_or_string(mapping.updated_at),
+                },
+            )
+        for cursor in repository.slack_collection_cursors.values():
+            self._create_node(
+                "SlackCollectionCursor",
+                {
+                    "cursor_id": _stored_scoped_child_id(
+                        cursor.project_id,
+                        cursor.conversation_id,
+                    ),
+                    "project_id": cursor.project_id,
+                    "conversation_id": cursor.conversation_id,
+                    "conversation_type": cursor.conversation_type,
+                    "conversation_name": cursor.conversation_name,
+                    "latest_collected_ts": cursor.latest_collected_ts,
+                    "last_run_id": cursor.last_run_id,
+                    "last_run_status": cursor.last_run_status,
+                    "updated_at": _isoformat_or_string(cursor.updated_at),
+                    "rate_limited_until_at": _isoformat_or_none(
+                        cursor.rate_limited_until_at,
+                    ),
+                },
+            )
+        for token in repository.slack_encrypted_tokens.values():
+            self._create_node(
+                "SlackEncryptedToken",
+                {
+                    "project_id": token.project_id,
+                    "ciphertext": token.ciphertext,
+                    "kdf": token.kdf,
+                    "kdf_salt": token.kdf_salt,
+                    "kdf_iterations": token.kdf_iterations,
+                    "cipher": token.cipher,
+                    "created_at": _isoformat_or_string(token.created_at),
+                    "updated_at": _isoformat_or_string(token.updated_at),
+                },
+            )
+        for run in repository.slack_runs.values():
+            self._create_node(
+                "SlackRun",
+                {
+                    "run_id": run.run_id,
+                    "project_id": run.project_id,
+                    "status": _value_or_enum_value(run.status),
+                    "trigger": run.trigger,
+                    "codex_model": run.codex_model,
+                    "started_at": _isoformat_or_string(run.started_at),
+                    "updated_at": _isoformat_or_string(run.updated_at),
+                    "finished_at": _isoformat_or_none(run.finished_at),
+                    "collected_message_count": run.collected_message_count,
+                    "draft_outbox_ids": run.draft_outbox_ids,
+                    "result_json": _json_storage_or_none(run.result_json),
+                    "error_text": run.error_text,
+                },
+            )
+        for outbox in repository.slack_outbox.values():
+            self._create_node(
+                "SlackOutbox",
+                {
+                    "outbox_id": outbox.outbox_id,
+                    "project_id": outbox.project_id,
+                    "status": _value_or_enum_value(outbox.status),
+                    "resource_id": outbox.resource_id,
+                    "slack_user_id": outbox.slack_user_id,
+                    "body": outbox.body,
+                    "content_hash": outbox.content_hash,
+                    "run_id": outbox.run_id,
+                    "created_at": _isoformat_or_string(outbox.created_at),
+                    "updated_at": _isoformat_or_string(outbox.updated_at),
+                    "sent_at": _isoformat_or_none(outbox.sent_at),
+                    "failed_at": _isoformat_or_none(outbox.failed_at),
+                    "slack_channel_id": outbox.slack_channel_id,
+                    "slack_message_ts": outbox.slack_message_ts,
+                    "error_text": outbox.error_text,
+                },
+            )
+            self._create_node(
+                "SlackOutboxMetadata",
+                {
+                    "outbox_id": outbox.outbox_id,
+                    "project_id": outbox.project_id,
+                    "generated_body": outbox.generated_body or outbox.body,
+                    "edited_at": _isoformat_or_none(outbox.edited_at),
+                    "skipped_at": _isoformat_or_none(outbox.skipped_at),
+                    "skip_reason": outbox.skip_reason,
+                },
+            )
+
     def _persist_retirements(self, repository: InMemoryProjectRepository) -> None:
         for process_id, retirement in repository.retired_processes.items():
             self._create_node(
@@ -1970,6 +2262,221 @@ class LadybugProjectRepository:
                 )
             )
 
+    def _load_milestones(self, projection: InMemoryProjectRepository) -> None:
+        if "Milestone" not in self.table_names():
+            return
+        for row in self._rows(
+            """
+            MATCH (milestone:Milestone)
+            RETURN milestone.milestone_id, milestone.project_id, milestone.name,
+                   milestone.description, milestone.process_symbols,
+                   milestone.active, milestone.created_at, milestone.updated_at
+            ORDER BY milestone.project_id, milestone.name, milestone.milestone_id
+            """
+        ):
+            milestone = MilestoneRecord(
+                milestone_id=row[0],
+                project_id=row[1],
+                name=row[2],
+                description=row[3] or "",
+                process_symbols=list(row[4] or []),
+                active=bool(row[5]),
+                created_at=_datetime_from_storage(row[6]),
+                updated_at=_datetime_from_storage(row[7]),
+            )
+            projection.milestones[milestone.milestone_id] = milestone
+            projection.milestone_ids_by_project[milestone.project_id].append(
+                milestone.milestone_id,
+            )
+
+    def _load_slack_state(self, projection: InMemoryProjectRepository) -> None:
+        if "SlackProjectConfig" not in self.table_names():
+            return
+        continuity_note_expr = (
+            "config.continuity_note"
+            if self._has_column("SlackProjectConfig", "continuity_note")
+            else "NULL"
+        )
+        continuity_updated_expr = (
+            "config.continuity_updated_at"
+            if self._has_column("SlackProjectConfig", "continuity_updated_at")
+            else "NULL"
+        )
+        for row in self._rows(
+            f"""
+            MATCH (config:SlackProjectConfig)
+            RETURN config.project_id, config.enabled, config.workspace_id,
+                   config.workspace_name, config.bot_token_secret_ref,
+                   config.signing_secret_ref, config.default_channel_id,
+                   {continuity_note_expr}, {continuity_updated_expr},
+                   config.updated_at
+            ORDER BY config.project_id
+            """
+        ):
+            config = SlackProjectConfigRecord(
+                project_id=row[0],
+                enabled=bool(row[1]),
+                workspace_id=row[2],
+                workspace_name=row[3],
+                bot_token_secret_ref=row[4],
+                signing_secret_ref=row[5],
+                default_channel_id=row[6],
+                continuity_note=row[7],
+                continuity_updated_at=_datetime_or_none(row[8]),
+                updated_at=_datetime_or_none(row[9]),
+            )
+            projection.slack_project_configs[config.project_id] = config
+        for row in self._rows(
+            """
+            MATCH (mapping:SlackResourceMapping)
+            RETURN mapping.project_id, mapping.resource_id, mapping.slack_user_id,
+                   mapping.display_name, mapping.active, mapping.updated_at
+            ORDER BY mapping.project_id, mapping.resource_id
+            """
+        ):
+            mapping = SlackResourceMappingRecord(
+                project_id=row[0],
+                resource_id=row[1],
+                slack_user_id=row[2],
+                display_name=row[3],
+                active=True if row[4] is None else bool(row[4]),
+                updated_at=_datetime_from_storage(row[5]),
+            )
+            projection.slack_resource_mappings[
+                (mapping.project_id, mapping.resource_id)
+            ] = mapping
+        for row in self._rows(
+            """
+            MATCH (cursor:SlackCollectionCursor)
+            RETURN cursor.project_id, cursor.conversation_id,
+                   cursor.conversation_type, cursor.conversation_name,
+                   cursor.latest_collected_ts, cursor.last_run_id,
+                   cursor.last_run_status, cursor.updated_at,
+                   cursor.rate_limited_until_at
+            ORDER BY cursor.project_id, cursor.conversation_type,
+                     cursor.conversation_id
+            """
+        ):
+            cursor = SlackCollectionCursorRecord(
+                project_id=row[0],
+                conversation_id=row[1],
+                conversation_type=row[2],
+                conversation_name=row[3],
+                latest_collected_ts=row[4],
+                last_run_id=row[5],
+                last_run_status=row[6],
+                updated_at=_datetime_from_storage(row[7]),
+                rate_limited_until_at=_datetime_or_none(row[8]),
+            )
+            projection.slack_collection_cursors[
+                (cursor.project_id, cursor.conversation_id)
+            ] = cursor
+        if "SlackEncryptedToken" in self.table_names():
+            for row in self._rows(
+                """
+                MATCH (token:SlackEncryptedToken)
+                RETURN token.project_id, token.ciphertext, token.kdf,
+                       token.kdf_salt, token.kdf_iterations, token.cipher,
+                       token.created_at, token.updated_at
+                ORDER BY token.project_id
+                """
+            ):
+                token = SlackEncryptedTokenRecord(
+                    project_id=row[0],
+                    ciphertext=row[1],
+                    kdf=row[2],
+                    kdf_salt=row[3],
+                    kdf_iterations=row[4],
+                    cipher=row[5],
+                    created_at=_datetime_from_storage(row[6]),
+                    updated_at=_datetime_from_storage(row[7]),
+                )
+                projection.slack_encrypted_tokens[token.project_id] = token
+        if "SlackRun" in self.table_names():
+            for row in self._rows(
+                """
+                MATCH (run:SlackRun)
+                RETURN run.run_id, run.project_id, run.status, run.trigger,
+                       run.codex_model, run.started_at, run.updated_at,
+                       run.finished_at, run.collected_message_count,
+                       run.draft_outbox_ids, run.result_json, run.error_text
+                ORDER BY run.project_id, run.started_at, run.run_id
+                """
+            ):
+                run = SlackRunRecord(
+                    run_id=row[0],
+                    project_id=row[1],
+                    status=row[2] or "running",
+                    trigger=row[3] or "ui",
+                    codex_model=row[4],
+                    started_at=_datetime_from_storage(row[5]),
+                    updated_at=_datetime_from_storage(row[6]),
+                    finished_at=_datetime_or_none(row[7]),
+                    collected_message_count=row[8] or 0,
+                    draft_outbox_ids=list(row[9] or []),
+                    result_json=_json_from_storage_or_none(row[10]),
+                    error_text=row[11],
+                )
+                projection.slack_runs[run.run_id] = run
+                projection.slack_run_ids_by_project[run.project_id].append(run.run_id)
+        metadata_by_outbox: dict[str, dict[str, Any]] = {}
+        if "SlackOutboxMetadata" in self.table_names():
+            for row in self._rows(
+                """
+                MATCH (meta:SlackOutboxMetadata)
+                RETURN meta.outbox_id, meta.generated_body, meta.edited_at,
+                       meta.skipped_at, meta.skip_reason
+                ORDER BY meta.project_id, meta.outbox_id
+                """
+            ):
+                metadata_by_outbox[row[0]] = {
+                    "generated_body": row[1],
+                    "edited_at": _datetime_or_none(row[2]),
+                    "skipped_at": _datetime_or_none(row[3]),
+                    "skip_reason": row[4],
+                }
+        for row in self._rows(
+            """
+            MATCH (outbox:SlackOutbox)
+            RETURN outbox.outbox_id, outbox.project_id, outbox.status,
+                   outbox.resource_id, outbox.slack_user_id, outbox.body,
+                   outbox.content_hash, outbox.run_id, outbox.created_at,
+                   outbox.updated_at, outbox.sent_at, outbox.failed_at,
+                   outbox.slack_channel_id, outbox.slack_message_ts,
+                   outbox.error_text
+            ORDER BY outbox.project_id, outbox.created_at, outbox.outbox_id
+            """
+        ):
+            metadata = metadata_by_outbox.get(row[0], {})
+            outbox = SlackOutboxRecord(
+                outbox_id=row[0],
+                project_id=row[1],
+                status=row[2] or "draft",
+                resource_id=row[3],
+                slack_user_id=row[4],
+                body=row[5],
+                generated_body=metadata.get("generated_body") or row[5],
+                content_hash=row[6],
+                run_id=row[7],
+                created_at=_datetime_from_storage(row[8]),
+                updated_at=_datetime_from_storage(row[9]),
+                edited_at=metadata.get("edited_at"),
+                sent_at=_datetime_or_none(row[10]),
+                failed_at=_datetime_or_none(row[11]),
+                skipped_at=metadata.get("skipped_at"),
+                slack_channel_id=row[12],
+                slack_message_ts=row[13],
+                error_text=row[14],
+                skip_reason=metadata.get("skip_reason"),
+            )
+            projection.slack_outbox[outbox.outbox_id] = outbox
+            projection.slack_outbox_ids_by_project[outbox.project_id].append(
+                outbox.outbox_id,
+            )
+            projection.slack_outbox_dedupe[
+                (outbox.project_id, outbox.slack_user_id, outbox.content_hash)
+            ] = outbox.outbox_id
+
     def _load_aliases(self, projection: InMemoryProjectRepository) -> None:
         source_clause = ", alias.source" if self._has_column("ProcessAlias", "source") else ""
         rows = self._rows(
@@ -2178,6 +2685,23 @@ def _field_or_generated_id(item: Any, name: str) -> str:
     else:
         value = getattr(item, name)
     return value or new_id()
+
+
+def _json_storage_or_none(value: Any | None) -> str | None:
+    if value is None:
+        return None
+    payload = json.dumps(value, sort_keys=True)
+    encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    return f"json_base64:{encoded}"
+
+
+def _json_from_storage_or_none(value: str | None) -> Any | None:
+    if not value:
+        return None
+    if value.startswith("json_base64:"):
+        payload = base64.b64decode(value.removeprefix("json_base64:")).decode("utf-8")
+        return json.loads(payload)
+    return json.loads(value)
 
 
 class _CloseMethodAdapter:

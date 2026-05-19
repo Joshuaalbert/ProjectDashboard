@@ -148,6 +148,30 @@ class WarningSeverity(str, Enum):
     ERROR = "error"
 
 
+class SlackOutboxStatus(str, Enum):
+    """Slack outbox delivery states."""
+
+    DRAFT = "draft"
+    SENT = "sent"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class SlackRunStatus(str, Enum):
+    """Slack background run states."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    NO_NEW_DATA = "no_new_data"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+    @property
+    def is_active(self) -> bool:
+        return self in {SlackRunStatus.QUEUED, SlackRunStatus.RUNNING}
+
+
 class ServiceConfig(StrictModel):
     """Service model configuration relevant to command validation."""
 
@@ -268,6 +292,19 @@ class ResourceCalendarOverrideCommand(StrictModel):
         if self.ends_at is not None and self.ends_at <= self.starts_at:
             raise ValueError("ends_at must be after starts_at.")
         return self
+
+
+class SlackOutboxMessageCommand(StrictModel):
+    """Slack outbox message payload accepted by create commands."""
+
+    resource_id: str | None = Field(default=None, min_length=1)
+    slack_user_id: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    generated_body: str | None = Field(default=None, min_length=1)
+    content_hash: str = Field(min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
+    created_at: AwareDatetime
+    status: SlackOutboxStatus = SlackOutboxStatus.DRAFT
 
 
 class UpsertResourcePayload(StrictModel):
@@ -703,6 +740,27 @@ class ScheduleSnapshotRecord(StrictModel):
         return data
 
 
+class MilestoneRecord(StrictModel):
+    """Named subset of project terminal processes for slippage tracking."""
+
+    milestone_id: str
+    project_id: str
+    name: str
+    description: str = ""
+    process_symbols: list[str] = Field(default_factory=list)
+    active: bool = True
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+    def model_dump(self, *args, **kwargs):
+        data = super().model_dump(*args, **kwargs)
+        if kwargs.get("mode") == "json":
+            for field in ("created_at", "updated_at"):
+                if isinstance(data.get(field), str) and data[field].endswith("Z"):
+                    data[field] = f"{data[field][:-1]}+00:00"
+        return data
+
+
 class ProcessRevisionRecord(StrictModel):
     """Append-only process planning revision."""
 
@@ -719,6 +777,7 @@ class ProcessRevisionRecord(StrictModel):
     delay_after_dependencies_business_days: int = Field(default=0, ge=0)
     required_roles: dict[str, float] = Field(default_factory=dict)
     role_requirements: list[RoleRequirementCommand] = Field(default_factory=list)
+    staked_resource_ids: list[str] = Field(default_factory=list)
     assumption_note: str | None = None
 
 
@@ -736,6 +795,106 @@ class BlockerRecord(StrictModel):
     severity: BlockerSeverity = BlockerSeverity.BLOCKING
     created_at: AwareDatetime | None = None
     resolution: str | None = None
+
+
+class SlackProjectConfigRecord(StrictModel):
+    """Optional project-owned Slack integration configuration."""
+
+    project_id: str
+    enabled: bool = False
+    workspace_id: str | None = None
+    workspace_name: str | None = None
+    bot_token_secret_ref: str | None = None
+    signing_secret_ref: str | None = None
+    default_channel_id: str | None = None
+    continuity_note: str | None = None
+    continuity_updated_at: AwareDatetime | None = None
+    updated_at: AwareDatetime | None = None
+
+
+class SlackResourceMappingRecord(StrictModel):
+    """Project resource to Slack user mapping."""
+
+    project_id: str
+    resource_id: str
+    slack_user_id: str | None = None
+    display_name: str | None = None
+    active: bool = True
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _validate_active_mapping(self) -> SlackResourceMappingRecord:
+        if self.active and self.slack_user_id is None:
+            raise ValueError("slack_user_id is required for active mappings.")
+        return self
+
+
+class SlackCollectionCursorRecord(StrictModel):
+    """Slack collection checkpoint for one project conversation."""
+
+    project_id: str
+    conversation_id: str
+    conversation_type: str
+    conversation_name: str | None = None
+    latest_collected_ts: str | None = None
+    last_run_id: str | None = None
+    last_run_status: str | None = None
+    updated_at: AwareDatetime
+    rate_limited_until_at: AwareDatetime | None = None
+
+
+class SlackEncryptedTokenRecord(StrictModel):
+    """Encrypted Slack bot token blob stored for UI-managed Slack projects."""
+
+    project_id: str
+    ciphertext: str = Field(min_length=1)
+    kdf: str = Field(min_length=1)
+    kdf_salt: str = Field(min_length=1)
+    kdf_iterations: PositiveInt
+    cipher: str = Field(min_length=1)
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+
+class SlackRunRecord(StrictModel):
+    """Persisted Slack background run/job state."""
+
+    run_id: str
+    project_id: str
+    status: SlackRunStatus = SlackRunStatus.RUNNING
+    trigger: str = Field(default="ui", min_length=1)
+    codex_model: str | None = Field(default=None, min_length=1)
+    started_at: AwareDatetime
+    updated_at: AwareDatetime
+    finished_at: AwareDatetime | None = None
+    collected_message_count: int = Field(default=0, ge=0)
+    draft_outbox_ids: list[str] = Field(default_factory=list)
+    result_json: JsonObject | None = None
+    error_text: str | None = None
+
+
+class SlackOutboxRecord(StrictModel):
+    """Persisted Slack message outbox row."""
+
+    outbox_id: str
+    project_id: str
+    status: SlackOutboxStatus = SlackOutboxStatus.DRAFT
+    resource_id: str | None = None
+    slack_user_id: str
+    body: str
+    generated_body: str | None = None
+    content_hash: str
+    run_id: str | None = None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    edited_at: AwareDatetime | None = None
+    sent_at: AwareDatetime | None = None
+    failed_at: AwareDatetime | None = None
+    skipped_at: AwareDatetime | None = None
+    slack_channel_id: str | None = None
+    slack_message_ts: str | None = None
+    error_text: str | None = None
+    skip_reason: str | None = None
 
 
 JsonObject = dict[str, Any]

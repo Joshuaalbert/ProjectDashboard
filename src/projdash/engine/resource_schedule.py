@@ -2157,11 +2157,19 @@ def _eligible_resources(
     role_id = str(requirement["role_id"])
     if role_id not in active_role_ids:
         return []
+    staked_resource_ids = {
+        str(resource_id)
+        for resource_id in requirement.get("staked_resource_ids", ()) or ()
+    }
     return [
         resource
         for resource in resources
         if bool(resource.get("active", True))
         and role_id in {str(value) for value in resource.get("role_ids", ())}
+        and (
+            not staked_resource_ids
+            or str(resource.get("resource_id")) in staked_resource_ids
+        )
     ]
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import hashlib
 import inspect
@@ -16,7 +17,11 @@ from zoneinfo import ZoneInfo
 import networkx as nx
 
 from projdash.engine.resource_schedule import compute_resource_schedule
-from projdash.engine.schedule import ProjectScheduleInput, compute_schedule
+from projdash.engine.schedule import (
+    ProjectScheduleInput,
+    ScheduleProjection,
+    compute_schedule,
+)
 from projdash.service.commands import (
     AddBlocker,
     AddCalendarException,
@@ -25,21 +30,30 @@ from projdash.service.commands import (
     AddRoleRequirementOperation,
     BatchCommandEnvelope,
     BatchUpdateProcessGraph,
+    ClearSlackBotToken,
     CollapseSubgraph,
     CommandEnvelope,
     CommitProjectState,
     CreateProject,
     CreateRole,
+    CreateSlackOutboxMessages,
     DeactivateRole,
     DeleteProject,
+    FinishSlackRun,
+    MarkSlackOutboxFailed,
+    MarkSlackOutboxSent,
+    MarkSlackOutboxSkipped,
+    RecordSlackCollectionCursor,
     RemoveCalendarException,
     RemoveDependencyOperation,
     RemoveRoleRequirementOperation,
     RenameProcess,
     RenameRole,
+    ReopenBlocker,
     ReplaceProcessWithSubgraph,
     ResolveBlocker,
     SetCalendarActive,
+    SetMilestoneActive,
     SetProcessStatus,
     SetProjectDefaultCurrency,
     SetResourceActive,
@@ -47,19 +61,32 @@ from projdash.service.commands import (
     SetResourceCalendarOperation,
     SetResourceRoles,
     SetResourceRolesOperation,
+    SetResourceSlackUser,
+    StartSlackRun,
+    StoreSlackBotToken,
     UpdateProject,
+    UpdateSlackContinuityNote,
+    UpdateSlackOutboxBody,
+    UpsertMilestone,
     UpsertProcessRevision,
     UpsertResource,
     UpsertResourceCalendar,
     UpsertResourceOperation,
+    UpsertSlackProjectConfig,
 )
 from projdash.service.errors import Error, ServiceValidationError, ValidationIssue
-from projdash.service.identifiers import new_id
+from projdash.service.identifiers import new_id, symbolify
 from projdash.service.models import (
+    MilestoneRecord,
     RequiredRolesTransitionMode,
     ScheduleBasis,
     ScheduleSnapshotRecord,
     ServiceConfig,
+    SlackCollectionCursorRecord,
+    SlackEncryptedTokenRecord,
+    SlackProjectConfigRecord,
+    SlackResourceMappingRecord,
+    SlackRunRecord,
     WarningSeverity,
 )
 from projdash.service.queries import (
@@ -69,6 +96,8 @@ from projdash.service.queries import (
     QueryCosts,
     QueryCriticalPath,
     QueryEnvelope,
+    QueryMilestones,
+    QueryPendingSlackOutbox,
     QueryProcessGraph,
     QueryProjectCatalog,
     QueryProjects,
@@ -76,6 +105,10 @@ from projdash.service.queries import (
     QueryResourceSchedule,
     QuerySchedule,
     QueryScheduleSnapshots,
+    QuerySlackBotToken,
+    QuerySlackOutbox,
+    QuerySlackProjectConfig,
+    QuerySlackRuns,
     QueryUtilization,
 )
 from projdash.service.repository import ProjectRepository
@@ -113,6 +146,20 @@ class ProjectService:
             object,
             dict[str, CommandResult | CommandErrorResult],
         ] = self._load_command_replay_cache()
+        self._projection_cache_lock = threading.RLock()
+        self._schedule_input_cache: dict[tuple[object, ...], ProjectScheduleInput] = {}
+        self._schedule_projection_cache: dict[
+            tuple[object, ...],
+            ScheduleProjection,
+        ] = {}
+        self._dependency_graph_cache: dict[
+            tuple[object, ...],
+            dict[str, list[dict[str, object]]],
+        ] = {}
+        self._resource_schedule_cache: dict[
+            tuple[object, ...],
+            dict[str, object],
+        ] = {}
 
     def handle_command(
         self,
@@ -206,6 +253,7 @@ class ProjectService:
                 )
             else:
                 self._command_replay_cache = staged_service._command_replay_cache
+                self._clear_projection_cache()
         self._command_replay_cache[envelope.command_id] = {fingerprint: result}
         self._persist_command_replay_cache()
         return result
@@ -295,6 +343,7 @@ class ProjectService:
                 ),
                 required_roles=command.required_roles,
                 role_requirements=command.role_requirements,
+                staked_resource_ids=command.staked_resource_ids,
                 assumption_note=command.assumption_note,
             )
             return CommandResult(
@@ -333,6 +382,29 @@ class ProjectService:
                 entity_ids={
                     "project_id": command.project_id,
                     "schedule_snapshot_id": snapshot.snapshot_id,
+                },
+            )
+        if isinstance(command, UpsertMilestone):
+            milestone = self._upsert_milestone(command)
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={
+                    "project_id": command.project_id,
+                    "milestone_id": milestone.milestone_id,
+                },
+            )
+        if isinstance(command, SetMilestoneActive):
+            milestone = self._repository.set_milestone_active(
+                command.project_id,
+                command.milestone_id,
+                command.active,
+                command.edit_at,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={
+                    "project_id": command.project_id,
+                    "milestone_id": milestone.milestone_id,
                 },
             )
         if isinstance(command, UpsertResourceCalendar):
@@ -443,6 +515,186 @@ class ProjectService:
                 command_id=envelope.command_id,
                 entity_ids={"resource_id": command.resource_id},
             )
+        if isinstance(command, UpsertSlackProjectConfig):
+            existing = self._repository.get_slack_project_config(command.project_id)
+            config = self._repository.upsert_slack_project_config(
+                SlackProjectConfigRecord(
+                    project_id=command.project_id,
+                    enabled=command.enabled,
+                    workspace_id=command.workspace_id,
+                    workspace_name=command.workspace_name,
+                    bot_token_secret_ref=command.bot_token_secret_ref,
+                    signing_secret_ref=command.signing_secret_ref,
+                    default_channel_id=command.default_channel_id,
+                    continuity_note=existing.continuity_note,
+                    continuity_updated_at=existing.continuity_updated_at,
+                    updated_at=command.updated_at,
+                )
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"project_id": config.project_id},
+            )
+        if isinstance(command, UpdateSlackContinuityNote):
+            existing = self._repository.get_slack_project_config(command.project_id)
+            config = self._repository.upsert_slack_project_config(
+                existing.model_copy(
+                    update={
+                        "continuity_note": command.continuity_note,
+                        "continuity_updated_at": command.updated_at,
+                        "updated_at": command.updated_at,
+                    }
+                )
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"project_id": config.project_id},
+            )
+        if isinstance(command, SetResourceSlackUser):
+            mapping = self._repository.set_resource_slack_user(
+                SlackResourceMappingRecord(
+                    project_id=command.project_id,
+                    resource_id=command.resource_id,
+                    slack_user_id=command.slack_user_id,
+                    display_name=command.display_name,
+                    active=command.active,
+                    updated_at=command.updated_at,
+                )
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"resource_id": mapping.resource_id},
+            )
+        if isinstance(command, RecordSlackCollectionCursor):
+            cursor = self._repository.record_slack_collection_cursor(
+                SlackCollectionCursorRecord(
+                    project_id=command.project_id,
+                    conversation_id=command.conversation_id,
+                    conversation_type=command.conversation_type,
+                    conversation_name=command.conversation_name,
+                    latest_collected_ts=command.latest_collected_ts,
+                    last_run_id=command.last_run_id,
+                    last_run_status=command.last_run_status,
+                    updated_at=command.updated_at,
+                    rate_limited_until_at=command.rate_limited_until_at,
+                )
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"conversation_id": cursor.conversation_id},
+            )
+        if isinstance(command, StoreSlackBotToken):
+            token = self._repository.store_slack_bot_token(
+                SlackEncryptedTokenRecord(
+                    project_id=command.project_id,
+                    ciphertext=command.ciphertext,
+                    kdf=command.kdf,
+                    kdf_salt=command.kdf_salt,
+                    kdf_iterations=command.kdf_iterations,
+                    cipher=command.cipher,
+                    created_at=command.updated_at,
+                    updated_at=command.updated_at,
+                )
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"project_id": token.project_id},
+            )
+        if isinstance(command, ClearSlackBotToken):
+            self._repository.clear_slack_bot_token(command.project_id)
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"project_id": command.project_id},
+            )
+        if isinstance(command, StartSlackRun):
+            run_id = command.run_id or new_id()
+            run = self._repository.start_slack_run(
+                SlackRunRecord(
+                    run_id=run_id,
+                    project_id=command.project_id,
+                    trigger=command.trigger,
+                    codex_model=command.codex_model,
+                    started_at=command.started_at,
+                    updated_at=command.started_at,
+                )
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"run_id": run.run_id},
+            )
+        if isinstance(command, FinishSlackRun):
+            run = self._repository.finish_slack_run(
+                project_id=command.project_id,
+                run_id=command.run_id,
+                status=command.status,
+                finished_at=command.finished_at,
+                collected_message_count=command.collected_message_count,
+                draft_outbox_ids=command.draft_outbox_ids,
+                result_json=command.result_json,
+                error_text=command.error_text,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"run_id": run.run_id},
+            )
+        if isinstance(command, CreateSlackOutboxMessages):
+            entity_ids = self._repository.create_slack_outbox_messages(
+                project_id=command.project_id,
+                messages=command.messages,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids=entity_ids,
+            )
+        if isinstance(command, MarkSlackOutboxSent):
+            outbox = self._repository.mark_slack_outbox_sent(
+                project_id=command.project_id,
+                outbox_id=command.outbox_id,
+                sent_at=command.sent_at,
+                slack_channel_id=command.slack_channel_id,
+                slack_message_ts=command.slack_message_ts,
+                run_id=command.run_id,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"outbox_id": outbox.outbox_id},
+            )
+        if isinstance(command, MarkSlackOutboxFailed):
+            outbox = self._repository.mark_slack_outbox_failed(
+                project_id=command.project_id,
+                outbox_id=command.outbox_id,
+                failed_at=command.failed_at,
+                error_text=command.error_text,
+                run_id=command.run_id,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"outbox_id": outbox.outbox_id},
+            )
+        if isinstance(command, UpdateSlackOutboxBody):
+            outbox = self._repository.update_slack_outbox_body(
+                project_id=command.project_id,
+                outbox_id=command.outbox_id,
+                body=command.body,
+                updated_at=command.updated_at,
+                run_id=command.run_id,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"outbox_id": outbox.outbox_id},
+            )
+        if isinstance(command, MarkSlackOutboxSkipped):
+            outbox = self._repository.mark_slack_outbox_skipped(
+                project_id=command.project_id,
+                outbox_id=command.outbox_id,
+                skipped_at=command.skipped_at,
+                reason=command.reason,
+                run_id=command.run_id,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"outbox_id": outbox.outbox_id},
+            )
         if isinstance(command, DeactivateRole):
             self._repository.deactivate_role(
                 project_id=command.project_id,
@@ -480,6 +732,15 @@ class ProjectService:
                 blocker_id=command.blocker_id,
                 resolved_at=command.resolved_at,
                 resolution=command.resolution,
+            )
+            return CommandResult(
+                command_id=envelope.command_id,
+                entity_ids={"blocker_id": blocker.blocker_id},
+            )
+        if isinstance(command, ReopenBlocker):
+            blocker = self._repository.reopen_blocker(
+                project_id=command.project_id,
+                blocker_id=command.blocker_id,
             )
             return CommandResult(
                 command_id=envelope.command_id,
@@ -697,6 +958,7 @@ class ProjectService:
             ]
         self._command_replay_cache = staged_service._command_replay_cache
         self._persist_command_replay_cache()
+        self._clear_projection_cache()
         return results
 
     def handle_query(self, envelope: QueryEnvelope) -> QueryResult | QueryErrorResult:
@@ -721,6 +983,18 @@ class ProjectService:
             }
         elif isinstance(query, QueryProjectCatalog):
             data = self._project_catalog_data(query)
+        elif isinstance(query, QueryMilestones):
+            data = self._milestone_data(query)
+        elif isinstance(query, QuerySlackProjectConfig):
+            data = self._slack_project_config_data(query)
+        elif isinstance(query, QuerySlackBotToken):
+            data = self._slack_bot_token_data(query)
+        elif isinstance(query, QuerySlackRuns):
+            data = self._slack_runs_data(query)
+        elif isinstance(query, QueryPendingSlackOutbox):
+            data = self._pending_slack_outbox_data(query)
+        elif isinstance(query, QuerySlackOutbox):
+            data = self._pending_slack_outbox_data(query)
         elif isinstance(query, QuerySchedule):
             data = self._schedule_data(query)
         elif isinstance(query, QueryCriticalPath):
@@ -766,7 +1040,141 @@ class ProjectService:
         """Return blockers for direct Python callers."""
         return self._repository.list_blockers(project_id, include_resolved)
 
+    def _clear_projection_cache(self) -> None:
+        with self._projection_cache_lock:
+            self._schedule_input_cache.clear()
+            self._schedule_projection_cache.clear()
+            self._dependency_graph_cache.clear()
+            self._resource_schedule_cache.clear()
+
+    def _cached_value(
+        self,
+        cache: dict[tuple[object, ...], Any],
+        key: tuple[object, ...],
+        factory,
+        *,
+        copy_result: bool = False,
+    ):
+        with self._projection_cache_lock:
+            cached = cache.get(key)
+            if cached is not None:
+                return copy.deepcopy(cached) if copy_result else cached
+            value = factory()
+            cache[key] = copy.deepcopy(value) if copy_result else value
+            return copy.deepcopy(cache[key]) if copy_result else value
+
+    def _cache_datetime(self, value: dt.datetime) -> str:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ServiceValidationError(
+                code="naive_datetime",
+                message="Projection cache keys require timezone-aware datetimes.",
+            )
+        return value.astimezone(dt.UTC).isoformat()
+
+    def _cache_value(self, value: Any) -> object:
+        if isinstance(value, dt.datetime):
+            return self._cache_datetime(value)
+        if isinstance(value, Decimal):
+            return str(value)
+        if hasattr(value, "model_dump"):
+            return self._cache_value(value.model_dump(mode="json"))
+        if isinstance(value, dict):
+            return tuple(
+                (str(key), self._cache_value(item))
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            )
+        if isinstance(value, list | tuple):
+            return tuple(self._cache_value(item) for item in value)
+        if isinstance(value, set):
+            return tuple(sorted(self._cache_value(item) for item in value))
+        return self._enum_value(value)
+
+    def _scope_cache_key(self, scope: Any) -> object:
+        return self._cache_value(scope)
+
+    def _repository_cache_version(self, project_id: str) -> object:
+        for attr_name in (
+            "cache_version",
+            "projection_version",
+            "project_version",
+            "project_generation",
+        ):
+            provider = getattr(self._repository, attr_name, None)
+            if provider is None:
+                continue
+            if isinstance(provider, dict):
+                return self._cache_value(provider.get(project_id))
+            if callable(provider):
+                return self._cache_value(
+                    self._repository_cache_version_from_callable(
+                        provider,
+                        project_id,
+                    )
+                )
+            return self._cache_value(provider)
+        return None
+
+    def _repository_cache_version_from_callable(
+        self,
+        provider,
+        project_id: str,
+    ) -> object:
+        signature = inspect.signature(provider)
+        parameters = list(signature.parameters.values())
+        required = [
+            parameter
+            for parameter in parameters
+            if parameter.default is inspect.Parameter.empty
+            and parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        ]
+        if not required:
+            return provider()
+        if required[0].kind is inspect.Parameter.KEYWORD_ONLY:
+            return provider(project_id=project_id)
+        return provider(project_id)
+
+    def _resource_schedule_cache_key(
+        self,
+        query,
+    ) -> tuple[object, ...]:
+        scope = None if isinstance(query, QueryCosts) else getattr(query, "scope", None)
+        return (
+            "resource_schedule",
+            query.project_id,
+            self._repository_cache_version(query.project_id),
+            self._cache_datetime(query.as_of),
+            self._cache_datetime(query.now),
+            self._scope_cache_key(scope),
+            self._enum_value(query.planning_granularity),
+            int(query.max_iterations),
+            float(query.convergence_tolerance_hours),
+        )
+
     def _schedule_input_for_scope(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        scope: Any,
+    ) -> ProjectScheduleInput:
+        key = (
+            "schedule_input",
+            project_id,
+            self._repository_cache_version(project_id),
+            self._cache_datetime(as_of),
+            self._scope_cache_key(scope),
+        )
+
+        def factory() -> ProjectScheduleInput:
+            return self._build_schedule_input_for_scope(project_id, as_of, scope)
+
+        return self._cached_value(self._schedule_input_cache, key, factory)
+
+    def _build_schedule_input_for_scope(
         self,
         project_id: str,
         as_of: dt.datetime,
@@ -800,15 +1208,27 @@ class ProjectService:
         )
 
     def _schedule(self, project_id, as_of, now, scope=None):
-        schedule_input = self._schedule_input_for_scope(project_id, as_of, scope)
-        return compute_schedule(schedule_input, now)
+        key = (
+            "schedule_projection",
+            project_id,
+            self._repository_cache_version(project_id),
+            self._cache_datetime(as_of),
+            self._cache_datetime(now),
+            self._scope_cache_key(scope),
+        )
+
+        def factory() -> ScheduleProjection:
+            schedule_input = self._schedule_input_for_scope(project_id, as_of, scope)
+            return compute_schedule(schedule_input, now)
+
+        return self._cached_value(self._schedule_projection_cache, key, factory)
 
     def _commit_project_state(
         self,
         envelope: CommandEnvelope,
         command: CommitProjectState,
     ) -> ScheduleSnapshotRecord:
-        terminal_symbols = sorted(command.terminal_process_symbols)
+        terminal_symbols = sorted(self._commit_terminal_symbols(command))
         scope = self._terminal_scope_data(terminal_symbols)
         schedule_query = QueryResourceSchedule(
             project_id=command.project_id,
@@ -858,8 +1278,64 @@ class ProjectService:
             raise ServiceValidationError(
                 code="unsupported_repository",
                 message="Repository does not support schedule snapshots.",
-            )
+        )
         return recorder(snapshot)
+
+    def _upsert_milestone(self, command: UpsertMilestone) -> MilestoneRecord:
+        self._repository.get_project(command.project_id)
+        process_symbols = list(
+            dict.fromkeys(
+                self._canonical_process_symbols(
+                    command.project_id,
+                    command.process_symbols,
+                )
+            )
+        )
+        milestone_id = command.milestone_id or f"milestone-{symbolify(command.name)}"
+        existing = None
+        for milestone in self._repository.list_milestones(
+            command.project_id,
+            include_inactive=True,
+        ):
+            if milestone.milestone_id == milestone_id:
+                existing = milestone
+                break
+        milestone = MilestoneRecord(
+            milestone_id=milestone_id,
+            project_id=command.project_id,
+            name=command.name,
+            description=command.description,
+            process_symbols=process_symbols,
+            active=command.active,
+            created_at=existing.created_at if existing is not None else command.edit_at,
+            updated_at=command.edit_at,
+        )
+        return self._repository.upsert_milestone(milestone)
+
+    def _commit_terminal_symbols(self, command: CommitProjectState) -> list[str]:
+        if command.milestone_id is None:
+            return list(command.terminal_process_symbols)
+        milestone = self._milestone_by_id(command.project_id, command.milestone_id)
+        return list(milestone.process_symbols)
+
+    def _milestone_by_id(
+        self,
+        project_id: str,
+        milestone_id: str,
+        *,
+        include_inactive: bool = True,
+    ) -> MilestoneRecord:
+        for milestone in self._repository.list_milestones(
+            project_id,
+            include_inactive=include_inactive,
+        ):
+            if milestone.milestone_id == milestone_id:
+                return milestone
+        raise ServiceValidationError(
+            code="milestone_not_found",
+            message=f"Milestone {milestone_id!r} does not exist.",
+            entity_id=milestone_id,
+        )
 
     def _terminal_process_ids(
         self,
@@ -882,7 +1358,7 @@ class ProjectService:
         scope: dict[str, object] | None,
     ) -> tuple[dt.datetime, dt.datetime]:
         schedule_input = self._schedule_input_for_scope(project_id, as_of, scope)
-        projection = compute_schedule(schedule_input, as_of)
+        projection = self._schedule(project_id, as_of, as_of, scope)
         total_effort_hours = 0.0
         for process in schedule_input.processes:
             revision = self._repository.selected_revision_as_of(
@@ -1101,6 +1577,33 @@ class ProjectService:
                         "allocation_state": row["allocation_state"],
                         "allocation_diagnostic": row.get("allocation_diagnostic"),
                     }
+            if not query.include_resource_fields:
+                dependency_node_fields = {
+                    "process_id",
+                    "process_symbol",
+                    "aliases",
+                    "name",
+                    "description",
+                    "duration_hours",
+                    "inferred_duration_hours",
+                    "earliest_start_at",
+                    "status",
+                    "started_at",
+                    "finished_at",
+                    "computed_status",
+                    "blocker_summary",
+                    "dependency_only",
+                    "resource_aware",
+                    "work_now_window",
+                    "late_risk_window",
+                    "required_roles",
+                    "role_requirements",
+                }
+                node = {
+                    key: value
+                    for key, value in node.items()
+                    if key in dependency_node_fields
+                }
             nodes.append(node)
         data = {
             "project_id": query.project_id,
@@ -1136,12 +1639,38 @@ class ProjectService:
         now: dt.datetime,
         scope: Any = None,
     ) -> dict[str, list[dict[str, object]]]:
+        key = (
+            "dependency_graph",
+            project_id,
+            self._repository_cache_version(project_id),
+            self._cache_datetime(as_of),
+            self._cache_datetime(now),
+            self._scope_cache_key(scope),
+        )
+
+        def factory() -> dict[str, list[dict[str, object]]]:
+            return self._build_dependency_graph_parts(project_id, as_of, now, scope)
+
+        return self._cached_value(
+            self._dependency_graph_cache,
+            key,
+            factory,
+            copy_result=True,
+        )
+
+    def _build_dependency_graph_parts(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        now: dt.datetime,
+        scope: Any = None,
+    ) -> dict[str, list[dict[str, object]]]:
         schedule_input = self._schedule_input_for_scope(
             project_id,
             as_of,
             scope,
         )
-        projection = compute_schedule(schedule_input, now)
+        projection = self._schedule(project_id, as_of, now, scope)
         input_by_id = {
             process.process_id: process for process in schedule_input.processes
         }
@@ -1190,6 +1719,7 @@ class ProjectService:
             role_requirements = self._role_requirements_json(
                 list(getattr(revision, "role_requirements", []) or [])
             )
+            staked_resource_ids = list(getattr(revision, "staked_resource_ids", []) or [])
             node = {
                 "process_id": row.process_id,
                 "process_symbol": process_symbol,
@@ -1197,12 +1727,20 @@ class ProjectService:
                 "name": row.name,
                 "description": revision.description if revision else "",
                 "duration_hours": duration_hours,
+                "duration_business_days": input_by_id[
+                    row.process_id
+                ].duration_business_days,
                 "inferred_duration_hours": None,
+                "dependencies": list(row.dependencies),
                 "earliest_start_at": (
                     input_by_id[row.process_id].earliest_start_at.isoformat()
                     if input_by_id[row.process_id].earliest_start_at
                     else None
                 ),
+                "start_at_earliest": input_by_id[row.process_id].start_at_earliest,
+                "delay_after_dependencies_business_days": input_by_id[
+                    row.process_id
+                ].delay_after_dependencies_business_days,
                 "status": row.explicit_status,
                 "started_at": started_at.isoformat() if started_at else None,
                 "finished_at": finished_at.isoformat() if finished_at else None,
@@ -1244,6 +1782,8 @@ class ProjectService:
             )
             if role_requirements or project_has_roles:
                 node["role_requirements"] = role_requirements
+            node["staked_resource_ids"] = staked_resource_ids
+            node["assumption_note"] = getattr(revision, "assumption_note", None)
             nodes.append(
                 node
             )
@@ -1394,6 +1934,95 @@ class ProjectService:
             "roles": sorted(roles, key=lambda item: item["role_id"]),
             "calendars": sorted(calendars, key=lambda item: item["calendar_id"]),
             "resources": sorted(resources, key=lambda item: item["resource_id"]),
+            "milestones": self._milestone_rows(query.project_id, include_inactive=True),
+        }
+
+    def _milestone_data(self, query: QueryMilestones) -> dict[str, object]:
+        self._repository.get_project(query.project_id)
+        return {
+            "project_id": query.project_id,
+            "milestones": self._milestone_rows(
+                query.project_id,
+                include_inactive=query.include_inactive,
+            ),
+        }
+
+    def _milestone_rows(
+        self,
+        project_id: str,
+        *,
+        include_inactive: bool = False,
+    ) -> list[dict[str, object]]:
+        return [
+            milestone.model_dump(mode="json")
+            for milestone in self._repository.list_milestones(
+                project_id,
+                include_inactive=include_inactive,
+            )
+        ]
+
+    def _slack_project_config_data(
+        self,
+        query: QuerySlackProjectConfig,
+    ) -> dict[str, object]:
+        config = self._repository.get_slack_project_config(query.project_id)
+        mappings = self._repository.list_resource_slack_mappings(query.project_id)
+        cursors = self._repository.list_slack_collection_cursors(query.project_id)
+        token = self._repository.get_slack_bot_token(query.project_id)
+        config_data = config.model_dump(mode="json")
+        config_data["has_encrypted_bot_token"] = token is not None
+        config_data["encrypted_bot_token_updated_at"] = (
+            token.model_dump(mode="json")["updated_at"] if token is not None else None
+        )
+        return {
+            "project_id": query.project_id,
+            "config": config_data,
+            "resource_mappings": [
+                mapping.model_dump(mode="json") for mapping in mappings
+            ],
+            "collection_cursors": [
+                cursor.model_dump(mode="json") for cursor in cursors
+            ],
+        }
+
+    def _slack_bot_token_data(
+        self,
+        query: QuerySlackBotToken,
+    ) -> dict[str, object]:
+        token = self._repository.get_slack_bot_token(query.project_id)
+        return {
+            "project_id": query.project_id,
+            "encrypted_token": (
+                token.model_dump(mode="json") if token is not None else None
+            ),
+        }
+
+    def _slack_runs_data(
+        self,
+        query: QuerySlackRuns,
+    ) -> dict[str, object]:
+        rows = self._repository.list_slack_runs(
+            project_id=query.project_id,
+            statuses=query.statuses,
+            limit=query.limit,
+        )
+        return {
+            "project_id": query.project_id,
+            "runs": [row.model_dump(mode="json") for row in rows],
+        }
+
+    def _pending_slack_outbox_data(
+        self,
+        query: QueryPendingSlackOutbox,
+    ) -> dict[str, object]:
+        rows = self._repository.list_slack_outbox(
+            project_id=query.project_id,
+            statuses=query.statuses,
+            limit=query.limit,
+        )
+        return {
+            "project_id": query.project_id,
+            "outbox": [row.model_dump(mode="json") for row in rows],
         }
 
     def _blocker_data(self, query: QueryBlockers) -> dict[str, object]:
@@ -1468,15 +2097,21 @@ class ProjectService:
         self,
         query: QueryScheduleSnapshots,
     ) -> dict[str, object]:
+        terminal_process_symbols = query.terminal_process_symbols
+        milestone = None
+        if query.milestone_id is not None:
+            milestone = self._milestone_by_id(query.project_id, query.milestone_id)
+            terminal_process_symbols = milestone.process_symbols
         snapshots = self._repository.schedule_snapshots_as_of(
             query.project_id,
             query.as_of,
-            query.terminal_process_symbols,
+            terminal_process_symbols,
         )
         return {
             "project_id": query.project_id,
             "as_of": query.as_of.isoformat(),
-            "terminal_process_symbols": query.terminal_process_symbols,
+            "milestone": milestone.model_dump(mode="json") if milestone else None,
+            "terminal_process_symbols": terminal_process_symbols,
             "snapshots": [
                 snapshot.model_dump(mode="json")
                 for snapshot in snapshots
@@ -1561,11 +2196,13 @@ class ProjectService:
                         priority_terminal_symbols,
                     ),
                 },
+                "milestones": self._agent_milestone_context(query),
                 "blockers": blockers["blockers"],
                 "available_queries": [
                     "query_process_graph",
                     "query_resource_schedule",
                     "query_schedule_snapshots",
+                    "query_milestones",
                     "query_utilization",
                     "query_costs",
                     "query_resource_capacity",
@@ -1626,6 +2263,33 @@ class ProjectService:
             snapshots_by_id.values(),
             key=self._agent_snapshot_sort_key,
         )
+
+    def _agent_milestone_context(
+        self,
+        query: QueryAgentContext,
+    ) -> list[dict[str, object]]:
+        rows = []
+        for milestone in self._repository.list_milestones(
+            query.project_id,
+            include_inactive=False,
+        ):
+            snapshots = self._schedule_snapshot_data(
+                QueryScheduleSnapshots(
+                    project_id=query.project_id,
+                    as_of=query.as_of,
+                    terminal_process_symbols=milestone.process_symbols,
+                )
+            )["snapshots"]
+            rows.append(
+                {
+                    **milestone.model_dump(mode="json"),
+                    "slippage": self._agent_slippage_context(
+                        snapshots,
+                        query.snapshot_limit,
+                    ),
+                }
+            )
+        return rows
 
     def _agent_snapshot_sort_key(self, snapshot: object) -> tuple[dt.datetime, str]:
         committed_at = self._parse_datetime(snapshot.get("committed_at"))
@@ -1696,6 +2360,8 @@ class ProjectService:
                     "predecessors": sorted(predecessors.get(symbol, [])),
                     "successors": sorted(successors.get(symbol, [])),
                     "role_requirements": node.get("role_requirements") or [],
+                    "staked_resource_ids": node.get("staked_resource_ids") or [],
+                    "assumption_note": node.get("assumption_note"),
                     "earliest_start_at": node.get("earliest_start_at"),
                     "started_at": node.get("started_at"),
                     "finished_at": node.get("finished_at"),
@@ -2095,6 +2761,8 @@ class ProjectService:
         )
         include_slices = getattr(query, "include_allocation_slices", False)
         data = dict(schedule)
+        data["as_of"] = query.as_of.isoformat()
+        data["now"] = query.now.isoformat()
         warnings = self._resource_warnings(data, query.max_iterations)
         if not include_slices:
             data["allocation_slices"] = []
@@ -2108,21 +2776,34 @@ class ProjectService:
         *,
         include_allocation_slices: bool = True,
     ) -> dict[str, object]:
-        scheduler_input = self._resource_schedule_input(
-            query,
-            include_allocation_slices=include_allocation_slices,
+        key = self._resource_schedule_cache_key(query)
+
+        def factory() -> dict[str, object]:
+            scheduler_input = self._resource_schedule_input(
+                query,
+                include_allocation_slices=True,
+            )
+            try:
+                if self._resource_scheduler is not None:
+                    schedule = self._resource_scheduler(scheduler_input)
+                else:
+                    schedule = compute_resource_schedule(scheduler_input)
+            except ValueError as exc:
+                raise ServiceValidationError(
+                    code="resource_schedule_unsatisfiable",
+                    message=str(exc),
+                ) from exc
+            return self._normalize_schedule_dict(schedule)
+
+        schedule = self._cached_value(
+            self._resource_schedule_cache,
+            key,
+            factory,
+            copy_result=True,
         )
-        try:
-            if self._resource_scheduler is not None:
-                schedule = self._resource_scheduler(scheduler_input)
-            else:
-                schedule = compute_resource_schedule(scheduler_input)
-        except ValueError as exc:
-            raise ServiceValidationError(
-                code="resource_schedule_unsatisfiable",
-                message=str(exc),
-            ) from exc
-        return self._normalize_schedule_dict(schedule)
+        if not include_allocation_slices:
+            schedule["allocation_slices"] = []
+        return schedule
 
     def _resource_schedule_input(
         self,
@@ -2196,6 +2877,7 @@ class ProjectService:
                     "delay_after_dependencies_business_days": (
                         revision.delay_after_dependencies_business_days
                     ),
+                    "staked_resource_ids": list(revision.staked_resource_ids),
                 }
             )
             for index, requirement in enumerate(revision.role_requirements):
@@ -2220,6 +2902,7 @@ class ProjectService:
                         "allocation_policy": self._enum_value(
                             requirement.allocation_policy,
                         ),
+                        "staked_resource_ids": list(revision.staked_resource_ids),
                     }
                 )
 

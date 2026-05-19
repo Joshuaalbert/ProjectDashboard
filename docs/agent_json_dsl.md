@@ -49,8 +49,11 @@ Supported command actions are:
 - `upsert_process_revision`
 - `set_process_status`
 - `commit_project_state`
+- `upsert_milestone`
+- `set_milestone_active`
 - `add_blocker`
 - `resolve_blocker`
+- `reopen_blocker`
 - `rename_process`
 - `add_process_aliases`
 - `batch_update_process_graph`
@@ -67,6 +70,19 @@ Supported command actions are:
 - `set_resource_active`
 - `set_resource_roles`
 - `set_resource_calendar`
+- `upsert_slack_project_config`
+- `update_slack_continuity_note`
+- `set_resource_slack_user`
+- `record_slack_collection_cursor`
+- `store_slack_bot_token`
+- `clear_slack_bot_token`
+- `start_slack_run`
+- `finish_slack_run`
+- `create_slack_outbox_messages`
+- `mark_slack_outbox_sent`
+- `mark_slack_outbox_failed`
+- `update_slack_outbox_body`
+- `mark_slack_outbox_skipped`
 
 ## Process Revisions
 
@@ -83,12 +99,34 @@ Important fields:
 - `dependencies`
 - `earliest_start_at`
 - `role_requirements`
+- `staked_resource_ids`
 
 Each `role_requirements` item has:
 
 - `role_id`
 - `effort_hours`
 - optional allocation policy and daily allocation bounds
+
+`staked_resource_ids` pins the process to specific project resources before
+resource cup filling. Use it when a teammate has explicitly committed to the
+work, or when a role assignment would overstate real capacity because only
+particular resources have the needed expertise. Preserve existing staking when
+editing unrelated revision fields.
+
+## Milestones
+
+`upsert_milestone` defines a named subset of process symbols for milestone
+slippage tracking. The service resolves aliases to canonical active symbols and
+stores `process_symbols`, `name`, `description`, `active`, and timestamps.
+Inactive milestones are retained for audit but omitted from agent context.
+
+`commit_project_state` accepts either `terminal_process_symbols` or
+`milestone_id`. When `milestone_id` is supplied, the snapshot terminal symbols
+come from that milestone. `query_schedule_snapshots` likewise accepts
+`milestone_id` to fetch slippage history for that milestone.
+
+Slack reconciliation agents should prefer milestone snapshots over whole-project
+snapshots when a project has active milestones.
 
 ## Topology Rewrites
 
@@ -122,6 +160,7 @@ Supported query actions are:
 - `get_project`
 - `query_projects`
 - `query_project_catalog`
+- `query_milestones`
 - `query_schedule`
 - `query_critical_path`
 - `query_process_graph`
@@ -132,6 +171,11 @@ Supported query actions are:
 - `query_resource_capacity`
 - `query_utilization`
 - `query_costs`
+- `query_slack_project_config`
+- `query_slack_bot_token`
+- `query_slack_runs`
+- `query_pending_slack_outbox`
+- `query_slack_outbox`
 
 `query_process_graph` returns process nodes with dependency-only schedule fields
 and, when requested, resource-aware fields plus allocation slices. Resource-aware
@@ -149,9 +193,10 @@ partial schedule.
 
 `query_agent_context` returns a concise JSON report intended for project-manager
 agents. It includes the resource-aware process graph, role requirements,
-inferred process durations, critical path, committed slippage summary, blockers,
-and role-prioritized work. Agents should use the narrower queries above when
-they need detailed schedule, utilization, cost, or capacity evidence.
+inferred process durations, critical path, committed slippage summary,
+milestones with their own slippage summaries, blockers, and role-prioritized
+work. Agents should use the narrower queries above when they need detailed
+schedule, utilization, cost, or capacity evidence.
 
 The request accepts `project_id`, timezone-aware `as_of` and `now`, optional
 `scope`, optional `terminal_process_symbols`, scheduler convergence options, and
@@ -179,3 +224,10 @@ terminal symbols and persists an immutable snapshot with:
 
 Repeated commits for the same project, timestamp, and terminal symbol set are
 idempotent.
+
+## Slack Continuity
+
+`update_slack_continuity_note` stores the handoff note that the next Slack run
+will read even when no new Slack messages were collected. The note should say
+what replies or state changes are expected, who should respond, whether the next
+follow-up belongs in DM or channel, and the expected time scale.

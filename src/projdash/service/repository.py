@@ -18,6 +18,7 @@ from projdash.service.models import (
     BlockerRecord,
     CalendarWeeklyWindowCommand,
     CostUnit,
+    MilestoneRecord,
     ProcessRecord,
     ProcessRevisionRecord,
     ProcessStatus,
@@ -26,6 +27,15 @@ from projdash.service.models import (
     ResourceHolidayCommand,
     RoleRequirementCommand,
     ScheduleSnapshotRecord,
+    SlackCollectionCursorRecord,
+    SlackEncryptedTokenRecord,
+    SlackOutboxMessageCommand,
+    SlackOutboxRecord,
+    SlackOutboxStatus,
+    SlackProjectConfigRecord,
+    SlackResourceMappingRecord,
+    SlackRunRecord,
+    SlackRunStatus,
 )
 
 
@@ -118,6 +128,7 @@ class ProjectRepository(Protocol):
         delay_after_dependencies_business_days: int,
         required_roles: dict[str, float],
         role_requirements: list[RoleRequirementCommand],
+        staked_resource_ids: list[str],
         assumption_note: str | None,
     ) -> tuple[ProcessRecord, ProcessRevisionRecord]:
         """Create a process if needed and append a planning revision."""
@@ -135,6 +146,28 @@ class ProjectRepository(Protocol):
 
     def resolve_process_id(self, project_id: str, process_symbol: str) -> str:
         """Resolve a project-scoped process symbol or alias to a process id."""
+
+    def upsert_milestone(
+        self,
+        milestone: MilestoneRecord,
+    ) -> MilestoneRecord:
+        """Create or update a named milestone subset."""
+
+    def set_milestone_active(
+        self,
+        project_id: str,
+        milestone_id: str,
+        active: bool,
+        updated_at: dt.datetime,
+    ) -> MilestoneRecord:
+        """Activate or deactivate a milestone."""
+
+    def list_milestones(
+        self,
+        project_id: str,
+        include_inactive: bool = False,
+    ) -> list[MilestoneRecord]:
+        """List project milestones."""
 
     def upsert_resource_calendar(
         self,
@@ -217,6 +250,144 @@ class ProjectRepository(Protocol):
         calendar_id: str,
     ) -> None:
         """Replace a resource's calendar assignment."""
+
+    def upsert_slack_project_config(
+        self,
+        config: SlackProjectConfigRecord,
+    ) -> SlackProjectConfigRecord:
+        """Create or update optional Slack settings for a project."""
+
+    def get_slack_project_config(
+        self,
+        project_id: str,
+    ) -> SlackProjectConfigRecord:
+        """Return Slack settings or a disabled default when absent."""
+
+    def set_resource_slack_user(
+        self,
+        mapping: SlackResourceMappingRecord,
+    ) -> SlackResourceMappingRecord:
+        """Set or clear a resource's Slack user mapping."""
+
+    def list_resource_slack_mappings(
+        self,
+        project_id: str,
+    ) -> list[SlackResourceMappingRecord]:
+        """List project Slack resource mappings."""
+
+    def record_slack_collection_cursor(
+        self,
+        cursor: SlackCollectionCursorRecord,
+    ) -> SlackCollectionCursorRecord:
+        """Create or update a Slack collection cursor."""
+
+    def list_slack_collection_cursors(
+        self,
+        project_id: str,
+    ) -> list[SlackCollectionCursorRecord]:
+        """List project Slack collection cursors."""
+
+    def store_slack_bot_token(
+        self,
+        token: SlackEncryptedTokenRecord,
+    ) -> SlackEncryptedTokenRecord:
+        """Store an encrypted UI-managed Slack bot token blob."""
+
+    def get_slack_bot_token(
+        self,
+        project_id: str,
+    ) -> SlackEncryptedTokenRecord | None:
+        """Return encrypted UI-managed Slack bot token blob when present."""
+
+    def clear_slack_bot_token(
+        self,
+        project_id: str,
+    ) -> None:
+        """Remove encrypted UI-managed Slack bot token blob."""
+
+    def start_slack_run(
+        self,
+        run: SlackRunRecord,
+    ) -> SlackRunRecord:
+        """Create one active Slack background run for a project."""
+
+    def finish_slack_run(
+        self,
+        project_id: str,
+        run_id: str,
+        *,
+        status: SlackRunStatus,
+        finished_at: dt.datetime,
+        collected_message_count: int = 0,
+        draft_outbox_ids: list[str] | None = None,
+        result_json: dict[str, Any] | None = None,
+        error_text: str | None = None,
+    ) -> SlackRunRecord:
+        """Finish a Slack background run."""
+
+    def list_slack_runs(
+        self,
+        project_id: str,
+        statuses: list[SlackRunStatus] | None = None,
+        limit: int | None = None,
+    ) -> list[SlackRunRecord]:
+        """List Slack background runs."""
+
+    def create_slack_outbox_messages(
+        self,
+        project_id: str,
+        messages: list[SlackOutboxMessageCommand],
+    ) -> dict[str, list[str]]:
+        """Create deduplicated Slack outbox rows."""
+
+    def mark_slack_outbox_sent(
+        self,
+        project_id: str,
+        outbox_id: str,
+        sent_at: dt.datetime,
+        slack_channel_id: str,
+        slack_message_ts: str,
+        run_id: str | None = None,
+    ) -> SlackOutboxRecord:
+        """Mark a Slack outbox row sent."""
+
+    def mark_slack_outbox_failed(
+        self,
+        project_id: str,
+        outbox_id: str,
+        failed_at: dt.datetime,
+        error_text: str,
+        run_id: str | None = None,
+    ) -> SlackOutboxRecord:
+        """Mark a Slack outbox row failed."""
+
+    def update_slack_outbox_body(
+        self,
+        project_id: str,
+        outbox_id: str,
+        body: str,
+        updated_at: dt.datetime,
+        run_id: str | None = None,
+    ) -> SlackOutboxRecord:
+        """Update an editable draft Slack outbox row."""
+
+    def mark_slack_outbox_skipped(
+        self,
+        project_id: str,
+        outbox_id: str,
+        skipped_at: dt.datetime,
+        reason: str | None = None,
+        run_id: str | None = None,
+    ) -> SlackOutboxRecord:
+        """Mark a Slack outbox row skipped."""
+
+    def list_slack_outbox(
+        self,
+        project_id: str,
+        statuses: list[SlackOutboxStatus],
+        limit: int | None = None,
+    ) -> list[SlackOutboxRecord]:
+        """List Slack outbox rows matching statuses."""
 
     def deactivate_role(
         self,
@@ -311,6 +482,23 @@ class InMemoryProjectRepository:
         self.process_alias_sources: dict[str, dict[str, str]] = defaultdict(dict)
         self.dependency_edge_ids: dict[tuple[str, str, str], str] = {}
         self.schedule_snapshots: list[ScheduleSnapshotRecord] = []
+        self.milestones: dict[str, MilestoneRecord] = {}
+        self.milestone_ids_by_project: dict[str, list[str]] = defaultdict(list)
+        self.slack_project_configs: dict[str, SlackProjectConfigRecord] = {}
+        self.slack_resource_mappings: dict[
+            tuple[str, str],
+            SlackResourceMappingRecord,
+        ] = {}
+        self.slack_collection_cursors: dict[
+            tuple[str, str],
+            SlackCollectionCursorRecord,
+        ] = {}
+        self.slack_encrypted_tokens: dict[str, SlackEncryptedTokenRecord] = {}
+        self.slack_runs: dict[str, SlackRunRecord] = {}
+        self.slack_run_ids_by_project: dict[str, list[str]] = defaultdict(list)
+        self.slack_outbox: dict[str, SlackOutboxRecord] = {}
+        self.slack_outbox_ids_by_project: dict[str, list[str]] = defaultdict(list)
+        self.slack_outbox_dedupe: dict[tuple[str, str, str], str] = {}
 
     def create_project(
         self,
@@ -373,6 +561,7 @@ class InMemoryProjectRepository:
         resource_ids = list(self.resource_ids_by_project.get(project_id, []))
         calendar_ids = list(self.calendar_ids_by_project.get(project_id, []))
         blocker_ids = list(self.blocker_ids_by_project.get(project_id, []))
+        milestone_ids = list(self.milestone_ids_by_project.get(project_id, []))
 
         for process_id in process_ids:
             self.processes.pop(process_id, None)
@@ -389,6 +578,8 @@ class InMemoryProjectRepository:
             self.calendars.pop(calendar_id, None)
         for blocker_id in blocker_ids:
             self.blockers.pop(blocker_id, None)
+        for milestone_id in milestone_ids:
+            self.milestones.pop(milestone_id, None)
 
         self.projects.pop(project_id, None)
         self.process_ids_by_project.pop(project_id, None)
@@ -396,6 +587,7 @@ class InMemoryProjectRepository:
         self.resource_ids_by_project.pop(project_id, None)
         self.calendar_ids_by_project.pop(project_id, None)
         self.blocker_ids_by_project.pop(project_id, None)
+        self.milestone_ids_by_project.pop(project_id, None)
         self.process_aliases.pop(project_id, None)
         self.process_alias_sources.pop(project_id, None)
         self.dependency_edge_ids = {
@@ -409,6 +601,27 @@ class InMemoryProjectRepository:
             for revision in revisions
             for requirement in revision.role_requirements
             if requirement.requirement_id is not None
+        }
+        self.slack_project_configs.pop(project_id, None)
+        self.slack_encrypted_tokens.pop(project_id, None)
+        self.slack_resource_mappings = {
+            key: mapping
+            for key, mapping in self.slack_resource_mappings.items()
+            if key[0] != project_id
+        }
+        self.slack_collection_cursors = {
+            key: cursor
+            for key, cursor in self.slack_collection_cursors.items()
+            if key[0] != project_id
+        }
+        for outbox_id in self.slack_outbox_ids_by_project.pop(project_id, []):
+            self.slack_outbox.pop(outbox_id, None)
+        for run_id in self.slack_run_ids_by_project.pop(project_id, []):
+            self.slack_runs.pop(run_id, None)
+        self.slack_outbox_dedupe = {
+            key: outbox_id
+            for key, outbox_id in self.slack_outbox_dedupe.items()
+            if key[0] != project_id
         }
 
     def create_role(
@@ -490,11 +703,13 @@ class InMemoryProjectRepository:
         delay_after_dependencies_business_days: int,
         required_roles: dict[str, float],
         role_requirements: list[RoleRequirementCommand],
+        staked_resource_ids: list[str],
         assumption_note: str | None,
     ) -> tuple[ProcessRecord, ProcessRevisionRecord]:
         self.get_project(project_id)
 
         self._validate_active_role_requirements(project_id, role_requirements)
+        self._validate_staked_resource_ids(project_id, staked_resource_ids)
 
         if process_id is None:
             process = ProcessRecord(
@@ -539,6 +754,7 @@ class InMemoryProjectRepository:
             delay_after_dependencies_business_days=delay_after_dependencies_business_days,
             required_roles=required_roles,
             role_requirements=role_requirements,
+            staked_resource_ids=staked_resource_ids,
             assumption_note=assumption_note,
         )
         self._validate_acyclic_after_revision(project_id, revision)
@@ -613,6 +829,54 @@ class InMemoryProjectRepository:
             field_path="process_symbol",
             entity_id=process_symbol,
         )
+
+    def upsert_milestone(self, milestone: MilestoneRecord) -> MilestoneRecord:
+        self.get_project(milestone.project_id)
+        if milestone.milestone_id not in self.milestones:
+            self.milestone_ids_by_project[milestone.project_id].append(
+                milestone.milestone_id,
+            )
+        else:
+            existing = self.milestones[milestone.milestone_id]
+            if existing.project_id != milestone.project_id:
+                raise ServiceValidationError(
+                    code="milestone_project_conflict",
+                    message="Milestone id already belongs to another project.",
+                    entity_id=milestone.milestone_id,
+                )
+        self.milestones[milestone.milestone_id] = milestone
+        return milestone
+
+    def set_milestone_active(
+        self,
+        project_id: str,
+        milestone_id: str,
+        active: bool,
+        updated_at: dt.datetime,
+    ) -> MilestoneRecord:
+        milestone = self._get_milestone(project_id, milestone_id)
+        updated = milestone.model_copy(
+            update={
+                "active": active,
+                "updated_at": updated_at,
+            }
+        )
+        self.milestones[milestone_id] = updated
+        return updated
+
+    def list_milestones(
+        self,
+        project_id: str,
+        include_inactive: bool = False,
+    ) -> list[MilestoneRecord]:
+        self.get_project(project_id)
+        output = [
+            self.milestones[milestone_id]
+            for milestone_id in self.milestone_ids_by_project.get(project_id, [])
+            if milestone_id in self.milestones
+            and (include_inactive or self.milestones[milestone_id].active)
+        ]
+        return sorted(output, key=lambda item: (item.name.casefold(), item.milestone_id))
 
     def rename_process(
         self,
@@ -908,6 +1172,349 @@ class InMemoryProjectRepository:
             active=resource["active"],
         )
         resource["calendar_id"] = calendar_id
+
+    def upsert_slack_project_config(
+        self,
+        config: SlackProjectConfigRecord,
+    ) -> SlackProjectConfigRecord:
+        self.get_project(config.project_id)
+        self.slack_project_configs[config.project_id] = config
+        return config
+
+    def get_slack_project_config(
+        self,
+        project_id: str,
+    ) -> SlackProjectConfigRecord:
+        self.get_project(project_id)
+        return self.slack_project_configs.get(
+            project_id,
+            SlackProjectConfigRecord(project_id=project_id),
+        )
+
+    def set_resource_slack_user(
+        self,
+        mapping: SlackResourceMappingRecord,
+    ) -> SlackResourceMappingRecord:
+        self._get_resource(mapping.project_id, mapping.resource_id)
+        if not mapping.active:
+            mapping = mapping.model_copy(
+                update={"slack_user_id": None, "display_name": None},
+            )
+        self.slack_resource_mappings[(mapping.project_id, mapping.resource_id)] = (
+            mapping
+        )
+        return mapping
+
+    def list_resource_slack_mappings(
+        self,
+        project_id: str,
+    ) -> list[SlackResourceMappingRecord]:
+        self.get_project(project_id)
+        return sorted(
+            [
+                mapping
+                for mapping in self.slack_resource_mappings.values()
+                if mapping.project_id == project_id
+            ],
+            key=lambda mapping: mapping.resource_id,
+        )
+
+    def record_slack_collection_cursor(
+        self,
+        cursor: SlackCollectionCursorRecord,
+    ) -> SlackCollectionCursorRecord:
+        self.get_project(cursor.project_id)
+        self.slack_collection_cursors[(cursor.project_id, cursor.conversation_id)] = (
+            cursor
+        )
+        return cursor
+
+    def list_slack_collection_cursors(
+        self,
+        project_id: str,
+    ) -> list[SlackCollectionCursorRecord]:
+        self.get_project(project_id)
+        return sorted(
+            [
+                cursor
+                for cursor in self.slack_collection_cursors.values()
+                if cursor.project_id == project_id
+            ],
+            key=lambda cursor: (cursor.conversation_type, cursor.conversation_id),
+        )
+
+    def store_slack_bot_token(
+        self,
+        token: SlackEncryptedTokenRecord,
+    ) -> SlackEncryptedTokenRecord:
+        self.get_project(token.project_id)
+        existing = self.slack_encrypted_tokens.get(token.project_id)
+        if existing is not None:
+            token = token.model_copy(update={"created_at": existing.created_at})
+        self.slack_encrypted_tokens[token.project_id] = token
+        return token
+
+    def get_slack_bot_token(
+        self,
+        project_id: str,
+    ) -> SlackEncryptedTokenRecord | None:
+        self.get_project(project_id)
+        return self.slack_encrypted_tokens.get(project_id)
+
+    def clear_slack_bot_token(
+        self,
+        project_id: str,
+    ) -> None:
+        self.get_project(project_id)
+        self.slack_encrypted_tokens.pop(project_id, None)
+
+    def start_slack_run(
+        self,
+        run: SlackRunRecord,
+    ) -> SlackRunRecord:
+        self.get_project(run.project_id)
+        for existing_id in self.slack_run_ids_by_project.get(run.project_id, []):
+            existing = self.slack_runs[existing_id]
+            status = (
+                existing.status
+                if isinstance(existing.status, SlackRunStatus)
+                else SlackRunStatus(existing.status)
+            )
+            if status.is_active:
+                raise ServiceValidationError(
+                    code="slack_run_already_active",
+                    message="A Slack run is already active for this project.",
+                    entity_id=existing.run_id,
+                )
+        if run.run_id in self.slack_runs:
+            raise ServiceValidationError(
+                code="slack_run_conflict",
+                message=f"Slack run {run.run_id!r} already exists.",
+                entity_id=run.run_id,
+            )
+        self.slack_runs[run.run_id] = run
+        self.slack_run_ids_by_project[run.project_id].append(run.run_id)
+        return run
+
+    def finish_slack_run(
+        self,
+        project_id: str,
+        run_id: str,
+        *,
+        status: SlackRunStatus,
+        finished_at: dt.datetime,
+        collected_message_count: int = 0,
+        draft_outbox_ids: list[str] | None = None,
+        result_json: dict[str, Any] | None = None,
+        error_text: str | None = None,
+    ) -> SlackRunRecord:
+        if status.is_active:
+            raise ServiceValidationError(
+                code="slack_run_terminal_status_required",
+                message="Slack run finish status must be terminal.",
+                entity_id=run_id,
+            )
+        run = self._get_slack_run(project_id, run_id)
+        if finished_at < run.started_at:
+            raise ServiceValidationError(
+                code="slack_run_finished_before_start",
+                message="Slack run finished_at must be no earlier than started_at.",
+                entity_id=run_id,
+            )
+        for outbox_id in draft_outbox_ids or []:
+            self._get_slack_outbox(project_id, outbox_id)
+        updated = run.model_copy(
+            update={
+                "status": status,
+                "finished_at": finished_at,
+                "updated_at": finished_at,
+                "collected_message_count": collected_message_count,
+                "draft_outbox_ids": list(draft_outbox_ids or []),
+                "result_json": result_json,
+                "error_text": error_text,
+            },
+        )
+        self.slack_runs[run_id] = updated
+        return updated
+
+    def list_slack_runs(
+        self,
+        project_id: str,
+        statuses: list[SlackRunStatus] | None = None,
+        limit: int | None = None,
+    ) -> list[SlackRunRecord]:
+        self.get_project(project_id)
+        status_values = (
+            {getattr(status, "value", status) for status in statuses}
+            if statuses is not None
+            else None
+        )
+        rows = [
+            self.slack_runs[run_id]
+            for run_id in self.slack_run_ids_by_project.get(project_id, [])
+            if status_values is None
+            or getattr(self.slack_runs[run_id].status, "value", self.slack_runs[run_id].status)
+            in status_values
+        ]
+        rows.sort(key=lambda row: (row.started_at, row.run_id), reverse=True)
+        if limit is not None:
+            return rows[:limit]
+        return rows
+
+    def create_slack_outbox_messages(
+        self,
+        project_id: str,
+        messages: list[SlackOutboxMessageCommand],
+    ) -> dict[str, list[str]]:
+        self.get_project(project_id)
+        created_ids: list[str] = []
+        matched_ids: list[str] = []
+        skipped_ids: list[str] = []
+        for message in messages:
+            if message.resource_id is not None:
+                self._get_resource(project_id, message.resource_id)
+            dedupe_key = (project_id, message.slack_user_id, message.content_hash)
+            existing_id = self.slack_outbox_dedupe.get(dedupe_key)
+            if existing_id is not None:
+                matched_ids.append(existing_id)
+                skipped_ids.append(existing_id)
+                continue
+            outbox_id = new_id()
+            record = SlackOutboxRecord(
+                outbox_id=outbox_id,
+                project_id=project_id,
+                status=message.status,
+                resource_id=message.resource_id,
+                slack_user_id=message.slack_user_id,
+                body=message.body,
+                generated_body=message.generated_body or message.body,
+                content_hash=message.content_hash,
+                run_id=message.run_id,
+                created_at=message.created_at,
+                updated_at=message.created_at,
+            )
+            self.slack_outbox[outbox_id] = record
+            self.slack_outbox_ids_by_project[project_id].append(outbox_id)
+            self.slack_outbox_dedupe[dedupe_key] = outbox_id
+            created_ids.append(outbox_id)
+        return {
+            "created_outbox_ids": created_ids,
+            "matched_outbox_ids": matched_ids,
+            "skipped_outbox_ids": skipped_ids,
+        }
+
+    def mark_slack_outbox_sent(
+        self,
+        project_id: str,
+        outbox_id: str,
+        sent_at: dt.datetime,
+        slack_channel_id: str,
+        slack_message_ts: str,
+        run_id: str | None = None,
+    ) -> SlackOutboxRecord:
+        record = self._get_slack_outbox(project_id, outbox_id)
+        updated = record.model_copy(
+            update={
+                "status": SlackOutboxStatus.SENT,
+                "sent_at": sent_at,
+                "failed_at": None,
+                "slack_channel_id": slack_channel_id,
+                "slack_message_ts": slack_message_ts,
+                "error_text": None,
+                "run_id": run_id or record.run_id,
+                "updated_at": sent_at,
+            },
+        )
+        self.slack_outbox[outbox_id] = updated
+        return updated
+
+    def mark_slack_outbox_failed(
+        self,
+        project_id: str,
+        outbox_id: str,
+        failed_at: dt.datetime,
+        error_text: str,
+        run_id: str | None = None,
+    ) -> SlackOutboxRecord:
+        record = self._get_slack_outbox(project_id, outbox_id)
+        updated = record.model_copy(
+            update={
+                "status": SlackOutboxStatus.FAILED,
+                "failed_at": failed_at,
+                "error_text": error_text,
+                "run_id": run_id or record.run_id,
+                "updated_at": failed_at,
+            },
+        )
+        self.slack_outbox[outbox_id] = updated
+        return updated
+
+    def update_slack_outbox_body(
+        self,
+        project_id: str,
+        outbox_id: str,
+        body: str,
+        updated_at: dt.datetime,
+        run_id: str | None = None,
+    ) -> SlackOutboxRecord:
+        record = self._get_slack_outbox(project_id, outbox_id)
+        if record.status != SlackOutboxStatus.DRAFT:
+            raise ServiceValidationError(
+                code="slack_outbox_not_editable",
+                message="Only draft Slack outbox rows can be edited.",
+                entity_id=outbox_id,
+            )
+        updated = record.model_copy(
+            update={
+                "body": body,
+                "edited_at": updated_at,
+                "updated_at": updated_at,
+                "run_id": run_id or record.run_id,
+            },
+        )
+        self.slack_outbox[outbox_id] = updated
+        return updated
+
+    def mark_slack_outbox_skipped(
+        self,
+        project_id: str,
+        outbox_id: str,
+        skipped_at: dt.datetime,
+        reason: str | None = None,
+        run_id: str | None = None,
+    ) -> SlackOutboxRecord:
+        record = self._get_slack_outbox(project_id, outbox_id)
+        updated = record.model_copy(
+            update={
+                "status": SlackOutboxStatus.SKIPPED,
+                "skipped_at": skipped_at,
+                "skip_reason": reason,
+                "failed_at": None,
+                "error_text": None,
+                "run_id": run_id or record.run_id,
+                "updated_at": skipped_at,
+            },
+        )
+        self.slack_outbox[outbox_id] = updated
+        return updated
+
+    def list_slack_outbox(
+        self,
+        project_id: str,
+        statuses: list[SlackOutboxStatus],
+        limit: int | None = None,
+    ) -> list[SlackOutboxRecord]:
+        self.get_project(project_id)
+        status_values = {getattr(status, "value", status) for status in statuses}
+        rows = [
+            self.slack_outbox[outbox_id]
+            for outbox_id in self.slack_outbox_ids_by_project.get(project_id, [])
+            if self.slack_outbox[outbox_id].status.value in status_values
+        ]
+        rows.sort(key=lambda row: (row.created_at, row.outbox_id))
+        if limit is not None:
+            return rows[:limit]
+        return rows
 
     def deactivate_role(
         self,
@@ -1364,6 +1971,7 @@ class InMemoryProjectRepository:
                 delay_after_dependencies_business_days=0,
                 required_roles={},
                 role_requirements=child.role_requirements,
+                staked_resource_ids=[],
                 assumption_note=None,
             )
             self.processes[process.process_id] = process.model_copy(
@@ -1594,6 +2202,7 @@ class InMemoryProjectRepository:
             delay_after_dependencies_business_days=0,
             required_roles=required_roles,
             role_requirements=role_requirements,
+            staked_resource_ids=[],
             assumption_note=None,
         )
         replacement = replacement.model_copy(
@@ -1738,6 +2347,17 @@ class InMemoryProjectRepository:
         self.process_alias_sources = other.process_alias_sources
         self.dependency_edge_ids = other.dependency_edge_ids
         self.schedule_snapshots = other.schedule_snapshots
+        self.milestones = other.milestones
+        self.milestone_ids_by_project = other.milestone_ids_by_project
+        self.slack_project_configs = other.slack_project_configs
+        self.slack_resource_mappings = other.slack_resource_mappings
+        self.slack_collection_cursors = other.slack_collection_cursors
+        self.slack_encrypted_tokens = other.slack_encrypted_tokens
+        self.slack_runs = other.slack_runs
+        self.slack_run_ids_by_project = other.slack_run_ids_by_project
+        self.slack_outbox = other.slack_outbox
+        self.slack_outbox_ids_by_project = other.slack_outbox_ids_by_project
+        self.slack_outbox_dedupe = other.slack_outbox_dedupe
 
     def _is_process_active_as_of(
         self,
@@ -2033,6 +2653,22 @@ class InMemoryProjectRepository:
             )
         return process
 
+    def _get_milestone(self, project_id: str, milestone_id: str) -> MilestoneRecord:
+        if milestone_id not in self.milestones:
+            raise ServiceValidationError(
+                code="milestone_not_found",
+                message=f"Milestone {milestone_id!r} does not exist.",
+                entity_id=milestone_id,
+            )
+        milestone = self.milestones[milestone_id]
+        if milestone.project_id != project_id:
+            raise ServiceValidationError(
+                code="cross_project_milestone",
+                message="Milestone does not belong to the requested project.",
+                entity_id=milestone_id,
+            )
+        return milestone
+
     def _get_role(self, project_id: str, role_id: str) -> dict[str, Any]:
         if role_id not in self.roles:
             raise ServiceValidationError(
@@ -2080,6 +2716,46 @@ class InMemoryProjectRepository:
                 entity_id=resource_id,
             )
         return resource
+
+    def _get_slack_outbox(
+        self,
+        project_id: str,
+        outbox_id: str,
+    ) -> SlackOutboxRecord:
+        if outbox_id not in self.slack_outbox:
+            raise ServiceValidationError(
+                code="slack_outbox_not_found",
+                message=f"Slack outbox row {outbox_id!r} does not exist.",
+                entity_id=outbox_id,
+            )
+        record = self.slack_outbox[outbox_id]
+        if record.project_id != project_id:
+            raise ServiceValidationError(
+                code="cross_project_slack_outbox",
+                message="Slack outbox row does not belong to the requested project.",
+                entity_id=outbox_id,
+            )
+        return record
+
+    def _get_slack_run(
+        self,
+        project_id: str,
+        run_id: str,
+    ) -> SlackRunRecord:
+        if run_id not in self.slack_runs:
+            raise ServiceValidationError(
+                code="slack_run_not_found",
+                message=f"Slack run {run_id!r} does not exist.",
+                entity_id=run_id,
+            )
+        record = self.slack_runs[run_id]
+        if record.project_id != project_id:
+            raise ServiceValidationError(
+                code="cross_project_slack_run",
+                message="Slack run does not belong to the requested project.",
+                entity_id=run_id,
+            )
+        return record
 
     def _active_process_symbols(self, project_id: str) -> dict[str, str]:
         as_of = dt.datetime.max.replace(tzinfo=dt.UTC)
@@ -2162,6 +2838,20 @@ class InMemoryProjectRepository:
                     code="inactive_role",
                     message="Inactive roles cannot be used by new requirements.",
                     entity_id=requirement.role_id,
+                )
+
+    def _validate_staked_resource_ids(
+        self,
+        project_id: str,
+        staked_resource_ids: list[str],
+    ) -> None:
+        for resource_id in staked_resource_ids:
+            resource = self._get_resource(project_id, resource_id)
+            if not resource["active"]:
+                raise ServiceValidationError(
+                    code="inactive_staked_resource",
+                    message="Inactive resources cannot be staked to new process revisions.",
+                    entity_id=resource_id,
                 )
 
     def _validate_resource_assignment(

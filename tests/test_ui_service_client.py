@@ -20,8 +20,8 @@ def test_create_project_service_reuses_single_service_per_database_path(
             return {}
 
     service_client._clear_project_service_cache()
-    monkeypatch.setattr(service_client, "LadybugProjectRepository", FakeRepository)
-    db_path = tmp_path / "shared.lbug"
+    monkeypatch.setattr(service_client, "SQLiteProjectRepository", FakeRepository)
+    db_path = tmp_path / "shared.sqlite"
     try:
         with ThreadPoolExecutor(max_workers=4) as executor:
             services = list(
@@ -34,5 +34,28 @@ def test_create_project_service_reuses_single_service_per_database_path(
         assert len({id(service) for service in services}) == 1
         assert FakeRepository.constructed == 1
         assert services[0]._repository.db_path == str(db_path.resolve())
+    finally:
+        service_client._clear_project_service_cache()
+
+
+def test_create_project_service_uses_sqlite_repository_for_sqlite_paths(
+    monkeypatch,
+    tmp_path,
+):
+    class FakeRepository:
+        def __init__(self, db_path: str) -> None:
+            self.db_path = db_path
+
+        def load_command_replay_cache(self):
+            return {}
+
+    service_client._clear_project_service_cache()
+    monkeypatch.setattr(service_client, "SQLiteProjectRepository", FakeRepository)
+    db_path = tmp_path / "shared.sqlite"
+    try:
+        service = service_client.create_project_service(str(db_path))
+
+        assert isinstance(service._repository, FakeRepository)
+        assert service._repository.db_path == str(db_path.resolve())
     finally:
         service_client._clear_project_service_cache()

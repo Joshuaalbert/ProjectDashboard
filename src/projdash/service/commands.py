@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     AwareDatetime,
@@ -21,6 +21,8 @@ from projdash.service.models import (
     ProcessStatus,
     RoleConflictPolicy,
     RoleRequirementCommand,
+    SlackOutboxMessageCommand,
+    SlackRunStatus,
     StrictModel,
     UpsertResourcePayload,
     validate_iana_timezone,
@@ -133,12 +135,19 @@ class UpsertProcessRevision(CommandModel):
         default_factory=list,
         exclude_if=lambda value: not value,
     )
+    staked_resource_ids: list[str] = Field(default_factory=list)
     assumption_note: str | None = None
 
     @field_validator("dependencies")
     @classmethod
     def _deduplicate_dependencies(cls, value: list[str]) -> list[str]:
         validate_unique_non_empty(value, "dependencies")
+        return list(dict.fromkeys(value))
+
+    @field_validator("staked_resource_ids")
+    @classmethod
+    def _deduplicate_staked_resource_ids(cls, value: list[str]) -> list[str]:
+        validate_unique_non_empty(value, "staked_resource_ids")
         return list(dict.fromkeys(value))
 
 
@@ -196,12 +205,49 @@ class CommitProjectState(CommandModel):
     project_id: str = Field(min_length=1)
     committed_at: AwareDatetime
     terminal_process_symbols: list[str] = Field(default_factory=list)
+    milestone_id: str | None = Field(default=None, min_length=1)
     note: str | None = None
 
     @field_validator("terminal_process_symbols")
     @classmethod
     def _validate_terminal_symbols(cls, value: list[str]) -> list[str]:
         return validate_unique_non_empty(value, "terminal_process_symbols")
+
+    @model_validator(mode="after")
+    def _validate_milestone_or_terminal_symbols(self) -> CommitProjectState:
+        if self.milestone_id is not None and self.terminal_process_symbols:
+            raise ValueError(
+                "milestone_id and terminal_process_symbols are mutually exclusive."
+            )
+        return self
+
+
+class UpsertMilestone(CommandModel):
+    """Create or update a named milestone process subset."""
+
+    action: Literal["upsert_milestone"] = "upsert_milestone"
+    project_id: str = Field(min_length=1)
+    milestone_id: str | None = Field(default=None, min_length=1)
+    name: str = Field(min_length=1)
+    description: str = ""
+    process_symbols: list[str] = Field(min_length=1)
+    active: bool = True
+    edit_at: AwareDatetime
+
+    @field_validator("process_symbols")
+    @classmethod
+    def _validate_process_symbols(cls, value: list[str]) -> list[str]:
+        return validate_unique_non_empty(value, "process_symbols")
+
+
+class SetMilestoneActive(CommandModel):
+    """Activate or deactivate a milestone."""
+
+    action: Literal["set_milestone_active"] = "set_milestone_active"
+    project_id: str = Field(min_length=1)
+    milestone_id: str = Field(min_length=1)
+    active: bool
+    edit_at: AwareDatetime
 
 
 class ResolveBlocker(CommandModel):
@@ -362,6 +408,169 @@ class SetResourceCalendar(CommandModel):
     project_id: str = Field(min_length=1)
     resource_id: str = Field(min_length=1)
     calendar_id: str = Field(min_length=1)
+
+
+class UpsertSlackProjectConfig(CommandModel):
+    """Create or update optional Slack integration settings for a project."""
+
+    action: Literal["upsert_slack_project_config"] = "upsert_slack_project_config"
+    project_id: str = Field(min_length=1)
+    enabled: bool = False
+    workspace_id: str | None = Field(default=None, min_length=1)
+    workspace_name: str | None = Field(default=None, min_length=1)
+    bot_token_secret_ref: str | None = Field(default=None, min_length=1)
+    signing_secret_ref: str | None = Field(default=None, min_length=1)
+    default_channel_id: str | None = Field(default=None, min_length=1)
+    updated_at: AwareDatetime
+
+
+class UpdateSlackContinuityNote(CommandModel):
+    """Persist the PM handoff note for the next Slack run."""
+
+    action: Literal["update_slack_continuity_note"] = "update_slack_continuity_note"
+    project_id: str = Field(min_length=1)
+    continuity_note: str = Field(min_length=1)
+    updated_at: AwareDatetime
+
+
+class SetResourceSlackUser(CommandModel):
+    """Set or clear a project resource's Slack user mapping."""
+
+    action: Literal["set_resource_slack_user"] = "set_resource_slack_user"
+    project_id: str = Field(min_length=1)
+    resource_id: str = Field(min_length=1)
+    slack_user_id: str | None = Field(default=None, min_length=1)
+    display_name: str | None = Field(default=None, min_length=1)
+    active: bool = True
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _validate_active_mapping(self) -> SetResourceSlackUser:
+        if self.active and self.slack_user_id is None:
+            raise ValueError("slack_user_id is required when active is true.")
+        return self
+
+
+class RecordSlackCollectionCursor(CommandModel):
+    """Record a Slack collection checkpoint for one conversation."""
+
+    action: Literal["record_slack_collection_cursor"] = (
+        "record_slack_collection_cursor"
+    )
+    project_id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1)
+    conversation_type: str = Field(min_length=1)
+    conversation_name: str | None = Field(default=None, min_length=1)
+    latest_collected_ts: str | None = Field(default=None, min_length=1)
+    last_run_id: str | None = Field(default=None, min_length=1)
+    last_run_status: str | None = Field(default=None, min_length=1)
+    updated_at: AwareDatetime
+    rate_limited_until_at: AwareDatetime | None = None
+
+
+class StoreSlackBotToken(CommandModel):
+    """Store an already encrypted UI-managed Slack bot token blob."""
+
+    action: Literal["store_slack_bot_token"] = "store_slack_bot_token"
+    project_id: str = Field(min_length=1)
+    ciphertext: str = Field(min_length=1)
+    kdf: str = Field(min_length=1)
+    kdf_salt: str = Field(min_length=1)
+    kdf_iterations: int = Field(gt=0)
+    cipher: str = Field(min_length=1)
+    updated_at: AwareDatetime
+
+
+class ClearSlackBotToken(CommandModel):
+    """Remove the encrypted UI-managed Slack bot token blob for a project."""
+
+    action: Literal["clear_slack_bot_token"] = "clear_slack_bot_token"
+    project_id: str = Field(min_length=1)
+    cleared_at: AwareDatetime
+
+
+class StartSlackRun(CommandModel):
+    """Start or claim one active Slack background run for a project."""
+
+    action: Literal["start_slack_run"] = "start_slack_run"
+    project_id: str = Field(min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
+    trigger: str = Field(default="ui", min_length=1)
+    codex_model: str | None = Field(default=None, min_length=1)
+    started_at: AwareDatetime
+
+
+class FinishSlackRun(CommandModel):
+    """Finish a Slack background run with a terminal status."""
+
+    action: Literal["finish_slack_run"] = "finish_slack_run"
+    project_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    status: SlackRunStatus
+    finished_at: AwareDatetime
+    collected_message_count: int = Field(default=0, ge=0)
+    draft_outbox_ids: list[str] = Field(default_factory=list)
+    result_json: dict[str, Any] | None = None
+    error_text: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_terminal_status(self) -> FinishSlackRun:
+        if self.status.is_active:
+            raise ValueError("status must be a terminal Slack run status.")
+        return self
+
+
+class CreateSlackOutboxMessages(CommandModel):
+    """Create deduplicated Slack outbox messages for a project."""
+
+    action: Literal["create_slack_outbox_messages"] = "create_slack_outbox_messages"
+    project_id: str = Field(min_length=1)
+    messages: list[SlackOutboxMessageCommand] = Field(min_length=1)
+
+
+class MarkSlackOutboxSent(CommandModel):
+    """Mark a Slack outbox message delivered."""
+
+    action: Literal["mark_slack_outbox_sent"] = "mark_slack_outbox_sent"
+    project_id: str = Field(min_length=1)
+    outbox_id: str = Field(min_length=1)
+    sent_at: AwareDatetime
+    slack_channel_id: str = Field(min_length=1)
+    slack_message_ts: str = Field(min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
+
+
+class MarkSlackOutboxFailed(CommandModel):
+    """Mark a Slack outbox message failed."""
+
+    action: Literal["mark_slack_outbox_failed"] = "mark_slack_outbox_failed"
+    project_id: str = Field(min_length=1)
+    outbox_id: str = Field(min_length=1)
+    failed_at: AwareDatetime
+    error_text: str = Field(min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
+
+
+class UpdateSlackOutboxBody(CommandModel):
+    """Update an editable draft Slack outbox message body."""
+
+    action: Literal["update_slack_outbox_body"] = "update_slack_outbox_body"
+    project_id: str = Field(min_length=1)
+    outbox_id: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    updated_at: AwareDatetime
+    run_id: str | None = Field(default=None, min_length=1)
+
+
+class MarkSlackOutboxSkipped(CommandModel):
+    """Mark a Slack outbox draft skipped without sending it."""
+
+    action: Literal["mark_slack_outbox_skipped"] = "mark_slack_outbox_skipped"
+    project_id: str = Field(min_length=1)
+    outbox_id: str = Field(min_length=1)
+    skipped_at: AwareDatetime
+    reason: str | None = Field(default=None, min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
 
 
 class BatchOperationModel(StrictModel):
@@ -669,6 +878,8 @@ Command = Annotated[
     | UpsertProcessRevision
     | SetProcessStatus
     | CommitProjectState
+    | UpsertMilestone
+    | SetMilestoneActive
     | AddBlocker
     | ResolveBlocker
     | ReopenBlocker
@@ -687,7 +898,20 @@ Command = Annotated[
     | UpsertResource
     | SetResourceActive
     | SetResourceRoles
-    | SetResourceCalendar,
+    | SetResourceCalendar
+    | UpsertSlackProjectConfig
+    | UpdateSlackContinuityNote
+    | SetResourceSlackUser
+    | RecordSlackCollectionCursor
+    | StoreSlackBotToken
+    | ClearSlackBotToken
+    | StartSlackRun
+    | FinishSlackRun
+    | CreateSlackOutboxMessages
+    | MarkSlackOutboxSent
+    | MarkSlackOutboxFailed
+    | UpdateSlackOutboxBody
+    | MarkSlackOutboxSkipped,
     Field(discriminator="action"),
 ]
 

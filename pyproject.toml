@@ -14,6 +14,8 @@ dependencies = [
     "numpy",
     "pydantic>=2",
     "real_ladybug",
+    "slack_sdk",
+    "cryptography",
     "streamlit",
 ]
 

@@ -95,6 +95,83 @@ def test_upsert_process_revision_respects_process_symbol_identity():
     assert graph["nodes"][0]["description"] == "Updated definition of design completion"
 
 
+def test_staked_resource_ids_pin_resource_schedule_allocation():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    role_id = _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": "role-engineer",
+            "name": "Engineer",
+        },
+    )["role_id"]
+    calendar_id = _handle(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-utc",
+            "name": "UTC Weekdays",
+            "timezone": "UTC",
+            "weekly_windows": _weekday_windows(),
+        },
+    )["calendar_id"]
+    for resource_id, name in (
+        ("resource-ada", "Ada"),
+        ("resource-grace", "Grace"),
+    ):
+        _handle(
+            service,
+            {
+                "action": "upsert_resource",
+                "project_id": project_id,
+                "resource_id": resource_id,
+                "name": name,
+                "role_ids": [role_id],
+                "calendar_id": calendar_id,
+                "available_from_at": _iso(13, 9),
+                "cost_rate": "100",
+                "cost_unit": "hour",
+            },
+        )
+    _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-build",
+            "name": "Build",
+            "effective_at": _iso(13, 9),
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-build",
+                    "role_id": role_id,
+                    "effort_hours": 8,
+                }
+            ],
+            "staked_resource_ids": ["resource-grace"],
+        },
+    )
+
+    schedule = _query(
+        service,
+        {
+            "action": "query_resource_schedule",
+            "project_id": project_id,
+            "as_of": _iso(13, 9),
+            "now": _iso(13, 9),
+            "include_allocation_slices": True,
+        },
+    )
+
+    assert {
+        slice_["resource_id"] for slice_ in schedule["allocation_slices"]
+    } == {"resource-grace"}
+
+
 def test_upsert_process_revision_auto_generates_unique_symbol_from_name():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)

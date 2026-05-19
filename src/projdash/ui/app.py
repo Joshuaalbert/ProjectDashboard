@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import importlib
+import inspect
 import json
 import os
+import re
+import subprocess
+import threading
+import uuid
+from collections.abc import Iterable
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -56,8 +63,76 @@ from projdash.ui.service_client import (
 
 
 @st.cache_resource(show_spinner=False)
-def _service(db_path: str):
-    return create_project_service(db_path)
+def _service(db_path: str, storage: str):
+    return create_project_service(db_path, storage=storage)
+
+
+_SLACK_RUN_JOBS: dict[str, dict[str, Any]] = {}
+_SLACK_RUN_JOBS_LOCK = threading.Lock()
+_SERVICE_ACCESS_LOCK = threading.RLock()
+_MAIN_SECTIONS = [
+    "Dashboard",
+    "Project",
+    "Context",
+    "Processes",
+    "Graph",
+    "Blockers",
+    "Resources",
+    "Slack",
+    "Schedule",
+    "Slippage",
+    "Costs",
+    "History",
+    "Topology",
+]
+_MAIN_SECTION_STATE_KEY = "projdash_previous_main_section"
+_SLACK_ACTION_PASSPHRASE_PREFIX = "slack_action_passphrase_"
+
+
+def _remember_main_section_and_clear_slack_action_passphrases(
+    selected_section: str,
+) -> None:
+    previous_section = st.session_state.get(_MAIN_SECTION_STATE_KEY)
+    for key in _slack_action_passphrase_keys_to_clear(
+        previous_section,
+        selected_section,
+        st.session_state.keys(),
+    ):
+        _clear_session_keys(key)
+    st.session_state[_MAIN_SECTION_STATE_KEY] = selected_section
+
+
+def _slack_action_passphrase_keys_to_clear(
+    previous_section: Any,
+    selected_section: str,
+    session_keys: Iterable[Any],
+) -> list[str]:
+    if previous_section != "Slack" or selected_section == "Slack":
+        return []
+    return [
+        key
+        for key in session_keys
+        if isinstance(key, str) and key.startswith(_SLACK_ACTION_PASSPHRASE_PREFIX)
+    ]
+
+
+class _LockedProjectService:
+    """Serialize background worker access to the cached in-process service."""
+
+    def __init__(self, service) -> None:
+        self._service = service
+
+    def handle_query(self, envelope):
+        with _SERVICE_ACCESS_LOCK:
+            return self._service.handle_query(envelope)
+
+    def handle_command(self, envelope):
+        with _SERVICE_ACCESS_LOCK:
+            return self._service.handle_command(envelope)
+
+    def handle_batch(self, envelope):
+        with _SERVICE_ACCESS_LOCK:
+            return self._service.handle_batch(envelope)
 
 
 def main() -> None:
@@ -65,8 +140,9 @@ def main() -> None:
     st.set_page_config(page_title="ProjectDashboard", layout="wide")
     st.title("ProjectDashboard")
 
-    db_path = os.environ.get("PROJDASH_DB_PATH", "projdash.lbug")
-    service = _service(db_path)
+    db_path = os.environ.get("PROJDASH_DB_PATH", "projdash.sqlite")
+    storage = os.environ.get("PROJDASH_STORAGE", "auto")
+    service = _service(db_path, storage)
     projects_data = _query(
         service,
         {"action": "query_projects"},
@@ -84,45 +160,40 @@ def main() -> None:
         _render_first_run(service, controls)
         return
 
-    tabs = st.tabs(
-        [
-            "Dashboard",
-            "Project",
-            "Context",
-            "Processes",
-            "Graph",
-            "Blockers",
-            "Resources",
-            "Schedule",
-            "Slippage",
-            "Costs",
-            "History",
-            "Topology",
-        ]
+    selected_section = st.radio(
+        "Section",
+        _MAIN_SECTIONS,
+        horizontal=True,
+        key="main_section",
+        label_visibility="collapsed",
     )
-    with tabs[0]:
-        _render_dashboard(controls, context)
-    with tabs[1]:
+    _remember_main_section_and_clear_slack_action_passphrases(selected_section)
+    _prepare_context_for_section(service, controls, context, selected_section)
+    if selected_section == "Dashboard":
+        _render_dashboard(service, controls, context)
+    elif selected_section == "Project":
         _render_project_settings(service, controls, context)
-    with tabs[2]:
-        _render_context_summary(controls, context)
-    with tabs[3]:
+    elif selected_section == "Context":
+        _render_context_summary(service, controls, context)
+    elif selected_section == "Processes":
         _render_processes(service, controls, context)
-    with tabs[4]:
-        _render_graph(context)
-    with tabs[5]:
-        _render_blockers(controls, context)
-    with tabs[6]:
+    elif selected_section == "Graph":
+        _render_graph(service, controls, context)
+    elif selected_section == "Blockers":
+        _render_blockers(service, controls, context)
+    elif selected_section == "Resources":
         _render_resources(service, controls, context)
-    with tabs[7]:
+    elif selected_section == "Slack":
+        _render_slack(service, controls, context, db_path)
+    elif selected_section == "Schedule":
         _render_schedule(service, controls, context)
-    with tabs[8]:
+    elif selected_section == "Slippage":
         _render_slippage(service, controls, context)
-    with tabs[9]:
-        _render_costs(controls, context)
-    with tabs[10]:
-        _render_history(controls, context)
-    with tabs[11]:
+    elif selected_section == "Costs":
+        _render_costs(service, controls, context)
+    elif selected_section == "History":
+        _render_history(service, controls, context)
+    elif selected_section == "Topology":
         _render_topology(service, controls, context)
 
 
@@ -137,7 +208,7 @@ def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, A
         "Service database",
         db_path,
         disabled=True,
-        help="Durable LadybugDB file used by the service.",
+        help="Durable service database file.",
     )
     options = project_options(projects)
     option_ids = [option.project_id for option in options]
@@ -381,6 +452,7 @@ def _render_first_run(service, controls: dict[str, Any]) -> None:
 
 
 def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
+    """Load only cheap project-wide data required before section rendering."""
     project_id = controls["project_id"]
     base = {
         "project": _query(
@@ -404,13 +476,82 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
     }
     if base["project"] is None:
         return base
-    base["catalog"] = _query(
+    return base
+
+
+def _prepare_context_for_section(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+    section: str,
+) -> dict[str, Any]:
+    """Populate the data required by one active UI section."""
+    if section == "Dashboard":
+        _ensure_catalog(service, controls, context)
+        _ensure_blockers(service, controls, context)
+    elif section == "Context":
+        _ensure_catalog(service, controls, context)
+        _ensure_agent_context(service, controls, context)
+    elif section == "Processes":
+        _ensure_catalog(service, controls, context)
+        _ensure_graph_context(service, controls, context)
+        _ensure_blockers(service, controls, context)
+    elif section == "Graph":
+        _ensure_graph_context(service, controls, context)
+    elif section == "Blockers":
+        _ensure_graph_context(service, controls, context)
+        _ensure_blockers(service, controls, context)
+    elif section == "Resources":
+        _ensure_catalog(service, controls, context)
+        _ensure_resource_schedule(service, controls, context)
+        _ensure_utilization(service, controls, context)
+    elif section == "Slack":
+        _ensure_catalog(service, controls, context)
+    elif section == "Schedule":
+        _ensure_catalog(service, controls, context)
+        _ensure_graph_context(service, controls, context)
+        _ensure_resource_schedule(service, controls, context)
+        _ensure_blockers(service, controls, context)
+    elif section == "Slippage":
+        _ensure_catalog(service, controls, context)
+        _ensure_graph_context(service, controls, context)
+    elif section == "Costs":
+        _ensure_costs(service, controls, context)
+        _ensure_utilization(service, controls, context)
+    elif section == "History":
+        _ensure_blockers(service, controls, context)
+    elif section == "Topology":
+        _ensure_catalog(service, controls, context)
+        _ensure_graph_context(service, controls, context)
+    return context
+
+
+def _ensure_catalog(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("catalog") is not None:
+        return context["catalog"]
+    context["catalog"] = _query(
         service,
         {
             "action": "query_project_catalog",
-            "project_id": project_id,
+            "project_id": controls["project_id"],
         },
     )
+    return context["catalog"] or {}
+
+
+def _ensure_graph_context(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("full_graph") is not None and context.get("graph") is not None:
+        return context
+
+    project_id = controls["project_id"]
     dependency_graph = _query(
         service,
         {
@@ -422,17 +563,17 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "include_allocation_slices": True,
         },
     )
-    base["full_graph"] = dependency_graph
+    context["full_graph"] = dependency_graph
     terminal_symbols = _valid_process_symbols(
         st.session_state.get("terminal_process_symbols", []),
         dependency_graph or {},
     )
     scope = _terminal_scope(terminal_symbols)
-    base["scope"] = scope
-    base["terminal_symbols"] = terminal_symbols
+    context["scope"] = scope
+    context["terminal_symbols"] = terminal_symbols
     scoped_query = {"scope": scope} if scope else {}
     if scoped_query:
-        base["graph"] = _query(
+        context["graph"] = _query(
             service,
             {
                 "action": "query_process_graph",
@@ -445,32 +586,137 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             },
         )
     else:
-        base["graph"] = dependency_graph
-    base["blockers"] = _query(
+        context["graph"] = dependency_graph
+    return context
+
+
+def _ensure_blockers(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("blockers") is not None:
+        return context["blockers"]
+    context["blockers"] = _query(
         service,
         {
             "action": "query_blockers",
-            "project_id": project_id,
+            "project_id": controls["project_id"],
             "as_of": controls["as_of"],
             "include_resolved": True,
         },
     )
-    base["schedule_snapshots"] = _query(
-        service,
-        {
-            "action": "query_schedule_snapshots",
-            "project_id": project_id,
-            "as_of": controls["as_of"],
-            "terminal_process_symbols": terminal_symbols,
-        },
-    )
-    resource_query = {
-        "project_id": project_id,
+    return context["blockers"] or {}
+
+
+def _resource_scope_query(
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    terminal_symbols = _context_terminal_symbols(context)
+    scope = _terminal_scope(terminal_symbols)
+    context["scope"] = scope
+    context["terminal_symbols"] = terminal_symbols
+    scoped_query = {"scope": scope} if scope else {}
+    return {
+        "project_id": controls["project_id"],
         "as_of": controls["as_of"],
         "now": controls["now"],
         **scoped_query,
     }
-    base["resource_schedule"] = _query(
+
+
+def _context_terminal_symbols(context: dict[str, Any]) -> list[str]:
+    if context.get("terminal_symbols"):
+        return list(context["terminal_symbols"])
+    if context.get("full_graph"):
+        return _valid_process_symbols(
+            st.session_state.get("terminal_process_symbols", []),
+            context.get("full_graph") or {},
+        )
+    return []
+
+
+def _selected_slippage_milestone(
+    context: dict[str, Any],
+) -> dict[str, Any] | None:
+    milestone_id = st.session_state.get("slippage_milestone_id")
+    if not milestone_id:
+        return None
+    for milestone in (context.get("catalog") or {}).get("milestones", []):
+        if milestone.get("milestone_id") == milestone_id:
+            return milestone
+    return None
+
+
+def _schedule_snapshot_query_payload(
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    milestone = _selected_slippage_milestone(context)
+    if milestone is not None:
+        context["terminal_symbols"] = list(milestone.get("process_symbols") or [])
+        return {
+            "action": "query_schedule_snapshots",
+            "project_id": controls["project_id"],
+            "as_of": controls["as_of"],
+            "milestone_id": milestone["milestone_id"],
+        }
+    terminal_symbols = _context_terminal_symbols(context)
+    context["terminal_symbols"] = terminal_symbols
+    return {
+        "action": "query_schedule_snapshots",
+        "project_id": controls["project_id"],
+        "as_of": controls["as_of"],
+        "terminal_process_symbols": terminal_symbols,
+    }
+
+
+def _commit_project_state_payload(
+    controls: dict[str, Any],
+    *,
+    terminal_symbols: list[str],
+    milestone: dict[str, Any] | None,
+    committed_at: dt.datetime,
+    note: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "action": "commit_project_state",
+        "project_id": controls["project_id"],
+        "committed_at": committed_at,
+        "note": note,
+    }
+    if milestone is not None:
+        payload["milestone_id"] = milestone["milestone_id"]
+    else:
+        payload["terminal_process_symbols"] = terminal_symbols
+    return payload
+
+
+def _ensure_schedule_snapshots(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("schedule_snapshots") is not None:
+        return context["schedule_snapshots"]
+    query_payload = _schedule_snapshot_query_payload(controls, context)
+    context["schedule_snapshots"] = _query(
+        service,
+        query_payload,
+    )
+    return context["schedule_snapshots"] or {}
+
+
+def _ensure_resource_schedule(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("resource_schedule") is not None:
+        return context["resource_schedule"]
+    resource_query = _resource_scope_query(controls, context)
+    context["resource_schedule"] = _query(
         service,
         {
             "action": "query_resource_schedule",
@@ -478,30 +724,54 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "include_allocation_slices": True,
         },
     )
-    schedule_data = base.get("resource_schedule") or {}
-    schedule_starts_at, schedule_ends_at = _allocation_slice_span(
-        schedule_data.get("allocation_slices", []),
-    )
-    if schedule_starts_at and schedule_ends_at:
-        base["capacity"] = _query(
-            service,
-            {
-                "action": "query_resource_capacity",
-                "project_id": project_id,
-                "as_of": controls["as_of"],
-                "horizon_starts_at": schedule_starts_at,
-                "horizon_ends_at": schedule_ends_at,
-            },
-        )
-    base["utilization"] = _query(
+    return context["resource_schedule"] or {}
+
+
+def _ensure_utilization(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("utilization") is not None:
+        return context["utilization"]
+    resource_query = _resource_scope_query(controls, context)
+    context["utilization"] = _query(
         service,
         {"action": "query_utilization", **resource_query},
     )
-    base["costs"] = _query(
+    return context["utilization"] or {}
+
+
+def _ensure_costs(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("costs") is not None:
+        return context["costs"]
+    resource_query = _resource_scope_query(controls, context)
+    context["costs"] = _query(
         service,
         {"action": "query_costs", **resource_query},
     )
-    base["agent_context"] = _query(
+    return context["costs"] or {}
+
+
+def _ensure_agent_context(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if context.get("agent_context") is not None:
+        return context["agent_context"]
+    terminal_symbols = _context_terminal_symbols(context)
+    resource_query = {
+        "project_id": controls["project_id"],
+        "as_of": controls["as_of"],
+        "now": controls["now"],
+    }
+    context["terminal_symbols"] = terminal_symbols
+    context["agent_context"] = _query(
         service,
         {
             "action": "query_agent_context",
@@ -510,15 +780,17 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
             "snapshot_limit": 5,
         },
     )
-    return base
+    return context["agent_context"] or {}
 
 
-def _render_dashboard(controls: dict[str, Any], context: dict[str, Any]) -> None:
+def _render_dashboard(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> None:
     project = context["project"]["project"]
-    graph = context.get("graph") or {}
-    blockers = context.get("blockers") or {}
-    costs = context.get("costs") or {}
-    nodes = graph.get("nodes", [])
+    catalog = _ensure_catalog(service, controls, context)
+    blockers = _ensure_blockers(service, controls, context)
     unresolved = [
         blocker
         for blocker in blockers.get("blockers", [])
@@ -526,15 +798,16 @@ def _render_dashboard(controls: dict[str, Any], context: dict[str, Any]) -> None
     ]
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Project", project["name"])
-    col2.metric("Processes", len(nodes))
-    col3.metric("Open blockers", len(unresolved))
-    col4.metric("Total cost", costs.get("total_cost", "0"))
-    st.dataframe(
-        format_display_datetimes(process_table_rows(graph), controls["timezone"]),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.metric("Schedule basis", graph.get("schedule_basis", "-"))
+    col2.metric("Roles", len(catalog.get("roles", [])))
+    col3.metric("Resources", len(catalog.get("resources", [])))
+    col4.metric("Open blockers", len(unresolved))
+    if unresolved:
+        st.subheader("Open blockers")
+        st.dataframe(
+            format_display_datetimes(unresolved, controls["timezone"]),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def _render_project_settings(
@@ -606,9 +879,12 @@ def _render_project_settings(
 
 
 def _render_context_summary(
+    service,
     controls: dict[str, Any],
     context: dict[str, Any],
 ) -> None:
+    _ensure_catalog(service, controls, context)
+    _ensure_agent_context(service, controls, context)
     markdown = _project_context_markdown(controls, context)
     st.markdown(markdown)
     st.text_area(
@@ -901,6 +1177,9 @@ def _render_process_table(
 
 
 def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    _ensure_catalog(service, controls, context)
+    _ensure_graph_context(service, controls, context)
+    _ensure_blockers(service, controls, context)
     graph = context.get("full_graph") or context.get("graph") or {}
     catalog = catalog_from_query_data(
         context.get("catalog"),
@@ -928,6 +1207,12 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
         id_by_symbol,
         node_by_symbol,
         selected_symbols,
+    )
+    _render_milestone_menu(
+        service,
+        controls,
+        catalog["process_symbols"],
+        context.get("catalog", {}).get("milestones", []),
     )
 
 
@@ -1280,11 +1565,17 @@ def _render_modify_process_menu(
                         if pred in id_by_symbol
                     ],
                     "earliest_start_at": earliest_start_at,
+                    "start_at_earliest": bool(node.get("start_at_earliest", False)),
+                    "delay_after_dependencies_business_days": int(
+                        node.get("delay_after_dependencies_business_days") or 0
+                    ),
                     "role_requirements": (
                         role_requirements_by_symbol.get(symbol, [])
                         if update_roles
                         else current_role_requirements
                     ),
+                    "staked_resource_ids": node.get("staked_resource_ids") or [],
+                    "assumption_note": node.get("assumption_note"),
                 }
             )
 
@@ -1339,6 +1630,100 @@ def _render_modify_process_menu(
 
     if commands:
         _apply_batch(service, commands)
+
+
+def _render_milestone_menu(
+    service,
+    controls: dict[str, Any],
+    process_symbols: list[str],
+    milestones: list[dict[str, Any]],
+) -> None:
+    with st.expander("Milestones"):
+        milestone_options = {
+            f"{milestone.get('name') or milestone['milestone_id']} "
+            f"({milestone['milestone_id']})": milestone
+            for milestone in milestones
+            if milestone.get("milestone_id")
+        }
+        selected_label = st.selectbox(
+            "Milestone",
+            ["Create new", *milestone_options],
+            key="process_milestone_selected",
+            help="Named process subsets used for milestone slippage tracking.",
+        )
+        selected = (
+            milestone_options[selected_label]
+            if selected_label in milestone_options
+            else None
+        )
+        selected_id = selected.get("milestone_id") if selected else "new"
+        name = st.text_input(
+            "Milestone name",
+            value=selected.get("name", "") if selected else "",
+            key=f"process_milestone_name_{selected_id}",
+            help="Human-readable milestone name.",
+        )
+        description = st.text_area(
+            "Milestone description",
+            value=selected.get("description", "") if selected else "",
+            key=f"process_milestone_description_{selected_id}",
+            help="Scope or delivery meaning for this milestone.",
+        )
+        default_processes = [
+            symbol
+            for symbol in (selected.get("process_symbols", []) if selected else [])
+            if symbol in process_symbols
+        ]
+        milestone_processes = st.multiselect(
+            "Milestone processes",
+            process_symbols,
+            default=default_processes,
+            key=f"process_milestone_processes_{selected_id}",
+            help="Terminal or checkpoint processes whose slippage defines the milestone.",
+        )
+        active = st.checkbox(
+            "Active",
+            value=bool(selected.get("active", True)) if selected else True,
+            key=f"process_milestone_active_{selected_id}",
+            help="Inactive milestones are hidden from agent context.",
+        )
+        save = st.button(
+            "Save milestone",
+            key=f"process_milestone_save_{selected_id}",
+        )
+        deactivate = (
+            st.button(
+                "Deactivate milestone",
+                key=f"process_milestone_deactivate_{selected_id}",
+            )
+            if selected and selected.get("active", True)
+            else False
+        )
+
+    if save and name and milestone_processes:
+        payload = {
+            "action": "upsert_milestone",
+            "project_id": controls["project_id"],
+            "name": name,
+            "description": description,
+            "process_symbols": milestone_processes,
+            "active": active,
+            "edit_at": controls["as_of"],
+        }
+        if selected:
+            payload["milestone_id"] = selected["milestone_id"]
+        _apply_command(service, payload)
+    if deactivate and selected:
+        _apply_command(
+            service,
+            {
+                "action": "set_milestone_active",
+                "project_id": controls["project_id"],
+                "milestone_id": selected["milestone_id"],
+                "active": False,
+                "edit_at": controls["as_of"],
+            },
+        )
 
 
 def _sync_selected_process_widget(
@@ -1596,7 +1981,12 @@ def _clear_widget_prefix(prefix: str) -> None:
             del st.session_state[key]
 
 
-def _render_graph(context: dict[str, Any]) -> None:
+def _render_graph(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+) -> None:
+    _ensure_graph_context(service, controls, context)
     graph = context.get("graph") or {}
     collapsed = set(st.session_state.get("collapsed_process_ids", []))
     if graph.get("nodes"):
@@ -1607,8 +1997,9 @@ def _render_graph(context: dict[str, Any]) -> None:
     st.dataframe(edge_table_rows(graph), use_container_width=True, hide_index=True)
 
 
-def _render_blockers(controls: dict[str, Any], context: dict[str, Any]) -> None:
-    blockers = context.get("blockers") or {}
+def _render_blockers(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    blockers = _ensure_blockers(service, controls, context)
+    _ensure_graph_context(service, controls, context)
     graph = context.get("full_graph") or context.get("graph") or {}
     schedule = (
         graph
@@ -1631,31 +2022,146 @@ def _render_blockers(controls: dict[str, Any], context: dict[str, Any]) -> None:
     if not rows:
         st.write("No blockers recorded.")
         return
-    display_columns = [
-        "blocker_status",
-        "severity",
-        "priority",
-        "process_symbol",
-        "process_name",
-        "process_status",
-        "computed_status",
-        "role_ids",
-        "resource_ids",
-        "summary",
-        "details",
-        "created_at",
-        "resolved_at",
-        "resolution",
-        "blocker_id",
+    sections = _blocker_sections(rows)
+    _render_blocker_section(
+        service,
+        controls,
+        "Unresolved blockers",
+        sections["unresolved"],
+        empty_text="No unresolved blockers.",
+    )
+    _render_blocker_section(
+        service,
+        controls,
+        "Resolved blockers",
+        sections["resolved"],
+        empty_text="No resolved blockers.",
+    )
+
+
+def _blocker_sections(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    return {
+        "unresolved": [
+            row for row in rows if not row.get("is_resolved_as_of")
+        ],
+        "resolved": [row for row in rows if row.get("is_resolved_as_of")],
+    }
+
+
+def _render_blocker_section(
+    service,
+    controls: dict[str, Any],
+    title: str,
+    rows: list[dict[str, Any]],
+    *,
+    empty_text: str,
+) -> None:
+    st.subheader(title)
+    if not rows:
+        st.write(empty_text)
+        return
+    for row in rows:
+        with st.expander(_blocker_expander_header(row), expanded=False):
+            _render_blocker_expander(service, controls, row)
+
+
+def _blocker_expander_header(row: dict[str, Any]) -> str:
+    status = row.get("blocker_status") or "-"
+    priority = row.get("priority") or "-"
+    symbol = row.get("process_symbol") or row.get("blocker_id") or "-"
+    summary = row.get("summary") or "Untitled blocker"
+    return " | ".join(str(part) for part in (status, priority, symbol, summary) if part)
+
+
+def _render_blocker_expander(
+    service,
+    controls: dict[str, Any],
+    row: dict[str, Any],
+) -> None:
+    st.markdown(_blocker_detail_markdown(row, controls["timezone"]))
+    blocker_id = row.get("blocker_id")
+    if not blocker_id:
+        st.warning("This blocker has no blocker id and cannot be updated.")
+        return
+    is_resolved = bool(row.get("is_resolved_as_of"))
+    key = f"blocker_resolved_{blocker_id}"
+    baseline_key = f"{key}_baseline"
+    if st.session_state.get(baseline_key) != is_resolved:
+        st.session_state[key] = is_resolved
+        st.session_state[baseline_key] = is_resolved
+    resolved_clicked = st.checkbox(
+        "Resolved",
+        value=is_resolved,
+        key=key,
+        help="Check to resolve this blocker now, or uncheck to move it back to unresolved.",
+    )
+    if resolved_clicked and not is_resolved:
+        edit_at = _current_ui_datetime(controls["timezone"])
+        _apply_command(
+            service,
+            {
+                "action": "resolve_blocker",
+                "project_id": controls["project_id"],
+                "blocker_id": blocker_id,
+                "resolved_at": edit_at,
+                "resolution": "Resolved from the blockers tab.",
+            },
+        )
+    if not resolved_clicked and is_resolved:
+        edit_at = _current_ui_datetime(controls["timezone"])
+        _apply_command(
+            service,
+            {
+                "action": "reopen_blocker",
+                "project_id": controls["project_id"],
+                "blocker_id": blocker_id,
+                "edit_at": edit_at,
+                "note": "Reopened from the blockers tab.",
+            },
+        )
+
+
+def _blocker_detail_markdown(row: dict[str, Any], timezone_name: str) -> str:
+    process_symbol = row.get("process_symbol") or "-"
+    process_name = row.get("process_name") or ""
+    process_label = (
+        f"`{process_symbol}` - {process_name}" if process_name else f"`{process_symbol}`"
+    )
+    details = row.get("details") or "No details recorded."
+    lines = [
+        f"- Process: {process_label}",
+        f"- Process status: {_blocker_process_status_text(row)}",
+        f"- Priority: {row.get('priority') or '-'}",
+        f"- Severity: {row.get('severity') or '-'}",
+        f"- Roles: {row.get('role_ids') or '-'}",
+        f"- Resources: {row.get('resource_ids') or '-'}",
+        f"- Created: {_markdown_datetime(row.get('created_at'), timezone_name)}",
+        f"- Details: {details}",
     ]
-    display_rows = [
-        {column: row.get(column) for column in display_columns}
-        for row in format_display_datetimes(rows, controls["timezone"])
-    ]
-    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+    if row.get("resolved_at"):
+        lines.append(f"- Resolved: {_markdown_datetime(row.get('resolved_at'), timezone_name)}")
+    if row.get("resolution"):
+        lines.append(f"- Resolution: {row['resolution']}")
+    lines.append(f"- Blocker id: `{row.get('blocker_id') or '-'}`")
+    return "\n".join(lines)
+
+
+def _blocker_process_status_text(row: dict[str, Any]) -> str:
+    status = row.get("process_status")
+    computed_status = row.get("computed_status")
+    if status and computed_status and status != computed_status:
+        return f"`{status}` (currently `{computed_status}`)"
+    if computed_status:
+        return f"`{computed_status}`"
+    if status:
+        return f"`{status}`"
+    return "-"
 
 
 def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    _ensure_catalog(service, controls, context)
+    _ensure_resource_schedule(service, controls, context)
+    _ensure_utilization(service, controls, context)
     catalog = catalog_from_query_data(
         context.get("catalog"),
         context.get("graph"),
@@ -2305,10 +2811,520 @@ def _resource_payload_with_holidays(
     }
 
 
+def _render_slack(
+    service,
+    controls: dict[str, Any],
+    context: dict[str, Any],
+    db_path: str,
+) -> None:
+    project_id = controls["project_id"]
+    _ensure_catalog(service, controls, context)
+    slack_data = _optional_service_query(
+        service,
+        {"action": "query_slack_project_config", "project_id": project_id},
+    ) or {
+        "project_id": project_id,
+        "config": {},
+        "resource_mappings": [],
+        "collection_cursors": [],
+    }
+    catalog_data = context.get("catalog") or {}
+    resources = sorted(
+        catalog_data.get("resources", []),
+        key=lambda resource: (
+            str(resource.get("name", "")).casefold(),
+            str(resource.get("resource_id", "")),
+        ),
+    )
+
+    st.subheader("Slack")
+    st.caption(
+        "Project-scoped Slack setup, collection, draft review, and delivery."
+    )
+    _render_slack_notice(project_id)
+    _render_slack_manifest_section(project_id, context)
+    _render_slack_settings_section(service, controls, slack_data)
+    _render_slack_token_section(service, controls, slack_data)
+
+    action_passphrase_key = f"slack_action_passphrase_{project_id}"
+    _consume_session_clear(action_passphrase_key)
+    action_passphrase = st.text_input(
+        "Passphrase for Slack actions",
+        type="password",
+        key=action_passphrase_key,
+        help=(
+            "Used only to decrypt the stored Slack bot token for discovery, "
+            "verification, run-once, and sending."
+        ),
+    )
+
+    _render_slack_mapping_section(
+        service,
+        controls,
+        resources,
+        slack_data,
+        action_passphrase,
+    )
+    _render_slack_run_section(
+        service,
+        controls,
+        db_path,
+        slack_data,
+        action_passphrase,
+    )
+    _render_slack_draft_section(
+        service,
+        controls,
+        slack_data,
+        resources,
+        action_passphrase,
+    )
+    _render_slack_history_section(service, controls, resources)
+
+
+def _set_slack_notice(project_id: str, level: str, message: str) -> None:
+    st.session_state[f"slack_notice_{project_id}"] = {
+        "level": level,
+        "message": message,
+    }
+
+
+def _render_slack_notice(project_id: str) -> None:
+    notice = st.session_state.pop(f"slack_notice_{project_id}", None)
+    if not isinstance(notice, dict):
+        return
+    message = str(notice.get("message") or "")
+    if not message:
+        return
+    level = str(notice.get("level") or "info")
+    if level == "success":
+        st.success(message)
+    elif level == "error":
+        st.error(message)
+    elif level == "warning":
+        st.warning(message)
+    else:
+        st.info(message)
+
+
+def _render_slack_manifest_section(project_id: str, context: dict[str, Any]) -> None:
+    project = ((context.get("project") or {}).get("project") or {})
+    default_name = f"{project.get('name') or project_id} Bot"
+    with st.expander("App manifest", expanded=True):
+        name = st.text_input(
+            "Slack app name",
+            default_name,
+            key=f"slack_manifest_name_{project_id}",
+            help="Name used in the generated Slack app manifest.",
+        )
+        manifest_payload = _slack_manifest_payload(project_id, name)
+        st.json(manifest_payload)
+
+
+def _render_slack_settings_section(
+    service,
+    controls: dict[str, Any],
+    slack_data: dict[str, Any],
+) -> None:
+    project_id = controls["project_id"]
+    config = slack_data.get("config") or {}
+    with st.expander("Enable and settings", expanded=True):
+        with st.form(f"slack_settings_{project_id}"):
+            enabled = st.checkbox(
+                "Enable Slack for this project",
+                bool(config.get("enabled", False)),
+            )
+            workspace_id = st.text_input(
+                "Workspace id",
+                config.get("workspace_id") or "",
+                help="Optional Slack workspace/team id.",
+            )
+            workspace_name = st.text_input(
+                "Workspace name",
+                config.get("workspace_name") or "",
+                help="Optional Slack workspace display name.",
+            )
+            default_channel_id = st.text_input(
+                "Default channel id",
+                config.get("default_channel_id") or "",
+                help="Optional channel id to restrict collection to one invited channel.",
+            )
+            save = st.form_submit_button("Save Slack settings")
+        if save:
+            _apply_command(
+                service,
+                {
+                    "action": "upsert_slack_project_config",
+                    "project_id": project_id,
+                    "enabled": enabled,
+                    "workspace_id": workspace_id or None,
+                    "workspace_name": workspace_name or None,
+                    "bot_token_secret_ref": config.get("bot_token_secret_ref"),
+                    "signing_secret_ref": config.get("signing_secret_ref"),
+                    "default_channel_id": default_channel_id or None,
+                    "updated_at": controls["as_of"],
+                },
+            )
+
+
+def _render_slack_token_section(
+    service,
+    controls: dict[str, Any],
+    slack_data: dict[str, Any],
+) -> None:
+    project_id = controls["project_id"]
+    token_present = _slack_has_encrypted_token(slack_data)
+    with st.expander("Encrypted bot token", expanded=not token_present):
+        st.write("Encrypted token stored." if token_present else "No encrypted token stored.")
+        token_key = f"slack_raw_token_{project_id}"
+        passphrase_key = f"slack_store_passphrase_{project_id}"
+        _consume_session_clear(token_key)
+        _consume_session_clear(passphrase_key)
+        with st.form(f"slack_token_store_{project_id}"):
+            raw_token = st.text_input(
+                "Raw bot token",
+                type="password",
+                key=token_key,
+                help="Slack xoxb token. It is encrypted before service storage.",
+            )
+            passphrase = st.text_input(
+                "Token passphrase",
+                type="password",
+                key=passphrase_key,
+                help="Passphrase used to encrypt the token. It is not stored.",
+            )
+            store = st.form_submit_button("Encrypt and store token")
+        if not store:
+            return
+        if not raw_token or not passphrase:
+            _set_slack_notice(project_id, "error", "Both raw token and passphrase are required.")
+            _clear_session_keys(token_key, passphrase_key)
+            st.rerun()
+            return
+        encrypted_token, error = _encrypt_slack_token_for_ui(raw_token, passphrase)
+        if error:
+            _set_slack_notice(project_id, "error", error)
+            _clear_session_keys(token_key, passphrase_key)
+            st.rerun()
+            return
+        result = _optional_service_command(
+            service,
+            {
+                "action": "store_slack_bot_token",
+                "project_id": project_id,
+                **encrypted_token,
+                "updated_at": controls["as_of"],
+            },
+        )
+        if not _service_result_ok(result):
+            result = _optional_service_command(
+                service,
+                {
+                    "action": "store_encrypted_slack_bot_token",
+                    "project_id": project_id,
+                    "encrypted_token": encrypted_token,
+                    "updated_at": controls["as_of"],
+                },
+            )
+        if not _service_result_ok(result):
+            _clear_session_keys(token_key, passphrase_key)
+            _set_slack_notice(
+                project_id,
+                "error",
+                "The encrypted token storage API is not available yet. "
+                "Expected `store_slack_bot_token`.",
+            )
+            st.rerun()
+            return
+        _clear_session_keys(token_key, passphrase_key)
+        _set_slack_notice(project_id, "success", "Encrypted Slack token stored.")
+        st.rerun()
+
+
+def _render_slack_mapping_section(
+    service,
+    controls: dict[str, Any],
+    resources: list[dict[str, Any]],
+    slack_data: dict[str, Any],
+    action_passphrase: str,
+) -> None:
+    project_id = controls["project_id"]
+    users_key = f"slack_users_{project_id}"
+    with st.expander("Users and resource mapping", expanded=True):
+        cols = st.columns(2)
+        if cols[0].button(
+            "Discover Slack users",
+            key=f"slack_discover_users_{project_id}",
+        ):
+            token, error = _decrypt_slack_token_for_ui(
+                service,
+                project_id,
+                slack_data,
+                action_passphrase,
+            )
+            if error:
+                _set_slack_notice(project_id, "error", error)
+            else:
+                users, user_error = _list_slack_users_for_ui(
+                    service,
+                    project_id,
+                    token or "",
+                )
+                if user_error:
+                    _set_slack_notice(project_id, "error", user_error)
+                else:
+                    st.session_state[users_key] = users
+                    _set_slack_notice(
+                        project_id,
+                        "success",
+                        f"Loaded {len(users)} Slack users.",
+                    )
+            st.rerun()
+        if cols[1].button("Verify settings", key=f"slack_verify_{project_id}"):
+            token, error = _decrypt_slack_token_for_ui(
+                service,
+                project_id,
+                slack_data,
+                action_passphrase,
+            )
+            if error:
+                _set_slack_notice(project_id, "error", error)
+            else:
+                ok, message = _verify_slack_settings_for_ui(
+                    service,
+                    project_id,
+                    token or "",
+                )
+                _set_slack_notice(project_id, "success" if ok else "error", message)
+            st.rerun()
+
+        users = st.session_state.get(users_key, [])
+        if not users:
+            st.info("Discover Slack users before editing mappings.")
+            return
+        if not resources:
+            st.warning("Create ProjDash resources before mapping Slack users.")
+            return
+
+        rows = _slack_mapping_rows(
+            slack_users=users,
+            resources=resources,
+            resource_mappings=slack_data.get("resource_mappings") or [],
+        )
+        edited_rows = st.data_editor(
+            rows,
+            key=f"slack_mapping_editor_{project_id}",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "mapped": st.column_config.CheckboxColumn("Mapped"),
+                "slack_name": st.column_config.TextColumn("Slack user", disabled=True),
+                "slack_user_id": st.column_config.TextColumn("Slack id", disabled=True),
+                "resource_id": st.column_config.SelectboxColumn(
+                    "Resource",
+                    options=[""] + [str(resource["resource_id"]) for resource in resources],
+                ),
+            },
+            disabled=["slack_name", "slack_user_id"],
+        )
+        if st.button("Save mappings", key=f"slack_save_mappings_{project_id}"):
+            commands, error = _slack_mapping_commands(
+                project_id=project_id,
+                rows=edited_rows,
+                current_mappings=slack_data.get("resource_mappings") or [],
+                updated_at=controls["as_of"],
+            )
+            if error:
+                st.error(error)
+            elif not commands:
+                st.info("No mapping changes to save.")
+            else:
+                _apply_batch(service, commands)
+
+
+def _render_slack_run_section(
+    service,
+    controls: dict[str, Any],
+    db_path: str,
+    slack_data: dict[str, Any],
+    action_passphrase: str,
+) -> None:
+    project_id = controls["project_id"]
+    with st.expander("Run once", expanded=True):
+        model_options = _codex_debug_model_options()
+        if model_options:
+            selected_model = st.selectbox(
+                "Codex model",
+                model_options,
+                key=f"slack_codex_model_{project_id}",
+            )
+        else:
+            selected_model = st.text_input(
+                "Codex model",
+                "",
+                key=f"slack_codex_model_fallback_{project_id}",
+                help=(
+                    "`codex debug models` did not return a model list. Leave blank "
+                    "to let the runner use its default."
+                ),
+            )
+        job = _slack_active_service_run(service, project_id) or _slack_run_job(project_id)
+        _render_slack_job_status(job, controls["timezone"])
+        active = _slack_job_is_active(job)
+        cols = st.columns(2)
+        if cols[0].button(
+            "Run once",
+            key=f"slack_run_once_{project_id}",
+            disabled=active,
+        ):
+            token, error = _decrypt_slack_token_for_ui(
+                service,
+                project_id,
+                slack_data,
+                action_passphrase,
+            )
+            if error:
+                _set_slack_notice(project_id, "error", error)
+            else:
+                started = _start_slack_run_job(
+                    service=service,
+                    db_path=db_path,
+                    project_id=project_id,
+                    token=token or "",
+                    model=selected_model or None,
+                )
+                if started:
+                    _set_slack_notice(project_id, "success", "Started Slack run.")
+                else:
+                    _set_slack_notice(
+                        project_id,
+                        "error",
+                        "A Slack run is already active or could not be started.",
+                    )
+            st.rerun()
+        if cols[1].button("Refresh status", key=f"slack_refresh_run_{project_id}"):
+            st.rerun()
+
+
+def _render_slack_draft_section(
+    service,
+    controls: dict[str, Any],
+    slack_data: dict[str, Any],
+    resources: list[dict[str, Any]],
+    action_passphrase: str,
+) -> None:
+    project_id = controls["project_id"]
+    with st.expander("Draft messages", expanded=True):
+        drafts = _slack_outbox_rows(service, project_id, ["draft"], limit=200)
+        if not drafts:
+            st.info("No draft Slack messages.")
+            return
+        rows = _slack_draft_rows(drafts, resources)
+        edited_rows = st.data_editor(
+            rows,
+            key=f"slack_draft_editor_{project_id}",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "send": st.column_config.CheckboxColumn("Send"),
+                "outbox_id": st.column_config.TextColumn("Outbox id", disabled=True),
+                "resource": st.column_config.TextColumn("Resource", disabled=True),
+                "slack_user_id": st.column_config.TextColumn("Slack id", disabled=True),
+                "status": st.column_config.TextColumn("Status", disabled=True),
+                "body": st.column_config.TextColumn("Message"),
+            },
+            disabled=["outbox_id", "resource", "slack_user_id", "status"],
+        )
+        st.json(_slack_draft_json(edited_rows))
+        cols = st.columns(3)
+        if cols[0].button("Save draft edits", key=f"slack_save_drafts_{project_id}"):
+            ok = _save_slack_draft_edits(
+                service,
+                project_id,
+                original_rows=drafts,
+                edited_rows=edited_rows,
+                edited_at=controls["as_of"],
+            )
+            if ok:
+                st.success("Saved draft edits.")
+                st.rerun()
+        if cols[1].button("Send selected", key=f"slack_send_selected_{project_id}"):
+            selected_rows = [row for row in edited_rows if row.get("send")]
+            if not selected_rows:
+                _set_slack_notice(project_id, "error", "Select at least one draft to send.")
+                st.rerun()
+                return
+            token, error = _decrypt_slack_token_for_ui(
+                service,
+                project_id,
+                slack_data,
+                action_passphrase,
+            )
+            if error:
+                _set_slack_notice(project_id, "error", error)
+                st.rerun()
+                return
+            if not _save_slack_draft_edits(
+                service,
+                project_id,
+                original_rows=drafts,
+                edited_rows=selected_rows,
+                edited_at=controls["as_of"],
+                require_changed_success=True,
+            ):
+                st.rerun()
+                return
+            ok, message = _send_slack_rows_for_ui(
+                service,
+                project_id,
+                token or "",
+                selected_rows,
+                controls["as_of"],
+            )
+            _set_slack_notice(project_id, "success" if ok else "error", message)
+            st.rerun()
+        if cols[2].button("Skip selected", key=f"slack_skip_selected_{project_id}"):
+            selected_rows = [row for row in edited_rows if row.get("send")]
+            if not selected_rows:
+                st.error("Select at least one draft to skip.")
+                return
+            ok = _mark_slack_rows_skipped(service, project_id, selected_rows, controls["as_of"])
+            if ok:
+                st.success("Marked selected drafts skipped.")
+                st.rerun()
+
+
+def _render_slack_history_section(
+    service,
+    controls: dict[str, Any],
+    resources: list[dict[str, Any]],
+) -> None:
+    with st.expander("History"):
+        rows = _slack_outbox_rows(
+            service,
+            controls["project_id"],
+            ["sent", "failed", "skipped"],
+            limit=200,
+        )
+        if not rows:
+            st.info("No sent, failed, or skipped Slack messages.")
+            return
+        st.dataframe(
+            format_display_datetimes(_slack_draft_rows(rows, resources), controls["timezone"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def _render_schedule(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    _ensure_catalog(service, controls, context)
+    _ensure_graph_context(service, controls, context)
+    _ensure_resource_schedule(service, controls, context)
+    _ensure_blockers(service, controls, context)
     graph = context.get("graph") or {}
     full_graph = context.get("full_graph") or graph
     schedule = context.get("resource_schedule") or {}
+    resources = (context.get("catalog") or {}).get("resources", [])
     symbol_options = [
         node.get("process_symbol")
         for node in full_graph.get("nodes", [])
@@ -2391,6 +3407,7 @@ def _render_schedule(service, controls: dict[str, Any], context: dict[str, Any])
         "resource_id",
         selected_resource_ids,
         id_label="Resource",
+        resources=resources,
     )
     st.subheader("Role priorities")
     role_rows = role_priority_rows(
@@ -2423,6 +3440,7 @@ def _render_schedule(service, controls: dict[str, Any], context: dict[str, Any])
         "role_id",
         selected_role_ids,
         id_label="Role",
+        resources=resources,
     )
 
 
@@ -2434,6 +3452,7 @@ def _render_priority_expanders(
     selected_ids: list[str] | tuple[str, ...],
     *,
     id_label: str,
+    resources: list[dict[str, Any]] | None = None,
 ) -> None:
     sections = _priority_expander_sections(
         rows,
@@ -2449,7 +3468,12 @@ def _render_priority_expanders(
         with st.expander(section["label"], expanded=False):
             for row in section["rows"]:
                 with st.expander(_priority_process_header(row), expanded=False):
-                    _render_priority_process_entry(service, controls, row)
+                    _render_priority_process_entry(
+                        service,
+                        controls,
+                        row,
+                        resources or [],
+                    )
 
 
 def _priority_markdown(
@@ -2536,6 +3560,17 @@ def _priority_rows(
                 "blockers": row.get("blockers") or [],
                 "blocking_count": row.get("blocking_count") or 0,
                 "role_ids": row.get("role_ids"),
+                "dependencies": row.get("dependencies") or [],
+                "duration_business_days": row.get("duration_business_days"),
+                "earliest_start_at": row.get("earliest_start_at"),
+                "start_at_earliest": row.get("start_at_earliest"),
+                "delay_after_dependencies_business_days": row.get(
+                    "delay_after_dependencies_business_days",
+                ),
+                "role_requirements": row.get("role_requirements") or [],
+                "required_roles": row.get("required_roles") or {},
+                "staked_resource_ids": row.get("staked_resource_ids") or [],
+                "assumption_note": row.get("assumption_note"),
                 id_field: row.get(id_field),
             }
         )
@@ -2578,6 +3613,17 @@ def _enrich_priority_rows(
                 "started_at": node.get("started_at"),
                 "finished_at": node.get("finished_at"),
                 "description": node.get("description"),
+                "duration_business_days": node.get("duration_business_days"),
+                "dependencies": node.get("dependencies") or [],
+                "earliest_start_at": node.get("earliest_start_at"),
+                "start_at_earliest": node.get("start_at_earliest"),
+                "delay_after_dependencies_business_days": node.get(
+                    "delay_after_dependencies_business_days",
+                ),
+                "role_requirements": node.get("role_requirements") or [],
+                "required_roles": node.get("required_roles") or {},
+                "staked_resource_ids": node.get("staked_resource_ids") or [],
+                "assumption_note": node.get("assumption_note"),
                 "blockers": process_blockers,
                 "blocking_count": blocking_count,
             }
@@ -2596,10 +3642,12 @@ def _render_priority_process_entry(
     service,
     controls: dict[str, Any],
     row: dict[str, Any],
+    resources: list[dict[str, Any]],
 ) -> None:
     st.markdown(_priority_process_markdown(row, controls["timezone"]))
     _render_block_status(row)
     _render_done_criteria(row)
+    _render_staked_resources_control(service, controls, row, resources)
     _render_priority_status_controls(service, controls, row)
 
 
@@ -2619,6 +3667,11 @@ def _priority_process_markdown(row: dict[str, Any], timezone_name: str) -> str:
             else ", ".join(f"`{role_id}`" for role_id in role_ids)
         )
         details.append(f"- Roles: {role_text}")
+    if row.get("staked_resource_ids"):
+        details.append(
+            "- Staked resources: "
+            + ", ".join(f"`{resource_id}`" for resource_id in row["staked_resource_ids"])
+        )
     if row.get("started_at"):
         started_at = _markdown_datetime(row.get("started_at"), timezone_name)
         details.append(f"- Started: {started_at}")
@@ -2658,6 +3711,65 @@ def _render_done_criteria(row: dict[str, Any]) -> None:
     st.markdown("**Done criteria**")
     description = row.get("description")
     st.write(description or "No done criteria recorded.")
+
+
+def _render_staked_resources_control(
+    service,
+    controls: dict[str, Any],
+    row: dict[str, Any],
+    resources: list[dict[str, Any]],
+) -> None:
+    process_symbol = row.get("process_symbol")
+    if not process_symbol or not resources:
+        return
+    resource_options = [
+        str(resource["resource_id"])
+        for resource in resources
+        if resource.get("resource_id") and resource.get("active", True)
+    ]
+    current = [
+        resource_id
+        for resource_id in row.get("staked_resource_ids", [])
+        if resource_id in resource_options
+    ]
+    row_scope = f"{row.get('role_id')}_{row.get('resource_id')}"
+    key = f"schedule_staked_resources_{process_symbol}_{row.get('priority')}_{row_scope}"
+    selected = st.multiselect(
+        "Staked resources",
+        resource_options,
+        default=current,
+        key=key,
+        help=(
+            "Pin this process to specific resources before resource scheduling "
+            "fills role capacity."
+        ),
+    )
+    if st.button(
+        "Save staked resources",
+        key=f"schedule_save_staked_{process_symbol}_{row.get('priority')}_{row_scope}",
+    ):
+        _apply_command(
+            service,
+            {
+                "action": "upsert_process_revision",
+                "project_id": controls["project_id"],
+                "process_symbol": process_symbol,
+                "name": row.get("process_name") or process_symbol,
+                "description": row.get("description") or "",
+                "effective_at": controls["as_of"],
+                "duration_business_days": int(row.get("duration_business_days") or 0),
+                "dependencies": list(row.get("dependencies") or []),
+                "earliest_start_at": row.get("earliest_start_at"),
+                "start_at_earliest": bool(row.get("start_at_earliest")),
+                "delay_after_dependencies_business_days": int(
+                    row.get("delay_after_dependencies_business_days") or 0,
+                ),
+                "required_roles": row.get("required_roles") or {},
+                "role_requirements": row.get("role_requirements") or [],
+                "staked_resource_ids": selected,
+                "assumption_note": row.get("assumption_note"),
+            },
+        )
 
 
 def _render_priority_status_controls(
@@ -3020,9 +4132,43 @@ def _utilization_colormap():
 
 
 def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    _ensure_catalog(service, controls, context)
+    milestones = [
+        milestone
+        for milestone in (context.get("catalog") or {}).get("milestones", [])
+        if milestone.get("active", True)
+    ]
+    milestone_by_id = {
+        milestone["milestone_id"]: milestone
+        for milestone in milestones
+        if milestone.get("milestone_id")
+    }
+    st.selectbox(
+        "Snapshot scope",
+        ["", *milestone_by_id],
+        key="slippage_milestone_id",
+        format_func=lambda value: (
+            "Current terminal selection"
+            if not value
+            else f"{milestone_by_id[value].get('name') or value} ({value})"
+        ),
+        help="Choose a milestone to view and commit milestone-specific slippage.",
+    )
+    selected_milestone = _selected_slippage_milestone(context)
+    _ensure_schedule_snapshots(service, controls, context)
     terminal_symbols = context.get("terminal_symbols") or []
     snapshots = (context.get("schedule_snapshots") or {}).get("snapshots", [])
     st.subheader("Committed schedule snapshots")
+    if selected_milestone is not None:
+        st.caption(
+            "Milestone scope: "
+            f"{selected_milestone.get('name') or selected_milestone['milestone_id']} "
+            f"({', '.join(terminal_symbols) or 'no processes'})"
+        )
+    elif terminal_symbols:
+        st.caption(f"Terminal scope: {', '.join(terminal_symbols)}")
+    else:
+        st.caption("Project-wide terminal scope")
     with st.form("commit_project_state"):
         note = st.text_input(
             "Commit note",
@@ -3033,13 +4179,13 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         committed_at = dt.datetime.now(dt.UTC)
         result = _apply_command(
             service,
-            {
-                "action": "commit_project_state",
-                "project_id": controls["project_id"],
-                "committed_at": committed_at,
-                "terminal_process_symbols": terminal_symbols,
-                "note": note or None,
-            },
+            _commit_project_state_payload(
+                controls,
+                terminal_symbols=terminal_symbols,
+                milestone=selected_milestone,
+                committed_at=committed_at,
+                note=note or None,
+            ),
             rerun=False,
         )
         if result is not None and result.ok:
@@ -3105,9 +4251,9 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         st.rerun()
 
 
-def _render_costs(controls: dict[str, Any], context: dict[str, Any]) -> None:
-    costs = context.get("costs") or {}
-    utilization = context.get("utilization") or {}
+def _render_costs(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    costs = _ensure_costs(service, controls, context)
+    utilization = _ensure_utilization(service, controls, context)
     cols = st.columns(2)
     cols[0].metric("Total cost", costs.get("total_cost", "0"))
     cols[1].metric("Currency", costs.get("currency", "-"))
@@ -3149,8 +4295,8 @@ def _render_costs(controls: dict[str, Any], context: dict[str, Any]) -> None:
     )
 
 
-def _render_history(controls: dict[str, Any], context: dict[str, Any]) -> None:
-    blockers = context.get("blockers") or {}
+def _render_history(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    blockers = _ensure_blockers(service, controls, context)
     st.subheader("Blocker history")
     st.dataframe(
         format_display_datetimes(blockers.get("blockers", []), controls["timezone"]),
@@ -3160,6 +4306,8 @@ def _render_history(controls: dict[str, Any], context: dict[str, Any]) -> None:
 
 
 def _render_topology(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
+    _ensure_catalog(service, controls, context)
+    _ensure_graph_context(service, controls, context)
     graph = context.get("full_graph") or context.get("graph") or {}
     catalog = catalog_from_query_data(context.get("catalog"), graph)
     node_by_symbol = {
@@ -3285,6 +4433,1084 @@ def _render_topology(service, controls: dict[str, Any], context: dict[str, Any])
             )
 
 
+def _slack_manifest_payload(project_id: str, name: str) -> dict[str, Any]:
+    scopes = [
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "im:read",
+        "im:write",
+        "users:read",
+    ]
+    module = _slack_bot_module()
+    if module is not None and hasattr(module, "REQUIRED_BOT_SCOPES"):
+        scopes = list(module.REQUIRED_BOT_SCOPES)
+    return {
+        "display_information": {"name": name},
+        "features": {
+            "app_home": {
+                "home_tab_enabled": False,
+                "messages_tab_enabled": True,
+                "messages_tab_read_only_enabled": False,
+            },
+            "bot_user": {
+                "display_name": name,
+                "always_online": False,
+            }
+        },
+        "oauth_config": {"scopes": {"bot": scopes}},
+        "settings": {
+            "org_deploy_enabled": False,
+            "socket_mode_enabled": False,
+            "token_rotation_enabled": False,
+        },
+    }
+
+
+def _slack_has_encrypted_token(slack_data: dict[str, Any]) -> bool:
+    config = slack_data.get("config") or {}
+    return bool(
+        slack_data.get("encrypted_token")
+        or slack_data.get("encrypted_bot_token")
+        or config.get("encrypted_token")
+        or config.get("encrypted_bot_token")
+        or config.get("bot_token_ciphertext")
+        or config.get("token_ciphertext")
+        or config.get("has_encrypted_bot_token")
+        or slack_data.get("has_encrypted_bot_token")
+    )
+
+
+def _slack_encrypted_token_payload(slack_data: dict[str, Any]) -> dict[str, Any] | None:
+    containers = [
+        slack_data,
+        slack_data.get("config") or {},
+        slack_data.get("token") or {},
+    ]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "encrypted_token",
+            "encrypted_bot_token",
+            "bot_token_encrypted",
+            "bot_token_ciphertext",
+            "token_ciphertext",
+            "ciphertext",
+        ):
+            value = container.get(key)
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, str) and value:
+                payload = dict(container)
+                payload["ciphertext"] = value
+                return payload
+    return None
+
+
+def _encrypt_slack_token_for_ui(
+    raw_token: str,
+    passphrase: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    helper = _find_slack_helper(
+        "encrypt_slack_bot_token",
+        "encrypt_slack_token",
+        "encrypt_bot_token",
+        "encrypt_token",
+    )
+    if helper is None:
+        return (
+            None,
+            "Encrypted token helper is not available yet. Expected "
+            "`projdash.service.slack_crypto.encrypt_slack_bot_token` or an "
+            "equivalent Slack integration helper.",
+        )
+    try:
+        result = _call_token_crypto_helper(
+            helper,
+            token=raw_token,
+            passphrase=passphrase,
+        )
+    except Exception as exc:
+        return None, f"Token encryption failed: {exc}"
+    return _jsonable_mapping(result), None
+
+
+def _decrypt_slack_token_for_ui(
+    service,
+    project_id: str,
+    slack_data: dict[str, Any],
+    passphrase: str,
+) -> tuple[str | None, str | None]:
+    if not passphrase:
+        return None, "Passphrase is required."
+
+    blob = _slack_encrypted_token_payload(slack_data)
+    if blob is None and _slack_has_encrypted_token(slack_data):
+        token_data = _optional_service_query(
+            service,
+            {"action": "query_slack_bot_token", "project_id": project_id},
+        ) or {}
+        blob = token_data.get("encrypted_token")
+    if blob is not None:
+        helper = _find_slack_helper(
+            "decrypt_slack_bot_token",
+            "decrypt_slack_token",
+            "decrypt_bot_token",
+            "decrypt_token",
+        )
+        if helper is None:
+            return (
+                None,
+                "Encrypted token decrypt helper is not available yet. Expected "
+                "`projdash.service.slack_crypto.decrypt_slack_bot_token` or an "
+                "equivalent Slack integration helper.",
+            )
+        try:
+            result = _call_token_crypto_helper(
+                helper,
+                encrypted_token=blob,
+                passphrase=passphrase,
+            )
+        except Exception as exc:
+            return None, f"Token decrypt failed: {exc}"
+        token = _extract_token_string(result)
+        if token:
+            return token, None
+        return None, "Token decrypt helper did not return a bot token."
+
+    return (
+        None,
+        "No decryptable Slack token is available. Store an encrypted token first.",
+    )
+
+
+def _find_slack_helper(*names: str):
+    for module_name in (
+        "projdash.service.slack_crypto",
+        "projdash.integrations.slack_crypto",
+        "projdash.integrations.slack_bot",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        for name in names:
+            helper = getattr(module, name, None)
+            if callable(helper):
+                return helper
+    return None
+
+
+def _call_token_crypto_helper(
+    helper,
+    *,
+    token: str | None = None,
+    encrypted_token: dict[str, Any] | None = None,
+    passphrase: str,
+) -> Any:
+    try:
+        parameters = inspect.signature(helper).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+
+    if not parameters:
+        if encrypted_token is not None:
+            return helper(encrypted_token, passphrase)
+        return helper(token, passphrase)
+
+    kwargs: dict[str, Any] = {"passphrase": passphrase}
+    if token is not None:
+        for key in ("raw_token", "token", "bot_token"):
+            if key in parameters:
+                kwargs[key] = token
+                break
+    if encrypted_token is not None:
+        for key in ("encrypted_token", "token_blob", "blob", "payload"):
+            if key in parameters:
+                kwargs[key] = encrypted_token
+                break
+    return helper(**kwargs)
+
+
+def _jsonable_mapping(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        return {"ciphertext": value}
+    return {"value": value}
+
+
+def _extract_token_string(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if isinstance(value, dict):
+        for key in ("token", "bot_token", "raw_token", "slack_bot_token"):
+            token = value.get(key)
+            if isinstance(token, str) and token:
+                return token
+    return None
+
+
+def _list_slack_users_for_ui(
+    service,
+    project_id: str,
+    token: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    if not token:
+        return [], "Slack token is required."
+    helper = _find_slack_helper("list_slack_users", "fetch_slack_users")
+    if helper is not None:
+        try:
+            result = _call_with_supported_kwargs(
+                helper,
+                {
+                    "db_path": "",
+                    "project_id": project_id,
+                    "service": service,
+                    "token_override": token,
+                    "token": token,
+                },
+            )
+        except Exception as exc:
+            return [], f"Slack user discovery failed: {exc}"
+        return _normalize_slack_users(result), None
+
+    try:
+        client = _make_slack_client_for_ui(token)
+        members: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {"limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            response = client.users_list(**kwargs)
+            members.extend(response.get("members", []))
+            cursor = (
+                response.get("response_metadata", {}).get("next_cursor")
+                if isinstance(response, dict)
+                else None
+            )
+            if not cursor:
+                break
+    except Exception as exc:
+        return [], f"Slack user discovery failed: {exc}"
+    return _normalize_slack_users(members), None
+
+
+def _normalize_slack_users(raw: Any) -> list[dict[str, Any]]:
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump(mode="json")
+    if isinstance(raw, dict):
+        raw = raw.get("members", raw.get("users", raw.get("rows", [])))
+    rows = []
+    for member in raw or []:
+        if hasattr(member, "model_dump"):
+            member = member.model_dump(mode="json")
+        elif hasattr(member, "as_dict"):
+            member = member.as_dict()
+        elif not isinstance(member, dict):
+            member = {
+                "slack_user_id": getattr(member, "slack_user_id", None),
+                "id": getattr(member, "id", None),
+                "user_id": getattr(member, "user_id", None),
+                "display_name": getattr(member, "display_name", None),
+                "real_name": getattr(member, "real_name", None),
+                "name": getattr(member, "name", None),
+                "email": getattr(member, "email", None),
+                "team_id": getattr(member, "team_id", None),
+                "team": getattr(member, "team", None),
+                "deleted": getattr(member, "deleted", False),
+                "is_bot": getattr(member, "is_bot", False),
+                "is_app_user": getattr(member, "is_app_user", False),
+            }
+        if not isinstance(member, dict):
+            continue
+        slack_user_id = member.get("id") or member.get("slack_user_id") or member.get("user_id")
+        if (
+            not slack_user_id
+            or member.get("deleted")
+            or member.get("is_bot")
+            or member.get("is_app_user")
+        ):
+            continue
+        profile = member.get("profile") or {}
+        slack_name = (
+            member.get("display_name")
+            or member.get("real_name")
+            or profile.get("display_name")
+            or profile.get("real_name")
+            or member.get("name")
+            or slack_user_id
+        )
+        rows.append(
+            {
+                "slack_user_id": str(slack_user_id),
+                "slack_name": str(slack_name),
+                "email": profile.get("email") or member.get("email"),
+                "team_id": member.get("team_id") or member.get("team"),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("slack_name", "")).casefold(),
+            str(row.get("slack_user_id", "")),
+        ),
+    )
+
+
+def _slack_mapping_rows(
+    *,
+    slack_users: list[dict[str, Any]],
+    resources: list[dict[str, Any]],
+    resource_mappings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    resource_ids = {str(resource.get("resource_id")) for resource in resources}
+    mapping_by_user = {
+        str(mapping.get("slack_user_id")): mapping
+        for mapping in resource_mappings
+        if mapping.get("active", True) and mapping.get("slack_user_id")
+    }
+    rows = []
+    for user in slack_users:
+        slack_user_id = str(user.get("slack_user_id") or "")
+        mapping = mapping_by_user.get(slack_user_id) or {}
+        resource_id = str(mapping.get("resource_id") or "")
+        rows.append(
+            {
+                "mapped": bool(resource_id and resource_id in resource_ids),
+                "slack_name": user.get("slack_name") or slack_user_id,
+                "slack_user_id": slack_user_id,
+                "resource_id": resource_id if resource_id in resource_ids else "",
+            }
+        )
+    return rows
+
+
+def _slack_mapping_commands(
+    *,
+    project_id: str,
+    rows: list[dict[str, Any]],
+    current_mappings: list[dict[str, Any]],
+    updated_at: dt.datetime,
+) -> tuple[list[dict[str, Any]], str | None]:
+    desired_by_resource: dict[str, dict[str, Any]] = {}
+    seen_slack_users: set[str] = set()
+    for row in rows:
+        if not row.get("mapped"):
+            continue
+        slack_user_id = str(row.get("slack_user_id") or "")
+        resource_id = str(row.get("resource_id") or "")
+        if not slack_user_id or not resource_id:
+            return [], "Mapped rows must have both a Slack user and a resource."
+        if slack_user_id in seen_slack_users:
+            return [], f"Slack user `{slack_user_id}` is mapped more than once."
+        if resource_id in desired_by_resource:
+            return [], f"Resource `{resource_id}` is mapped more than once."
+        seen_slack_users.add(slack_user_id)
+        desired_by_resource[resource_id] = row
+
+    current_by_resource = {
+        str(mapping.get("resource_id")): mapping
+        for mapping in current_mappings
+        if mapping.get("active", True) and mapping.get("resource_id")
+    }
+    commands: list[dict[str, Any]] = []
+    for resource_id, mapping in sorted(current_by_resource.items()):
+        desired = desired_by_resource.get(resource_id)
+        if desired and desired.get("slack_user_id") == mapping.get("slack_user_id"):
+            continue
+        commands.append(
+            {
+                "action": "set_resource_slack_user",
+                "project_id": project_id,
+                "resource_id": resource_id,
+                "slack_user_id": None,
+                "display_name": None,
+                "active": False,
+                "updated_at": updated_at,
+            }
+        )
+    for resource_id, row in sorted(desired_by_resource.items()):
+        current = current_by_resource.get(resource_id) or {}
+        if (
+            current.get("slack_user_id") == row.get("slack_user_id")
+            and current.get("display_name") == row.get("slack_name")
+        ):
+            continue
+        commands.append(
+            {
+                "action": "set_resource_slack_user",
+                "project_id": project_id,
+                "resource_id": resource_id,
+                "slack_user_id": row.get("slack_user_id"),
+                "display_name": row.get("slack_name"),
+                "active": True,
+                "updated_at": updated_at,
+            }
+        )
+    return commands, None
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _codex_debug_model_options() -> list[str]:
+    try:
+        completed = subprocess.run(
+            ["codex", "debug", "models"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    return _parse_codex_debug_models(completed.stdout)
+
+
+def _parse_codex_debug_models(output: str) -> list[str]:
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        parsed = None
+    if parsed is not None:
+        models: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key in ("slug", "id", "name", "model"):
+                    item = value.get(key)
+                    if isinstance(item, str) and _looks_like_model_id(item):
+                        models.append(item)
+                for item in value.values():
+                    visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(parsed)
+        return _dedupe(models)
+
+    models = []
+    for line in output.splitlines():
+        cleaned = line.strip().strip("|").strip()
+        if not cleaned or set(cleaned) <= {"-", " ", "|"}:
+            continue
+        for token in re.split(r"[\s|,]+", cleaned):
+            token = token.strip("`'\"*")
+            if _looks_like_model_id(token):
+                models.append(token)
+                break
+    return _dedupe(models)
+
+
+def _looks_like_model_id(value: str) -> bool:
+    return bool(
+        re.match(
+            r"^(?:gpt|o\d|codex|openai/|anthropic/|claude|gemini)[A-Za-z0-9_.:/-]*$",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _slack_run_job_key(project_id: str) -> str:
+    return f"slack-run:{project_id}"
+
+
+def _slack_run_job(project_id: str) -> dict[str, Any] | None:
+    with _SLACK_RUN_JOBS_LOCK:
+        job = _SLACK_RUN_JOBS.get(_slack_run_job_key(project_id))
+        return dict(job) if job else None
+
+
+def _slack_active_service_run(service, project_id: str) -> dict[str, Any] | None:
+    data = _optional_service_query(
+        service,
+        {
+            "action": "query_slack_runs",
+            "project_id": project_id,
+            "statuses": ["queued", "running"],
+            "limit": 1,
+        },
+    )
+    rows = data.get("runs", []) if isinstance(data, dict) else []
+    return dict(rows[0]) if rows else None
+
+
+def _slack_job_is_active(job: dict[str, Any] | None) -> bool:
+    return bool(job and job.get("status") in {"queued", "running"})
+
+
+def _render_slack_job_status(
+    job: dict[str, Any] | None,
+    timezone_name: str,
+) -> None:
+    if not job:
+        st.info("No Slack run has been started in this app process.")
+        return
+    status = str(job.get("status", "unknown"))
+    started_at = format_display_datetime(job.get("started_at"), timezone_name)
+    finished_at = (
+        format_display_datetime(job.get("finished_at"), timezone_name)
+        if job.get("finished_at")
+        else "-"
+    )
+    st.write(
+        {
+            "status": status,
+            "run_id": job.get("run_id"),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "message": job.get("message"),
+        }
+    )
+
+
+def _start_slack_run_job(
+    *,
+    service,
+    db_path: str,
+    project_id: str,
+    token: str,
+    model: str | None,
+) -> bool:
+    key = _slack_run_job_key(project_id)
+    now = dt.datetime.now(dt.UTC)
+    run_id = f"{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    with _SLACK_RUN_JOBS_LOCK:
+        if _slack_job_is_active(_SLACK_RUN_JOBS.get(key)):
+            return False
+        service_result = _optional_service_command(
+            service,
+            {
+                "action": "start_slack_run",
+                "project_id": project_id,
+                "run_id": run_id,
+                "trigger": "ui",
+                "codex_model": model,
+                "started_at": now,
+            },
+        )
+        if service_result is not None and not _service_result_ok(service_result):
+            return False
+        _SLACK_RUN_JOBS[key] = {
+            "status": "queued",
+            "run_id": run_id,
+            "project_id": project_id,
+            "model": model,
+            "started_at": now.isoformat(),
+            "message": "Queued.",
+        }
+    thread = threading.Thread(
+        target=_slack_run_worker,
+        kwargs={
+            "key": key,
+            "service": service,
+            "db_path": db_path,
+            "project_id": project_id,
+            "token": token,
+            "model": model,
+            "run_id": run_id,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
+def _slack_run_worker(
+    *,
+    key: str,
+    service,
+    db_path: str,
+    project_id: str,
+    token: str,
+    model: str | None,
+    run_id: str,
+) -> None:
+    _set_slack_run_job(key, status="running", message="Collecting Slack data.")
+    try:
+        result = _run_slack_once_for_ui(
+            service=service,
+            db_path=db_path,
+            project_id=project_id,
+            token=token,
+            model=model,
+            run_id=run_id,
+        )
+        result_data = getattr(result, "data", None) or {}
+        status = "succeeded" if getattr(result, "exit_code", 1) == 0 else "failed"
+        if status == "succeeded" and result_data.get("skipped_codex"):
+            status = "no_new_data"
+        message = getattr(result, "message", None) or status
+        _set_slack_run_job(
+            key,
+            status=status,
+            message=message,
+            finished_at=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        _finish_slack_run(
+            service,
+            project_id,
+            run_id,
+            status,
+            model,
+            message,
+            result_data,
+        )
+    except Exception as exc:
+        message = str(exc)
+        _set_slack_run_job(
+            key,
+            status="failed",
+            message=message,
+            finished_at=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        _finish_slack_run(service, project_id, run_id, "failed", model, message)
+    finally:
+        token = ""
+
+
+def _set_slack_run_job(key: str, **updates: Any) -> None:
+    with _SLACK_RUN_JOBS_LOCK:
+        job = dict(_SLACK_RUN_JOBS.get(key, {}))
+        job.update(updates)
+        _SLACK_RUN_JOBS[key] = job
+
+
+def _finish_slack_run(
+    service,
+    project_id: str,
+    run_id: str,
+    status: str,
+    model: str | None,
+    message: str | None = None,
+    result_data: dict[str, Any] | None = None,
+) -> None:
+    result_data = result_data or {}
+    rows = _slack_outbox_rows(
+        service,
+        project_id,
+        ["draft", "sent", "failed", "skipped"],
+        limit=500,
+    )
+    draft_ids = [
+        str(row["outbox_id"])
+        for row in rows
+        if row.get("outbox_id") and row.get("run_id") == run_id
+    ]
+    _optional_service_command(
+        service,
+        {
+            "action": "finish_slack_run",
+            "project_id": project_id,
+            "run_id": run_id,
+            "status": status,
+            "finished_at": dt.datetime.now(dt.UTC),
+            "collected_message_count": int(result_data.get("message_count") or 0),
+            "draft_outbox_ids": draft_ids,
+            "result_json": {
+                "codex_model": model,
+                "message": message,
+                "runner": result_data,
+            },
+            "error_text": message if status == "failed" else None,
+        },
+    )
+
+
+def _run_slack_once_for_ui(
+    *,
+    service,
+    db_path: str,
+    project_id: str,
+    token: str,
+    model: str | None,
+    run_id: str,
+) -> Any:
+    module = _slack_bot_module()
+    if module is None or not hasattr(module, "run_once"):
+        raise RuntimeError("Slack run_once integration helper is not available.")
+    run_once = module.run_once
+    service = _LockedProjectService(service)
+    kwargs: dict[str, Any] = {
+        "db_path": db_path,
+        "project_id": project_id,
+        "service": service,
+        "dry_run_send": True,
+        "prepare_only": True,
+        "now": dt.datetime.now(dt.UTC),
+        "run_id": run_id,
+    }
+    signature = inspect.signature(run_once)
+    if "codex_model" in signature.parameters and model:
+        kwargs["codex_model"] = model
+    elif "model" in signature.parameters and model:
+        kwargs["model"] = model
+    if "token_override" in signature.parameters:
+        kwargs["token_override"] = token
+        return _call_with_supported_kwargs(run_once, kwargs)
+
+    raise RuntimeError("Slack run_once helper must support token_override.")
+
+
+def _slack_outbox_rows(
+    service,
+    project_id: str,
+    statuses: list[str],
+    *,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    data = _optional_service_query(
+        service,
+        {
+            "action": "query_pending_slack_outbox",
+            "project_id": project_id,
+            "statuses": statuses,
+            "limit": limit,
+        },
+    )
+    if isinstance(data, dict):
+        return list(data.get("outbox", data.get("messages", data.get("rows", []))))
+    if isinstance(data, list):
+        return list(data)
+    return []
+
+
+def _slack_draft_rows(
+    rows: list[dict[str, Any]],
+    resources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    resource_labels = {
+        str(resource.get("resource_id")): (
+            f"{resource.get('name') or resource.get('resource_id')} "
+            f"({resource.get('resource_id')})"
+        )
+        for resource in resources
+    }
+    return [
+        {
+            "send": False,
+            "outbox_id": row.get("outbox_id"),
+            "status": row.get("status"),
+            "resource": resource_labels.get(
+                str(row.get("resource_id")),
+                row.get("resource_id") or "",
+            ),
+            "resource_id": row.get("resource_id"),
+            "slack_user_id": row.get("slack_user_id"),
+            "body": row.get("body") or row.get("text") or "",
+            "run_id": row.get("run_id"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+            "sent_at": row.get("sent_at"),
+            "failed_at": row.get("failed_at"),
+            "error_text": row.get("error_text"),
+            "slack_channel_id": row.get("slack_channel_id"),
+            "slack_message_ts": row.get("slack_message_ts"),
+        }
+        for row in rows
+    ]
+
+
+def _slack_draft_json(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "outbox_id": row.get("outbox_id"),
+            "resource_id": row.get("resource_id"),
+            "slack_user_id": row.get("slack_user_id"),
+            "body": row.get("body"),
+            "send": bool(row.get("send")),
+        }
+        for row in rows
+    ]
+
+
+def _save_slack_draft_edits(
+    service,
+    project_id: str,
+    *,
+    original_rows: list[dict[str, Any]],
+    edited_rows: list[dict[str, Any]],
+    edited_at: dt.datetime,
+    require_changed_success: bool = False,
+) -> bool:
+    original_by_id = {
+        str(row.get("outbox_id")): row.get("body") or row.get("text") or ""
+        for row in original_rows
+        if row.get("outbox_id")
+    }
+    changed = [
+        row
+        for row in edited_rows
+        if row.get("outbox_id")
+        and str(row.get("body") or "") != str(original_by_id.get(str(row["outbox_id"]), ""))
+    ]
+    if not changed:
+        return True
+    for row in changed:
+        result = _optional_service_command(
+            service,
+            {
+                "action": "update_slack_outbox_body",
+                "project_id": project_id,
+                "outbox_id": row.get("outbox_id"),
+                "body": row.get("body") or "",
+                "updated_at": edited_at,
+            },
+        )
+        if not _service_result_ok(result):
+            _set_slack_notice(
+                project_id,
+                "error",
+                "The draft edit API is not available yet. Expected "
+                "`update_slack_outbox_body`.",
+            )
+            return False
+    return True
+
+
+def _send_slack_rows_for_ui(
+    service,
+    project_id: str,
+    token: str,
+    rows: list[dict[str, Any]],
+    sent_at: dt.datetime,
+) -> tuple[bool, str]:
+    if not token:
+        return False, "Slack token is required."
+    module = _slack_bot_module()
+    if module is None:
+        return False, "Slack integration module is not available."
+
+    helper = (
+        getattr(module, "send_outbox_messages", None)
+        or getattr(module, "send_slack_outbox_messages", None)
+    )
+    if callable(helper):
+        try:
+            result = _call_with_supported_kwargs(
+                helper,
+                {
+                    "db_path": "",
+                    "service": service,
+                    "project_id": project_id,
+                    "token_override": token,
+                    "outbox_ids": [
+                        row.get("outbox_id") for row in rows if row.get("outbox_id")
+                    ],
+                    "rows": rows,
+                    "now": sent_at,
+                    "sent_at": sent_at,
+                },
+            )
+        except Exception as exc:
+            return False, f"Slack send failed: {exc}"
+        message = getattr(result, "message", None) or "Selected Slack messages sent."
+        return getattr(result, "exit_code", 0) == 0, message
+
+    try:
+        gateway = module.ServiceGateway(service)
+        config = module._normalize_config(  # noqa: SLF001 - integration fallback.
+            gateway.query_slack_project_config(project_id),
+            project_id,
+        )
+        if config is None:
+            return False, "Slack project config is not available."
+        client = _make_slack_client_for_ui(token)
+        pending = [
+            {
+                "outbox_id": row.get("outbox_id"),
+                "slack_user_id": row.get("slack_user_id"),
+                "slack_channel_id": row.get("slack_channel_id"),
+                "body": row.get("body"),
+            }
+            for row in rows
+        ]
+        module._send_pending_outbox(  # noqa: SLF001 - integration fallback.
+            client=client,
+            gateway=gateway,
+            project_id=project_id,
+            pending=pending,
+            now=sent_at,
+            dry_run_send=False,
+            config=config,
+        )
+    except Exception as exc:
+        return False, f"Slack send failed: {exc}"
+    return True, "Selected Slack messages sent."
+
+
+def _mark_slack_rows_skipped(
+    service,
+    project_id: str,
+    rows: list[dict[str, Any]],
+    skipped_at: dt.datetime,
+) -> bool:
+    for row in rows:
+        result = _optional_service_command(
+            service,
+            {
+                "action": "mark_slack_outbox_skipped",
+                "project_id": project_id,
+                "outbox_id": row.get("outbox_id"),
+                "skipped_at": skipped_at,
+            },
+        )
+        if not _service_result_ok(result):
+            st.error(
+                "The skip API is not available yet. Expected "
+                "`mark_slack_outbox_skipped`."
+            )
+            return False
+    return True
+
+
+def _verify_slack_settings_for_ui(
+    service,
+    project_id: str,
+    token: str,
+) -> tuple[bool, str]:
+    if not token:
+        return False, "Slack token is required."
+    module = _slack_bot_module()
+    if module is None:
+        return False, "Slack integration module is not available."
+    verify = getattr(module, "verify", None)
+    if callable(verify) and "token_override" in inspect.signature(verify).parameters:
+        try:
+            result = _call_with_supported_kwargs(
+                verify,
+                {
+                    "db_path": "",
+                    "project_id": project_id,
+                    "service": service,
+                    "token_override": token,
+                },
+            )
+        except Exception as exc:
+            return False, f"Slack verification failed: {exc}"
+        message = getattr(result, "message", None) or "Slack integration verified."
+        return getattr(result, "exit_code", 1) == 0, message
+
+    try:
+        client = _make_slack_client_for_ui(token)
+        client.auth_test()
+        client.conversations_list(
+            types="public_channel,private_channel,im",
+            exclude_archived=True,
+            limit=1,
+        )
+        slack_data = _optional_service_query(
+            service,
+            {"action": "query_slack_project_config", "project_id": project_id},
+        ) or {}
+        for mapping in slack_data.get("resource_mappings", []):
+            if mapping.get("active", True) and mapping.get("slack_user_id"):
+                client.users_info(user=mapping["slack_user_id"])
+    except Exception as exc:
+        return False, f"Slack verification failed: {exc}"
+    return True, "Slack integration verified."
+
+
+def _make_slack_client_for_ui(token: str) -> Any:
+    module = _slack_bot_module()
+    if module is not None:
+        for name in ("make_slack_client", "_make_slack_client"):
+            helper = getattr(module, name, None)
+            if callable(helper):
+                return helper(token)
+    from slack_sdk import WebClient
+
+    return WebClient(token=token)
+
+
+def _slack_bot_module():
+    try:
+        return importlib.import_module("projdash.integrations.slack_bot")
+    except ImportError:
+        return None
+
+
+def _call_with_supported_kwargs(function, kwargs: dict[str, Any]) -> Any:
+    parameters = inspect.signature(function).parameters
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return function(**kwargs)
+    filtered = {key: value for key, value in kwargs.items() if key in parameters}
+    return function(**filtered)
+
+
+def _optional_service_query(service, payload: dict[str, Any]) -> Any:
+    try:
+        with _SERVICE_ACCESS_LOCK:
+            result = service.handle_query(query_payload_envelope(payload))
+    except (ValidationError, ValueError):
+        return None
+    if not getattr(result, "ok", False):
+        return None
+    return getattr(result, "data", None)
+
+
+def _optional_service_command(service, payload: dict[str, Any]) -> Any:
+    try:
+        with _SERVICE_ACCESS_LOCK:
+            return service.handle_command(command_payload_envelope(payload))
+    except (ValidationError, ValueError):
+        return None
+
+
+def _service_result_ok(result: Any) -> bool:
+    return bool(getattr(result, "ok", False))
+
+
+def _service_result_data(result: Any) -> Any:
+    if result is None:
+        return None
+    if hasattr(result, "data"):
+        return result.data
+    if isinstance(result, dict):
+        return result.get("data", result)
+    return None
+
+
+def _clear_session_keys(*keys: str) -> None:
+    for key in keys:
+        st.session_state[f"{key}__clear_next"] = True
+        try:
+            st.session_state[key] = ""
+        except Exception:
+            st.session_state[f"{key}__clear_next"] = True
+
+
+def _consume_session_clear(key: str) -> None:
+    if st.session_state.pop(f"{key}__clear_next", False):
+        st.session_state[key] = ""
+
+
 def _query(
     service,
     payload: dict[str, Any],
@@ -3293,7 +5519,8 @@ def _query(
     render: bool = True,
 ) -> Any:
     try:
-        result = service.handle_query(query_payload_envelope(payload))
+        with _SERVICE_ACCESS_LOCK:
+            result = service.handle_query(query_payload_envelope(payload))
     except (ValidationError, ValueError) as exc:
         st.error(str(exc))
         return None
@@ -3308,7 +5535,8 @@ def _query(
 
 def _apply_command(service, payload: dict[str, Any], *, rerun: bool = True):
     try:
-        result = service.handle_command(command_payload_envelope(payload))
+        with _SERVICE_ACCESS_LOCK:
+            result = service.handle_command(command_payload_envelope(payload))
     except (ValidationError, ValueError) as exc:
         st.error(str(exc))
         return None
@@ -3320,7 +5548,8 @@ def _apply_command(service, payload: dict[str, Any], *, rerun: bool = True):
 
 def _apply_batch(service, payloads: list[dict[str, Any]], *, rerun: bool = True):
     try:
-        results = service.handle_batch(batch_payload_envelope(payloads))
+        with _SERVICE_ACCESS_LOCK:
+            results = service.handle_batch(batch_payload_envelope(payloads))
     except (ValidationError, ValueError) as exc:
         st.error(str(exc))
         return None

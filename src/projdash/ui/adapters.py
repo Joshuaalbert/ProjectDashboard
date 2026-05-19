@@ -144,6 +144,7 @@ def catalog_from_query_data(*datasets: dict[str, Any] | None) -> dict[str, list[
     resource_ids: set[str] = set()
     calendar_ids: set[str] = set()
     blocker_ids: set[str] = set()
+    milestone_ids: set[str] = set()
 
     for data in datasets:
         if not data:
@@ -163,6 +164,10 @@ def catalog_from_query_data(*datasets: dict[str, Any] | None) -> dict[str, list[
         for calendar in data.get("calendars", []):
             if calendar.get("calendar_id"):
                 calendar_ids.add(calendar["calendar_id"])
+        for milestone in data.get("milestones", []):
+            if milestone.get("milestone_id"):
+                milestone_ids.add(milestone["milestone_id"])
+            process_symbols.update(milestone.get("process_symbols") or [])
         for node in data.get("nodes", []):
             if node.get("process_id"):
                 process_ids.add(node["process_id"])
@@ -209,6 +214,7 @@ def catalog_from_query_data(*datasets: dict[str, Any] | None) -> dict[str, list[
         "resource_ids": sorted(resource_ids),
         "calendar_ids": sorted(calendar_ids),
         "blocker_ids": sorted(blocker_ids),
+        "milestone_ids": sorted(milestone_ids),
     }
 
 

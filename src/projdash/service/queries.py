@@ -19,6 +19,8 @@ from projdash.service.models import (
     PlanningGranularity,
     ProjectScope,
     Scope,
+    SlackOutboxStatus,
+    SlackRunStatus,
     StrictModel,
     TargetProcessScope,
     TopologyFilterScope,
@@ -48,6 +50,80 @@ class QueryProjectCatalog(QueryModel):
 
     action: Literal["query_project_catalog"] = "query_project_catalog"
     project_id: str = Field(min_length=1)
+
+
+class QueryMilestones(QueryModel):
+    """Fetch project milestone definitions."""
+
+    action: Literal["query_milestones"] = "query_milestones"
+    project_id: str = Field(min_length=1)
+    include_inactive: bool = False
+
+
+class QuerySlackProjectConfig(QueryModel):
+    """Fetch Slack project settings, mappings, and collection cursors."""
+
+    action: Literal["query_slack_project_config"] = "query_slack_project_config"
+    project_id: str = Field(min_length=1)
+
+
+class QuerySlackBotToken(QueryModel):
+    """Fetch the encrypted UI-managed Slack bot token blob for decryption."""
+
+    action: Literal["query_slack_bot_token"] = "query_slack_bot_token"
+    project_id: str = Field(min_length=1)
+
+
+class QuerySlackRuns(QueryModel):
+    """Fetch Slack background run/job records."""
+
+    action: Literal["query_slack_runs"] = "query_slack_runs"
+    project_id: str = Field(min_length=1)
+    statuses: list[SlackRunStatus] | None = None
+    limit: PositiveInt | None = None
+
+    @field_validator("statuses")
+    @classmethod
+    def _validate_statuses(
+        cls,
+        value: list[SlackRunStatus] | None,
+    ) -> list[SlackRunStatus] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("statuses must be non-empty when supplied.")
+        if len(value) != len(set(value)):
+            raise ValueError("statuses must be unique.")
+        return value
+
+
+class QueryPendingSlackOutbox(QueryModel):
+    """Fetch Slack outbox rows by status for delivery workers."""
+
+    action: Literal["query_pending_slack_outbox"] = "query_pending_slack_outbox"
+    project_id: str = Field(min_length=1)
+    statuses: list[SlackOutboxStatus] = Field(
+        default_factory=lambda: [SlackOutboxStatus.DRAFT],
+    )
+    limit: PositiveInt | None = None
+
+    @field_validator("statuses")
+    @classmethod
+    def _validate_statuses(
+        cls,
+        value: list[SlackOutboxStatus],
+    ) -> list[SlackOutboxStatus]:
+        if not value:
+            raise ValueError("statuses must be non-empty.")
+        if len(value) != len(set(value)):
+            raise ValueError("statuses must be unique.")
+        return value
+
+
+class QuerySlackOutbox(QueryPendingSlackOutbox):
+    """Fetch Slack outbox rows by status for UI review and history."""
+
+    action: Literal["query_slack_outbox"] = "query_slack_outbox"
 
 
 class ResourceOptionsMixin(StrictModel):
@@ -138,6 +214,7 @@ class QueryScheduleSnapshots(QueryModel):
     project_id: str = Field(min_length=1)
     as_of: AwareDatetime
     terminal_process_symbols: list[str] | None = None
+    milestone_id: str | None = Field(default=None, min_length=1)
 
     @field_validator("terminal_process_symbols")
     @classmethod
@@ -145,6 +222,14 @@ class QueryScheduleSnapshots(QueryModel):
         if value is None:
             return None
         return validate_unique_non_empty(value, "terminal_process_symbols")
+
+    @model_validator(mode="after")
+    def _validate_milestone_or_terminal_symbols(self) -> QueryScheduleSnapshots:
+        if self.milestone_id is not None and self.terminal_process_symbols:
+            raise ValueError(
+                "milestone_id and terminal_process_symbols are mutually exclusive."
+            )
+        return self
 
 
 class QueryResourceSchedule(QueryModel, ResourceOptionsMixin):
@@ -267,6 +352,12 @@ Query = Annotated[
     GetProject
     | QueryProjects
     | QueryProjectCatalog
+    | QueryMilestones
+    | QuerySlackProjectConfig
+    | QuerySlackBotToken
+    | QuerySlackRuns
+    | QueryPendingSlackOutbox
+    | QuerySlackOutbox
     | QuerySchedule
     | QueryCriticalPath
     | QueryProcessGraph
@@ -297,9 +388,15 @@ __all__ = [
     "QueryCriticalPath",
     "QueryScheduleSnapshots",
     "QueryEnvelope",
+    "QueryMilestones",
+    "QuerySlackBotToken",
+    "QuerySlackOutbox",
+    "QuerySlackRuns",
+    "QueryPendingSlackOutbox",
     "QueryProcessGraph",
     "QueryProjects",
     "QueryProjectCatalog",
+    "QuerySlackProjectConfig",
     "QueryResourceCapacity",
     "QueryResourceSchedule",
     "QuerySchedule",

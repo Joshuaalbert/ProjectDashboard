@@ -17,6 +17,10 @@ Treat those paths as the reconciliation contract. Read source material from the
 requested or implied by reconciliation, then move fully incorporated files to
 the `reconciled` path. The rest of the project context should come from this
 skill, the API reference, and ProjDash queries, not from conversation memory.
+When a runner prompt says the input folder is read-only or runner-owned, do not
+move, rename, delete, or rewrite input evidence. In that mode, write required
+outputs only to the requested completed/reconciled path and let the runner manage
+collection cursors and evidence retention.
 
 ## Operating Model
 
@@ -35,7 +39,8 @@ Prefer this loop:
 6. Apply validated service commands.
 7. Re-query context, schedule, blockers, utilization, and slippage.
 8. Compare projections against prior committed snapshots and recent actuals.
-9. Commit the project state when the reconciled state is intentional.
+9. Commit the project state when the reconciled state is intentional; prefer
+   active milestone snapshots when milestones exist.
 10. Move incorporated source files to `reconciled/`.
 11. Report the changes, risks, action items, slippage, and unresolved
     questions.
@@ -51,8 +56,8 @@ When starting from a fresh context, build this inventory before mutating state:
 - Service access: database path, project id, project timezone if known, and the
   `as_of`/`now` timestamp used for queries.
 - Current context: `query_agent_context` JSON, including summary, graph,
-  schedule, slippage, role priorities, resource priorities, blockers, and
-  available follow-up queries.
+  schedule, slippage, milestones, role priorities, resource priorities,
+  blockers, and available follow-up queries.
 - Catalog facts: roles, resources, calendars, calendar overrides, aliases, and
   existing blockers from `query_project_catalog` when ids are needed.
 - Schedule evidence: resource schedule, utilization, capacity, costs, or
@@ -96,6 +101,11 @@ For each source, extract:
 - Blockers and blocker resolutions.
 - Earliest-start constraints.
 - Assumption changes that should be recorded in revision notes.
+- Explicit or inferred resource staking commitments, where named teammates have
+  committed to a process or role capacity would otherwise overstate who can do
+  the work.
+- Milestone definitions or changes: named subsets of process symbols whose
+  completion/slippage should be tracked independently from the whole project.
 
 Ask the user before applying changes when:
 
@@ -113,6 +123,36 @@ Ask the user before applying changes when:
 After successful reconciliation, move each fully incorporated note to
 `reconciled/`. Use a dated subfolder when it helps traceability. Do not move a
 source file while material questions from that file remain unresolved.
+For runner-owned Slack folders, "successful reconciliation" means producing the
+requested JSON/artifacts and service updates; leave cursor advancement and input
+file retention to the runner.
+
+## Slack Bot Runs and Continuity
+
+Slack reconciliation runs should treat the prior continuity note as live project
+management state, not as a historical summary. Read `continuity_note.json`,
+`pm_signal_context.json`, `agent_context.json`, Slack message files, teammate
+mapping files, and the current timestamp before deciding whether to draft
+messages. Even when no new Slack messages were collected, use the continuity
+expectations and current time to decide whether a check-in is now due.
+
+Every Slack run must write a fresh continuity note through
+`update_slack_continuity_note`. The note should be concise but operational:
+expected replies, expected status changes, expected timescales, who owns each
+expectation, whether follow-up should be DM or channel-visible, and what the next
+run should verify. Keep teammate messages short and focused; prefer frequent
+small follow-ups over broad status dumps.
+
+For teammate DMs, focus on what changed for that resource or their roles,
+current blockers by priority, work that should be active now, upcoming work, and
+definitions of done for in-progress items. Ask whether anything is blocked,
+resolved, uncaptured, incorrectly assigned, or estimated poorly. For channel
+messages, use visibility deliberately: cross-resource coordination, repeated DM
+non-response, milestone risk, critical-path uncertainty, or team-wide decisions.
+
+Return the exact JSON shape the runner requested. Include no-message decisions
+for mapped teammates who do not need a message, and always include the
+continuity note.
 
 ## Planning Judgment
 
@@ -153,6 +193,12 @@ Use aliases when people refer to the same process by different names. Preserve
 old symbols as aliases after renames when a note or conversation may still use
 the old label.
 
+Stake resources to a process when evidence says named teammates have committed
+or when a role assignment hides scarce expertise. Staked resources are a hard
+resource-aware scheduling constraint before cup filling. When multiple resources
+are staked to one process, make sure the communication plan reflects the
+coordination cost and shared done definition.
+
 ## Slippage and Calibration
 
 Treat slippage as a planning signal, not just a report field. Before committing
@@ -160,6 +206,12 @@ a reconciled state, query the latest schedule snapshots for the relevant
 terminal processes and compare prior `completion_at` values to the new
 projection. Explain whether changes came from scope, estimates, resource
 capacity, dependencies, blockers, lifecycle status, or calendar changes.
+
+Milestones are named subsets of process symbols. Prefer committing and comparing
+active milestone snapshots when they exist because different milestones naturally
+have different risk horizons. Use milestone slippage to ask what the plan failed
+to capture: missing dependency, wrong estimate, blocked work, unmodeled capacity,
+calendar exception, unclear ownership, or topology granularity.
 
 When notes contain actual progress, update process status and revise remaining
 role effort when appropriate. Do not silently erase slippage by shortening
@@ -187,11 +239,25 @@ Report:
 - P3 watchlist: upcoming processes before `ES`.
 - Current blockers, blocker owners if known, and the next unblock action.
 - Critical path processes and inferred durations.
+- Active milestone slippage and the likely reason for movement.
 - Role-prioritized and resource-prioritized work.
 - Resource or role utilization pressure.
 - Slippage since the prior committed snapshot.
 - Estimate-confidence issues and the next evidence needed to improve them.
 - Questions whose answers would change topology, effort, status, or resources.
+
+For active project management, explicitly check:
+
+- Work that should already be started or done, especially items past `LS` or
+  `LF`.
+- Critical-path items starting soon, starting today, or estimated with weak
+  confidence.
+- Critical-path work involving multiple roles or resources.
+- High-slack work that may reveal missing dependencies or false slack.
+- Whether each teammate has a clear current/staked assignment and whether their
+  actual work is fully represented in the graph.
+- New blockers, resolved blockers, holidays, calendar exceptions, recurring
+  capacity changes, and definitions of done that need team buy-in.
 
 Keep daily action items specific: process symbol, action, role/resource, blocker
 or dependency, and the timestamp context used for the query.

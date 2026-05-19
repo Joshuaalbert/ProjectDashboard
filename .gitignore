@@ -6,6 +6,12 @@ data/
 *.lbug.shadow
 *.lbug.wal
 *.lbug/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
 __pycache__/
 *.py[cod]
 *.egg-info/
