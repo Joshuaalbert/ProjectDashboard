@@ -87,9 +87,19 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
 
     Returns:
         Resource schedule data with process rows, optional allocation slices,
-        critical path, and convergence metadata.
+        schedule-window diagnostics, and convergence metadata.
     """
     options = dict(_mapping(input_data.get("options", {}), "options"))
+    backend = str(options.get("resource_schedule_backend", "greedy"))
+    if backend == "mcts":
+        from projdash.engine.resource_schedule_commitment import (
+            compute_commitment_resource_schedule,
+        )
+
+        return compute_commitment_resource_schedule(input_data)
+
+    if backend != "greedy":
+        raise ValueError("resource_schedule_backend must be 'greedy' or 'mcts'")
     project_id = str(input_data["project_id"])
     project_start_at = _as_utc(input_data["project_start_at"])
     as_of = _as_utc(input_data["as_of"])
@@ -109,7 +119,7 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
         _mapping(item, "role requirement")
         for item in _sequence(input_data.get("role_requirements", ()))
     ]
-    _validate_integral_effort_hours(requirements)
+    _validate_positive_effort_hours(requirements)
     roles = [_mapping(item, "role") for item in _sequence(input_data.get("roles", ()))]
     resources = [
         _mapping(item, "resource") for item in _sequence(input_data.get("resources", ()))
@@ -120,6 +130,13 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     blockers = [
         _mapping(item, "blocker") for item in _sequence(input_data.get("blockers", ()))
     ]
+    fixed_allocation_slices = _fixed_allocation_slices(
+        input_data.get("fixed_allocation_slices", ()),
+    )
+    capacity_holds = _capacity_holds(input_data.get("capacity_holds", ()))
+    fixed_role_completions = _fixed_role_completions(
+        input_data.get("fixed_role_completions", ()),
+    )
 
     dependencies = _collect_dependencies(input_data, processes)
     topo_order = _topological_order(processes, dependencies)
@@ -135,7 +152,12 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
         resources=resources,
         calendars=calendars,
     )
-    active_blocked_process_ids = _blocked_process_ids(blockers, as_of)
+    # Blockers are represented in planning only through ordinary blocker
+    # resolver processes and dependency edges. The blocker metadata itself is
+    # retained for API compatibility, but it must not create a second scheduling
+    # policy path.
+    _ = blockers
+    active_blocked_process_ids: set[str] = set()
     resource_by_id = {str(resource["resource_id"]): resource for resource in resources}
     expanded_buckets = _expand_capacity_buckets(
         resources=resources,
@@ -144,6 +166,11 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
         horizon_ends_at=horizon_ends_at,
         planning_granularity=planning_granularity,
     )
+    _apply_fixed_allocation_slices_to_buckets(
+        expanded_buckets,
+        fixed_allocation_slices,
+    )
+    _apply_capacity_holds_to_buckets(expanded_buckets, capacity_holds)
 
     previous_state = _initial_iteration_state(
         processes=processes,
@@ -162,6 +189,7 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
             topo_order=topo_order,
             cpm_by_id=cpm_by_id,
             requirements_by_process=requirements_by_process,
+            fixed_role_completions=fixed_role_completions,
             active_role_ids=active_role_ids,
             resources=resources,
             resource_by_id=resource_by_id,
@@ -190,6 +218,7 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     unallocated = list(final_iteration["unallocated_requirements"])
     if unallocated:
         _raise_for_permanent_capacity_failures(unallocated)
+    if _requires_capacity_search(unallocated):
         next_horizon_ends_at = _next_capacity_search_end(
             horizon_starts_at,
             horizon_ends_at,
@@ -225,7 +254,10 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
         )
 
     all_slices = _with_slice_ids(
-        slices=final_iteration["allocation_slices"],
+        slices=[
+            *fixed_allocation_slices,
+            *list(final_iteration["allocation_slices"]),
+        ],
         project_id=project_id,
         as_of=as_of,
         horizon_starts_at=horizon_starts_at,
@@ -237,6 +269,7 @@ def compute_resource_schedule(input_data: Mapping[str, object]) -> dict[str, obj
     )
     output_slices = all_slices if include_slices else []
     processes_out = list(final_iteration["processes"])
+    _apply_fixed_allocation_bounds(processes_out, fixed_allocation_slices)
     _attach_allocation_diagnostics(
         rows=processes_out,
         unallocated=unallocated,
@@ -306,6 +339,195 @@ def allocation_slice_fingerprint(slices: list[dict[str, object]]) -> tuple[tuple
             )
         )
     return tuple(sorted(rows))
+
+
+def _fixed_allocation_slices(value: object) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in _sequence(value):
+        row = dict(_mapping(item, "fixed allocation slice"))
+        starts_at = _as_utc(row["starts_at"])
+        ends_at = _as_utc(row["ends_at"])
+        effort_hours = float(row.get("effort_hours", 0.0) or 0.0)
+        capacity_hours = float(row.get("capacity_hours", effort_hours) or 0.0)
+        if ends_at <= starts_at or effort_hours <= EPSILON:
+            continue
+        row["starts_at"] = starts_at
+        row["ends_at"] = ends_at
+        row["effort_hours"] = effort_hours
+        row["capacity_hours"] = capacity_hours
+        row.setdefault("iteration", 0)
+        row.setdefault("cost_rate", None)
+        row.setdefault("cost_unit", None)
+        row.setdefault("cost_currency", None)
+        row.setdefault("cost_amount", None)
+        row.setdefault("allocation_source", "fixed")
+        rows.append(row)
+    return rows
+
+
+def _capacity_holds(value: object) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in _sequence(value):
+        row = dict(_mapping(item, "capacity hold"))
+        starts_at = _as_utc(row["starts_at"])
+        ends_at = _as_utc(row["ends_at"])
+        if ends_at <= starts_at:
+            continue
+        rows.append(
+            {
+                "resource_id": str(row["resource_id"]),
+                "starts_at": starts_at,
+                "ends_at": ends_at,
+                "hold_id": row.get("hold_id"),
+                "source": row.get("source", "capacity_hold"),
+            }
+        )
+    return rows
+
+
+def _fixed_role_completions(value: object) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for item in _sequence(value):
+        row = dict(_mapping(item, "fixed role completion"))
+        starts_at = _as_utc(row["starts_at"])
+        finish_at = _as_utc(row["finish_at"])
+        if finish_at < starts_at:
+            continue
+        rows.append(
+            {
+                "process_id": str(row["process_id"]),
+                "requirement_id": str(row["requirement_id"]),
+                "role_id": str(row["role_id"]),
+                "resource_id": str(row["resource_id"]),
+                "starts_at": starts_at,
+                "finish_at": finish_at,
+                "source": row.get("source", "fixed_role_completion"),
+                "work_plan_id": row.get("work_plan_id"),
+                "forecast_id": row.get("forecast_id"),
+            }
+        )
+    return rows
+
+
+def _apply_fixed_allocation_slices_to_buckets(
+    buckets: tuple[_LedgerBucket, ...],
+    fixed_slices: list[dict[str, object]],
+) -> None:
+    for fixed_slice in fixed_slices:
+        resource_id = str(fixed_slice["resource_id"])
+        starts_at = _as_utc(fixed_slice["starts_at"])
+        ends_at = _as_utc(fixed_slice["ends_at"])
+        if ends_at <= starts_at:
+            continue
+        for bucket in buckets:
+            if bucket.resource_id != resource_id:
+                continue
+            overlap_hours = _overlap_hours(
+                starts_at,
+                ends_at,
+                bucket.starts_at,
+                bucket.ends_at,
+            )
+            if overlap_hours <= EPSILON:
+                continue
+            # The scheduler cannot split a resource's pinned work inside one
+            # planning bucket. Any pin overlap reserves the remaining bucket
+            # capacity, even if the recorded effort is partial.
+            consumed_hours = bucket.remaining_hours
+            bucket.remaining_hours -= consumed_hours
+            if bucket.remaining_hours < -EPSILON:
+                raise ValueError(
+                    "fixed allocation exceeds resource capacity for "
+                    f"{resource_id} between {bucket.starts_at.isoformat()} and "
+                    f"{bucket.ends_at.isoformat()}"
+                )
+            if bucket.remaining_hours < 0:
+                bucket.remaining_hours = 0.0
+
+
+def _apply_capacity_holds_to_buckets(
+    buckets: tuple[_LedgerBucket, ...],
+    holds: list[dict[str, object]],
+) -> None:
+    for hold in holds:
+        resource_id = str(hold["resource_id"])
+        starts_at = _as_utc(hold["starts_at"])
+        ends_at = _as_utc(hold["ends_at"])
+        if ends_at <= starts_at:
+            continue
+        for bucket in buckets:
+            if bucket.resource_id != resource_id:
+                continue
+            if _overlap_hours(starts_at, ends_at, bucket.starts_at, bucket.ends_at) <= EPSILON:
+                continue
+            bucket.remaining_hours = 0.0
+
+
+def _apply_fixed_role_completions_to_requirement_states(
+    completions: list[dict[str, object]],
+    states: dict[tuple[str, str], _RequirementState],
+) -> None:
+    for completion in completions:
+        key = (str(completion["process_id"]), str(completion["requirement_id"]))
+        state = states.get(key)
+        if state is None:
+            continue
+        required_effort = float(state.requirement["effort_hours"])
+        state.allocated_hours = max(state.allocated_hours, required_effort)
+        starts_at = _as_utc(completion["starts_at"])
+        finish_at = _as_utc(completion["finish_at"])
+        if state.starts_at is None or starts_at < state.starts_at:
+            state.starts_at = starts_at
+        if state.ends_at is None or finish_at > state.ends_at:
+            state.ends_at = finish_at
+        state.reason = None
+
+
+def _overlap_hours(
+    starts_at: dt.datetime,
+    ends_at: dt.datetime,
+    window_starts_at: dt.datetime,
+    window_ends_at: dt.datetime,
+) -> float:
+    overlap_starts_at = max(starts_at, window_starts_at)
+    overlap_ends_at = min(ends_at, window_ends_at)
+    if overlap_ends_at <= overlap_starts_at:
+        return 0.0
+    return (overlap_ends_at - overlap_starts_at).total_seconds() / 3600
+
+
+def _apply_fixed_allocation_bounds(
+    rows: list[dict[str, object]],
+    fixed_slices: list[dict[str, object]],
+) -> None:
+    if not fixed_slices:
+        return
+    bounds_by_process: dict[str, list[dt.datetime]] = {}
+    for fixed_slice in fixed_slices:
+        process_id = str(fixed_slice["process_id"])
+        bounds_by_process.setdefault(process_id, []).extend(
+            [
+                _as_utc(fixed_slice["starts_at"]),
+                _as_utc(fixed_slice["ends_at"]),
+            ]
+        )
+    for row in rows:
+        process_id = str(row["process_id"])
+        bounds = bounds_by_process.get(process_id)
+        if not bounds:
+            continue
+        fixed_start = min(bounds)
+        fixed_finish = max(bounds)
+        ready_at = _as_utc(row["ready_at"]) if row.get("ready_at") is not None else None
+        if ready_at is not None:
+            fixed_start = max(fixed_start, ready_at)
+            fixed_finish = max(fixed_finish, fixed_start)
+        starts_at = _as_utc(row["starts_at"]) if row.get("starts_at") is not None else None
+        ends_at = _as_utc(row["ends_at"]) if row.get("ends_at") is not None else None
+        if starts_at is None or fixed_start < starts_at:
+            row["starts_at"] = fixed_start
+        if ends_at is None or fixed_finish > ends_at:
+            row["ends_at"] = fixed_finish
 
 
 def compare_resource_schedule_iterations(
@@ -391,6 +613,7 @@ def _run_allocation_iteration(
     topo_order: tuple[str, ...],
     cpm_by_id: dict[str, _ProcessCpm],
     requirements_by_process: dict[str, list[Mapping[str, object]]],
+    fixed_role_completions: list[dict[str, object]],
     active_role_ids: set[str],
     resources: list[Mapping[str, object]],
     resource_by_id: dict[str, Mapping[str, object]],
@@ -403,12 +626,17 @@ def _run_allocation_iteration(
     ledger = _fresh_ledger(expanded_buckets)
     daily_allocated: dict[tuple[str, str, str, str], float] = defaultdict(float)
     bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str] = {}
+    session_focus: dict[tuple[str, str, str], tuple[str, str]] = {}
     process_rows: dict[str, dict[str, object]] = {}
     requirement_states = {
         _requirement_state_key(requirement): _RequirementState(requirement=requirement)
         for requirement in requirements_by_process.values()
         for requirement in requirement
     }
+    _apply_fixed_role_completions_to_requirement_states(
+        fixed_role_completions,
+        requirement_states,
+    )
     allocation_slices: list[dict[str, object]] = []
     unallocated: list[dict[str, object]] = []
     completed_process_ids: set[str] = set()
@@ -455,7 +683,22 @@ def _run_allocation_iteration(
                 for item in ledger.values()
                 if item.starts_at == _starts_at and item.ends_at == bucket_ends_at
             ),
-            key=lambda item: _bucket_resource_sort_key(item, resource_by_id),
+            key=lambda item: (
+                _bucket_resource_preference_rank(
+                    bucket=item,
+                    active_role_ids=active_role_ids,
+                    dependencies=dependencies,
+                    process_rows=process_rows,
+                    completed_process_ids=completed_process_ids,
+                    cpm_by_id=cpm_by_id,
+                    requirements_by_process=requirements_by_process,
+                    requirement_states=requirement_states,
+                    closed_process_ids=closed_process_ids,
+                    project_start_at=project_start_at,
+                    processes_by_id=processes_by_id,
+                ),
+                *_bucket_resource_sort_key(item, resource_by_id),
+            ),
         ):
             if bucket.remaining_hours <= EPSILON:
                 continue
@@ -477,6 +720,7 @@ def _run_allocation_iteration(
                 ledger=ledger,
                 resources_used_by_requirement=resources_used_by_requirement,
                 bucket_focus=bucket_focus,
+                session_focus=session_focus,
             )
             assignments = _water_fill_requirement_candidates(
                 candidates,
@@ -495,6 +739,11 @@ def _run_allocation_iteration(
                     candidate.requirement
                 )
                 bucket_focus[_bucket_focus_key(bucket)] = process_id
+                _set_session_focus(
+                    session_focus,
+                    candidate.bucket,
+                    candidate.requirement,
+                )
                 resources_used_by_requirement[
                     (
                         process_id,
@@ -536,6 +785,7 @@ def _run_allocation_iteration(
                 processes_by_id=processes_by_id,
                 horizon_ends_at=horizon_ends_at,
                 bucket_focus=bucket_focus,
+                session_focus=session_focus,
                 iteration=iteration,
                 allocation_slices=allocation_slices,
             ):
@@ -681,7 +931,7 @@ def _settle_ready_processes(
             process_requirements = requirements_by_process.get(process_id, [])
             process = processes_by_id[process_id]
             if (
-                str(process.get("explicit_status", "")) == "done"
+                str(process.get("derived_status", "")) == "finished"
                 or process.get("finished_at") is not None
             ):
                 _finalize_done_process(
@@ -760,6 +1010,7 @@ def _ready_split_candidates_for_bucket(
         set[str],
     ],
     bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
+    session_focus: dict[tuple[str, str, str], tuple[str, str]],
 ) -> list[_RequirementCandidate]:
     candidates = []
     role_availability_by_key: dict[tuple[str, str, dt.datetime], float] = {}
@@ -786,6 +1037,13 @@ def _ready_split_candidates_for_bucket(
             requirement_key = _requirement_state_key(requirement)
             state = requirement_states[requirement_key]
             if state.reason is not None:
+                continue
+            if not _session_focus_allows(
+                bucket,
+                requirement_key,
+                requirement_states,
+                session_focus,
+            ):
                 continue
             remaining = float(requirement["effort_hours"]) - state.allocated_hours
             if remaining <= EPSILON:
@@ -856,6 +1114,9 @@ def _ready_split_candidates_for_bucket(
                         resources=resources,
                         ledger=ledger,
                         bucket_focus=bucket_focus,
+                        session_focus=session_focus,
+                        requirement_key=requirement_key,
+                        requirement_states=requirement_states,
                         starts_at=feasible_start,
                     )
                 )
@@ -875,11 +1136,57 @@ def _ready_split_candidates_for_bucket(
                         cpm.topo_index,
                         process_id,
                         str(requirement["requirement_id"]),
+                        _resource_preference_rank(requirement, bucket.resource_id),
                         bucket.resource_id,
                     ),
                 )
             )
     return _focused_process_candidates(candidates)
+
+
+def _bucket_resource_preference_rank(
+    *,
+    bucket: _LedgerBucket,
+    active_role_ids: set[str],
+    dependencies: dict[str, tuple[str, ...]],
+    process_rows: dict[str, dict[str, object]],
+    completed_process_ids: set[str],
+    cpm_by_id: dict[str, _ProcessCpm],
+    requirements_by_process: dict[str, list[Mapping[str, object]]],
+    requirement_states: dict[tuple[str, str], _RequirementState],
+    closed_process_ids: set[str],
+    project_start_at: dt.datetime,
+    processes_by_id: dict[str, Mapping[str, object]],
+) -> int:
+    for process_id in cpm_by_id:
+        if process_id in completed_process_ids or process_id in closed_process_ids:
+            continue
+        ready_at = _process_ready_at(
+            process_id=process_id,
+            dependencies=dependencies,
+            process_rows=process_rows,
+            completed_process_ids=completed_process_ids,
+            cpm_by_id=cpm_by_id,
+            project_start_at=project_start_at,
+            processes_by_id=processes_by_id,
+        )
+        if ready_at is None or ready_at >= bucket.ends_at:
+            continue
+        for requirement in requirements_by_process.get(process_id, []):
+            if str(requirement.get("allocation_policy", "split_allowed")) != "split_allowed":
+                continue
+            if str(requirement["role_id"]) not in active_role_ids:
+                continue
+            if str(requirement["role_id"]) not in bucket.role_ids:
+                continue
+            state = requirement_states[_requirement_state_key(requirement)]
+            if state.reason is not None:
+                continue
+            if _resource_preference_rank(requirement, bucket.resource_id) == 0 and (
+                requirement.get("preferred_resource_ids")
+            ):
+                return 0
+    return 1
 
 
 def _focused_process_candidates(
@@ -900,12 +1207,13 @@ def _water_fill_requirement_candidates(
     candidates: list[_RequirementCandidate],
     capacity_hours: float,
 ) -> list[tuple[_RequirementCandidate, float]]:
-    if not candidates or capacity_hours + EPSILON < 1:
+    if not candidates or capacity_hours <= EPSILON:
         return []
     for tier in _role_availability_tiers(candidates):
         for candidate in tier:
-            if candidate.headroom_hours + EPSILON >= 1:
-                return [(candidate, 1.0)]
+            amount = min(capacity_hours, candidate.headroom_hours)
+            if amount > EPSILON:
+                return [(candidate, amount)]
     return []
 
 
@@ -979,6 +1287,7 @@ def _allocate_contiguous_ready_requirements(
     processes_by_id: dict[str, Mapping[str, object]],
     horizon_ends_at: dt.datetime,
     bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
+    session_focus: dict[tuple[str, str, str], tuple[str, str]],
     iteration: int,
     allocation_slices: list[dict[str, object]],
 ) -> bool:
@@ -1016,12 +1325,19 @@ def _allocate_contiguous_ready_requirements(
                 ledger=ledger,
                 daily_allocated=daily_allocated,
                 bucket_focus=bucket_focus,
+                session_focus=session_focus,
+                requirement_states=requirement_states,
                 iteration=iteration,
             )
             for allocation in new_slices:
                 allocation_slices.append(allocation)
                 allocation_bucket = _allocation_bucket_key(allocation)
                 bucket_focus[allocation_bucket] = str(allocation["process_id"])
+                _set_session_focus(
+                    session_focus,
+                    ledger[allocation_bucket],
+                    requirement,
+                )
                 _apply_allocation_to_requirement_state(
                     state,
                     allocation,
@@ -1116,7 +1432,7 @@ def _finalize_open_processes(
             continue
         process = processes_by_id[process_id]
         if (
-            str(process.get("explicit_status", "")) == "done"
+            str(process.get("derived_status", "")) == "finished"
             or process.get("finished_at") is not None
         ):
             _finalize_done_process(
@@ -1323,7 +1639,14 @@ def _allocate_split(
                 continue
             resource = resource_by_id[bucket.resource_id]
             candidates.append(
-                (_resource_sort_key(resource, bucket, ready_at), bucket, headroom)
+                (
+                    (
+                        _resource_preference_rank(requirement, bucket.resource_id),
+                        *_resource_sort_key(resource, bucket, ready_at),
+                    ),
+                    bucket,
+                    headroom,
+                )
             )
 
         selected = [
@@ -1363,12 +1686,22 @@ def _allocate_contiguous(
     daily_allocated: dict[tuple[str, str, str, str], float],
     bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
     iteration: int,
+    session_focus: dict[tuple[str, str, str], tuple[str, str]] | None = None,
+    requirement_states: dict[tuple[str, str], _RequirementState] | None = None,
 ) -> list[dict[str, object]]:
+    if session_focus is None:
+        session_focus = {}
+    if requirement_states is None:
+        requirement_states = {}
     effort = float(requirement["effort_hours"])
     process_id = str(requirement["process_id"])
+    requirement_key = _requirement_state_key(requirement)
     sorted_resources = sorted(
         eligible,
-        key=lambda resource: _first_resource_bucket_key(resource, ledger, ready_at),
+        key=lambda resource: (
+            _resource_preference_rank(requirement, str(resource["resource_id"])),
+            *_first_resource_bucket_key(resource, ledger, ready_at),
+        ),
     )
     for resource in sorted_resources:
         resource_id = str(resource["resource_id"])
@@ -1384,6 +1717,12 @@ def _allocate_contiguous(
             for bucket in resource_working_buckets
             if bucket.remaining_hours > EPSILON
             and bucket_focus.get(_bucket_focus_key(bucket), process_id) == process_id
+            and _session_focus_allows(
+                bucket,
+                requirement_key,
+                requirement_states,
+                session_focus,
+            )
         ]
         for index, _first in enumerate(buckets):
             total = 0.0
@@ -1420,6 +1759,11 @@ def _allocate_contiguous(
                             requirement,
                         )
                         bucket_focus[_bucket_focus_key(selected_bucket)] = process_id
+                        _set_session_focus(
+                            session_focus,
+                            selected_bucket,
+                            requirement,
+                        )
                         slices.append(
                             _allocation_row(
                                 project_id=project_id,
@@ -1462,15 +1806,16 @@ def _water_fill(
     selected: list[tuple[_LedgerBucket, float]],
     remaining: float,
 ) -> list[tuple[_LedgerBucket, float]]:
-    demand = int(remaining + EPSILON)
+    demand = remaining
     assignments = []
     for bucket, headroom in selected:
-        if demand <= 0:
+        if demand <= EPSILON:
             break
-        if headroom + EPSILON < 1:
+        amount = min(demand, headroom)
+        if amount <= EPSILON:
             continue
-        assignments.append((bucket, 1.0))
-        demand -= 1
+        assignments.append((bucket, amount))
+        demand -= amount
     return assignments
 
 
@@ -1488,14 +1833,16 @@ def _candidate_headroom(
         key = _daily_allocation_key(requirement, bucket.resource_id, bucket.local_date)
         daily_residual = max(0.0, float(cap) - daily_allocated[key])
     available_after_ready = _bucket_capacity_after(bucket, ready_at)
-    if (
-        bucket.remaining_hours + EPSILON < 1
-        or available_after_ready + EPSILON < 1
-        or daily_residual + EPSILON < 1
-        or remaining + EPSILON < 1
-    ):
+    headroom = min(
+        1.0,
+        bucket.remaining_hours,
+        available_after_ready,
+        daily_residual,
+        remaining,
+    )
+    if headroom <= EPSILON:
         return 0.0
-    return 1.0
+    return headroom
 
 
 def _block_headroom(
@@ -1791,19 +2138,20 @@ def _compute_cpm(
             (earliest_finish[dependency] for dependency in dependencies.get(process_id, ())),
             default=project_start,
         )
+        constraints = [dependency_finish]
+        if process.get("remaining_ready_at") is not None:
+            constraints.append(_as_utc(process["remaining_ready_at"]))
         if process.get("started_at") is not None:
-            start = _as_utc(process["started_at"])
-        else:
-            constraints = [dependency_finish]
-            if process.get("earliest_start_at") is not None:
-                constraints.append(next_business_day(_as_utc(process["earliest_start_at"])))
-            delay_days = int(process.get("delay_after_dependencies_business_days", 0) or 0)
-            if delay_days:
-                constraints.append(add_business_days(dependency_finish, delay_days))
-            start = max(constraints)
+            constraints.append(_as_utc(process["started_at"]))
+        if process.get("earliest_start_at") is not None:
+            constraints.append(next_business_day(_as_utc(process["earliest_start_at"])))
+        delay_days = int(process.get("delay_after_dependencies_business_days", 0) or 0)
+        if delay_days:
+            constraints.append(add_business_days(dependency_finish, delay_days))
+        start = max(constraints)
         earliest_start[process_id] = start
         if process.get("finished_at") is not None:
-            earliest_finish[process_id] = _as_utc(process["finished_at"])
+            earliest_finish[process_id] = max(_as_utc(process["finished_at"]), start)
         else:
             earliest_finish[process_id] = add_business_days(
                 start,
@@ -1821,13 +2169,8 @@ def _compute_cpm(
     slack: dict[str, int] = {}
     for process_id in reversed(topo_order):
         process = process_by_id[process_id]
-        if process.get("finished_at") is not None:
+        if process.get("finished_at") is not None or process.get("started_at") is not None:
             latest_start[process_id] = earliest_start[process_id]
-            latest_finish[process_id] = earliest_finish[process_id]
-            slack[process_id] = 0
-            continue
-        if process.get("started_at") is not None:
-            latest_start[process_id] = _as_utc(process["started_at"])
             latest_finish[process_id] = earliest_finish[process_id]
             slack[process_id] = 0
             continue
@@ -1835,6 +2178,7 @@ def _compute_cpm(
             (latest_start[successor] for successor in successors.get(process_id, ())),
             default=completion_at,
         )
+        finish = max(finish, earliest_finish[process_id])
         duration_days = int(process.get("duration_business_days", 0) or 0)
         start = subtract_business_days(finish, duration_days)
         latest_start[process_id] = start
@@ -1880,9 +2224,11 @@ def _process_ready_at(
         dependency_finishes.append(_as_utc(ends_at))
     dependency_finish = max(dependency_finishes, default=project_start_at)
     process = processes_by_id[process_id]
-    if process.get("started_at") is not None:
-        return _as_utc(process["started_at"])
     constraints = [project_start_at, dependency_finish]
+    if process.get("remaining_ready_at") is not None:
+        constraints.append(_as_utc(process["remaining_ready_at"]))
+    elif process.get("started_at") is not None:
+        constraints.append(_as_utc(process["started_at"]))
     if process.get("earliest_start_at") is not None:
         constraints.append(_as_utc(process["earliest_start_at"]))
     delay_days = int(process.get("delay_after_dependencies_business_days", 0) or 0)
@@ -1922,6 +2268,60 @@ def _bucket_focus_key(
     bucket: _LedgerBucket,
 ) -> tuple[str, dt.datetime, dt.datetime]:
     return bucket.resource_id, bucket.starts_at, bucket.ends_at
+
+
+def _bucket_session_focus_key(bucket: _LedgerBucket) -> tuple[str, str, str]:
+    session_id = bucket.window_id or f"{bucket.starts_at.isoformat()}..{bucket.ends_at.isoformat()}"
+    return bucket.resource_id, bucket.local_date, session_id
+
+
+def _requirement_state_finished(state: _RequirementState) -> bool:
+    return (
+        state.allocated_hours + EPSILON
+        >= float(state.requirement["effort_hours"])
+    )
+
+
+def _session_focus_blocks(
+    bucket: _LedgerBucket,
+    requirement_key: tuple[str, str],
+    requirement_states: dict[tuple[str, str], _RequirementState],
+    session_focus: dict[tuple[str, str, str], tuple[str, str]],
+) -> bool:
+    focused_key = session_focus.get(_bucket_session_focus_key(bucket))
+    if focused_key is None or focused_key == requirement_key:
+        return False
+    focused_state = requirement_states.get(focused_key)
+    return focused_state is not None and not _requirement_state_finished(focused_state)
+
+
+def _session_focus_allows(
+    bucket: _LedgerBucket,
+    requirement_key: tuple[str, str],
+    requirement_states: dict[tuple[str, str], _RequirementState],
+    session_focus: dict[tuple[str, str, str], tuple[str, str]],
+) -> bool:
+    if not _session_focus_blocks(
+        bucket,
+        requirement_key,
+        requirement_states,
+        session_focus,
+    ):
+        focused_key = session_focus.get(_bucket_session_focus_key(bucket))
+        if focused_key is not None and focused_key != requirement_key:
+            session_focus.pop(_bucket_session_focus_key(bucket), None)
+        return True
+    return False
+
+
+def _set_session_focus(
+    session_focus: dict[tuple[str, str, str], tuple[str, str]],
+    bucket: _LedgerBucket,
+    requirement: Mapping[str, object],
+) -> None:
+    session_focus[_bucket_session_focus_key(bucket)] = _requirement_state_key(
+        requirement
+    )
 
 
 def _allocation_bucket_key(
@@ -2009,7 +2409,7 @@ def _resource_calendar_ids(resource: Mapping[str, object]) -> tuple[str, ...]:
 
 def _is_done_process(process: Mapping[str, object]) -> bool:
     return (
-        str(process.get("explicit_status", "")) == "done"
+        str(process.get("derived_status", "")) == "finished"
         or process.get("finished_at") is not None
     )
 
@@ -2029,6 +2429,25 @@ def _blocked_process_ids(
         if created_at <= as_of and (resolved_at is None or resolved_at > as_of):
             blocked.add(str(blocker["process_id"]))
     return blocked
+
+
+def _unresolved_blocker_process_ids(
+    processes: list[Mapping[str, object]],
+) -> set[str]:
+    return {
+        str(process["process_id"])
+        for process in processes
+        if _is_unresolved_blocker_process(process)
+    }
+
+
+def _is_unresolved_blocker_process(process: Mapping[str, object]) -> bool:
+    if str(process.get("process_type", "standard")) != "blocker":
+        return False
+    status = str(process.get("derived_status", "waiting"))
+    if status == "finished":
+        return False
+    return process.get("finished_at") is None
 
 
 def _expand_capacity_buckets(
@@ -2139,7 +2558,7 @@ def _fresh_ledger(
             starts_at=bucket.starts_at,
             ends_at=bucket.ends_at,
             capacity_hours=bucket.capacity_hours,
-            remaining_hours=bucket.capacity_hours,
+            remaining_hours=bucket.remaining_hours,
             role_ids=bucket.role_ids,
             local_date=bucket.local_date,
             local_week=bucket.local_week,
@@ -2157,20 +2576,24 @@ def _eligible_resources(
     role_id = str(requirement["role_id"])
     if role_id not in active_role_ids:
         return []
-    staked_resource_ids = {
-        str(resource_id)
-        for resource_id in requirement.get("staked_resource_ids", ()) or ()
-    }
     return [
         resource
         for resource in resources
         if bool(resource.get("active", True))
         and role_id in {str(value) for value in resource.get("role_ids", ())}
-        and (
-            not staked_resource_ids
-            or str(resource.get("resource_id")) in staked_resource_ids
-        )
     ]
+
+
+def _resource_preference_rank(
+    requirement: Mapping[str, object],
+    resource_id: str,
+) -> int:
+    preferred_resource_ids = {
+        str(value) for value in requirement.get("preferred_resource_ids", ()) or ()
+    }
+    if not preferred_resource_ids:
+        return 0
+    return 0 if resource_id in preferred_resource_ids else 1
 
 
 def _window_id_for_bucket(
@@ -2231,6 +2654,9 @@ def _role_remaining_capacity_hours(
     resources: list[Mapping[str, object]],
     ledger: dict[tuple[str, dt.datetime, dt.datetime], _LedgerBucket],
     bucket_focus: dict[tuple[str, dt.datetime, dt.datetime], str],
+    session_focus: dict[tuple[str, str, str], tuple[str, str]],
+    requirement_key: tuple[str, str],
+    requirement_states: dict[tuple[str, str], _RequirementState],
     starts_at: dt.datetime,
 ) -> float:
     """Measure remaining schedulable capacity for a role from a point in time."""
@@ -2250,6 +2676,13 @@ def _role_remaining_capacity_hours(
             continue
         focused_process_id = bucket_focus.get(_bucket_focus_key(bucket))
         if focused_process_id is not None and focused_process_id != process_id:
+            continue
+        if _session_focus_blocks(
+            bucket,
+            requirement_key,
+            requirement_states,
+            session_focus,
+        ):
             continue
         capacity = _bucket_capacity_between(bucket, starts_at, bucket.ends_at)
         total += min(bucket.remaining_hours, capacity)
@@ -2330,7 +2763,7 @@ def _finalize_predecessor_unallocated(
                     "dependency predecessor did not finish in the computed schedule."
                 ),
                 "required_effort_hours": float(requirement["effort_hours"]),
-                "remaining_effort_hours": float(requirement["effort_hours"]),
+                "unallocated_effort_hours": float(requirement["effort_hours"]),
                 "allocated_effort_hours": 0.0,
                 "eligible_resource_ids": [],
                 "first_feasible_starts_at": None,
@@ -2378,7 +2811,7 @@ def _finalize_blocked(
                         "blockers prevented this requirement from being scheduled."
                     ),
                     "required_effort_hours": float(requirement["effort_hours"]),
-                    "remaining_effort_hours": float(requirement["effort_hours"]),
+                    "unallocated_effort_hours": float(requirement["effort_hours"]),
                     "allocated_effort_hours": 0.0,
                     "eligible_resource_ids": [],
                     "first_feasible_starts_at": None,
@@ -2398,12 +2831,20 @@ def _finalize_no_requirement_process(
     cpm_by_id: dict[str, _ProcessCpm],
     processes_by_id: dict[str, Mapping[str, object]],
 ) -> None:
-    del processes_by_id
+    process = processes_by_id[process_id]
+    starts_at = (
+        max(_as_utc(process["started_at"]), ready_at)
+        if process.get("started_at") is not None
+        else ready_at
+    )
     ends_at = ready_at
+    if process.get("finished_at") is not None:
+        ends_at = max(_as_utc(process["finished_at"]), ready_at)
+    ends_at = max(ends_at, starts_at)
     process_rows[process_id] = _process_row(
         cpm=cpm_by_id[process_id],
         ready_at=ready_at,
-        starts_at=ready_at,
+        starts_at=starts_at,
         ends_at=ends_at,
         allocation_state="complete",
         requirement_ids=[],
@@ -2420,11 +2861,15 @@ def _finalize_done_process(
     requirement_ids: list[str],
 ) -> None:
     process = processes_by_id[process_id]
-    starts_at = _as_utc(process["started_at"]) if process.get("started_at") else ready_at
+    starts_at = (
+        max(_as_utc(process["started_at"]), ready_at)
+        if process.get("started_at")
+        else ready_at
+    )
     ends_at = (
-        _as_utc(process["finished_at"])
+        max(_as_utc(process["finished_at"]), starts_at)
         if process.get("finished_at") is not None
-        else max(starts_at, ready_at)
+        else starts_at
     )
     process_rows[process_id] = _process_row(
         cpm=cpm_by_id[process_id],
@@ -2457,6 +2902,9 @@ def _finalize_process_with_requirements(
     ends_at = max((state.ends_at for state in process_states if state.ends_at), default=None)
     if complete:
         allocation_state = "complete"
+        ready_at = max(ready_values) if ready_values else None
+        if ends_at is not None and ready_at is not None:
+            ends_at = max(ends_at, ready_at)
     elif any_allocated:
         allocation_state = "partial"
         ends_at = None
@@ -2529,7 +2977,7 @@ def _unallocated_row(
         "message": _reason_message(reason),
         "diagnostic_message": _diagnostic_message(reason, diagnostics),
         "required_effort_hours": round(float(requirement["effort_hours"]), 6),
-        "remaining_effort_hours": round(remaining, 6),
+        "unallocated_effort_hours": round(remaining, 6),
         "allocated_effort_hours": round(state.allocated_hours, 6),
         "eligible_resource_ids": list(state.eligible_resource_ids),
         "first_feasible_starts_at": state.first_feasible_starts_at,
@@ -2614,6 +3062,15 @@ def _raise_for_permanent_capacity_failures(
     raise ValueError(f"resource schedule cannot be solved: {details}")
 
 
+def _requires_capacity_search(unallocated: list[dict[str, object]]) -> bool:
+    expandable_reasons = {
+        "horizon_exhausted",
+        "no_calendar_capacity",
+        "resource_capacity_exhausted",
+    }
+    return any(str(item.get("reason")) in expandable_reasons for item in unallocated)
+
+
 def _next_capacity_search_end(
     horizon_starts_at: dt.datetime,
     horizon_ends_at: dt.datetime,
@@ -2680,14 +3137,14 @@ def _requirement_diagnostics(
             if remaining > EPSILON:
                 resources_with_remaining.add(bucket.resource_id)
 
-    remaining_effort = max(0.0, required_effort - state.allocated_hours)
+    unallocated_effort = max(0.0, required_effort - state.allocated_hours)
     return {
         "process_ready_at": ready_at,
         "horizon_ends_at": horizon_ends_at,
         "allocation_policy": str(requirement.get("allocation_policy", "split_allowed")),
         "required_effort_hours": round(required_effort, 6),
         "allocated_effort_hours": round(state.allocated_hours, 6),
-        "remaining_effort_hours": round(remaining_effort, 6),
+        "unallocated_effort_hours": round(unallocated_effort, 6),
         "eligible_resource_count": len(eligible_resource_ids),
         "eligible_resource_ids": list(eligible_resource_ids),
         "candidate_capacity_hours": round(candidate_capacity, 6),
@@ -2709,7 +3166,7 @@ def _diagnostic_message(reason: str, diagnostics: Mapping[str, object]) -> str:
     remaining_capacity = float(
         diagnostics.get("remaining_candidate_capacity_hours", 0) or 0
     )
-    remaining_effort = float(diagnostics.get("remaining_effort_hours", 0) or 0)
+    unallocated_effort = float(diagnostics.get("unallocated_effort_hours", 0) or 0)
 
     if reason == "missing_role":
         return "The required role is missing or inactive, so no resource can be matched."
@@ -2729,7 +3186,7 @@ def _diagnostic_message(reason: str, diagnostics: Mapping[str, object]) -> str:
         )
     if reason == "horizon_exhausted":
         return (
-            f"{remaining_effort:g} effort hour(s) remain unfilled before "
+            f"{unallocated_effort:g} effort hour(s) are unallocated before "
             f"horizon_ends_at={_diagnostic_datetime(horizon_ends_at)}; "
             f"{remaining_capacity:g} eligible capacity hour(s) remain available."
         )
@@ -2826,7 +3283,7 @@ def _add_iteration_not_converged_reasons(
                         "so this requirement may need a larger max_iterations value."
                     ),
                     "required_effort_hours": float(requirement["effort_hours"]),
-                    "remaining_effort_hours": 0.0,
+                    "unallocated_effort_hours": 0.0,
                     "allocated_effort_hours": float(requirement["effort_hours"]),
                     "eligible_resource_ids": [],
                     "first_feasible_starts_at": None,
@@ -2899,7 +3356,7 @@ def _attach_resource_schedule_windows(
     dependencies: dict[str, tuple[str, ...]],
     topo_order: tuple[str, ...],
 ) -> None:
-    """Attach process-level resource-aware ES/EF/LS/LF windows to rows."""
+    """Attach resource-aware schedule windows and buffer to rows."""
     row_by_id = {str(row["process_id"]): row for row in rows}
     process_by_id = {str(process["process_id"]): process for process in processes}
     active_hours_by_process = _active_allocation_hours_by_process(allocation_slices)
@@ -2909,8 +3366,17 @@ def _attach_resource_schedule_windows(
         if row.get("starts_at") is not None and row.get("ends_at") is not None
     ]
     for row in rows:
-        row["resource_es_at"] = row.get("starts_at")
-        row["resource_ef_at"] = row.get("ends_at")
+        row["schedule_window_starts_at"] = None
+        row["schedule_window_ends_at"] = None
+        row["schedule_buffer_hours"] = None
+        row["schedule_elapsed_hours"] = None
+        row["role_sensitivity"] = []
+        row["max_makespan_sensitivity_hours"] = None
+        row["sensitivity_label"] = "unknown"
+        # Legacy nullable aliases retained for older clients; project-management
+        # context should use schedule_window_* and schedule_buffer_hours.
+        row["resource_es_at"] = None
+        row["resource_ef_at"] = None
         row["resource_ls_at"] = None
         row["resource_lf_at"] = None
         row["resource_slack_hours"] = None
@@ -2926,8 +3392,10 @@ def _attach_resource_schedule_windows(
             if predecessor_id in row_by_id:
                 successors.setdefault(predecessor_id, []).append(successor_id)
 
-    completion_at = max(_as_utc(row_by_id[process_id]["ends_at"]) for process_id in complete_ids)
-    latest_start: dict[str, dt.datetime] = {}
+    completion_at = max(
+        _as_utc(row_by_id[process_id]["ends_at"])
+        for process_id in complete_ids
+    )
     for process_id in reversed(topo_order):
         row = row_by_id.get(process_id)
         if row is None or process_id not in complete_ids:
@@ -2935,32 +3403,62 @@ def _attach_resource_schedule_windows(
         starts_at = _as_utc(row["starts_at"])
         ends_at = _as_utc(row["ends_at"])
         elapsed_duration = max(ends_at - starts_at, dt.timedelta())
+        window_starts_at = _schedule_window_start(
+            process_id=process_id,
+            row_by_id=row_by_id,
+            dependencies=dependencies,
+            process=process_by_id.get(process_id, {}),
+            fallback=starts_at,
+        )
+        child_starts = [
+            _as_utc(row_by_id[successor_id]["starts_at"])
+            for successor_id in successors.get(process_id, ())
+            if successor_id in row_by_id
+            and row_by_id[successor_id].get("starts_at") is not None
+        ]
+        window_ends_at = min(child_starts, default=completion_at)
         active_duration_hours = active_hours_by_process.get(process_id)
         if active_duration_hours is None:
             active_duration_hours = elapsed_duration.total_seconds() / 3600
         row["inferred_duration_hours"] = round(active_duration_hours, 6)
-        process = process_by_id.get(process_id, {})
-        if process.get("finished_at") is not None:
-            ls_at = starts_at
-            lf_at = ends_at
-        elif process.get("started_at") is not None:
-            ls_at = _as_utc(process["started_at"])
-            lf_at = ls_at + elapsed_duration
-        else:
-            successor_starts = [
-                latest_start[successor_id]
-                for successor_id in successors.get(process_id, ())
-                if successor_id in latest_start
-            ]
-            lf_at = min(successor_starts, default=completion_at)
-            ls_at = lf_at - elapsed_duration
-        latest_start[process_id] = ls_at
-        row["resource_ls_at"] = ls_at
-        row["resource_lf_at"] = lf_at
-        row["resource_slack_hours"] = round(
-            (ls_at - starts_at).total_seconds() / 3600,
+        row["schedule_elapsed_hours"] = round(
+            elapsed_duration.total_seconds() / 3600,
             6,
         )
+        row["schedule_window_starts_at"] = window_starts_at
+        row["schedule_window_ends_at"] = window_ends_at
+        buffer_hours = (
+            (window_ends_at - window_starts_at - elapsed_duration).total_seconds()
+            / 3600
+        )
+        row["schedule_buffer_hours"] = round(max(0.0, buffer_hours), 6)
+        row["resource_es_at"] = window_starts_at
+        row["resource_ef_at"] = ends_at
+        row["resource_ls_at"] = starts_at
+        row["resource_lf_at"] = window_ends_at
+        row["resource_slack_hours"] = round(
+            max(0.0, buffer_hours),
+            6,
+        )
+
+
+def _schedule_window_start(
+    *,
+    process_id: str,
+    row_by_id: Mapping[str, Mapping[str, object]],
+    dependencies: Mapping[str, tuple[str, ...]],
+    process: Mapping[str, object],
+    fallback: dt.datetime,
+) -> dt.datetime:
+    values = [
+        _as_utc(row_by_id[dependency_id]["ends_at"])
+        for dependency_id in dependencies.get(process_id, ())
+        if dependency_id in row_by_id
+        and row_by_id[dependency_id].get("ends_at") is not None
+    ]
+    if process.get("earliest_start_at") is not None:
+        values.append(_as_utc(process["earliest_start_at"]))
+    return max(values, default=fallback)
 
 
 def _active_allocation_hours_by_process(
@@ -3053,15 +3551,15 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
     raise ValueError(f"{name} must be an object")
 
 
-def _validate_integral_effort_hours(
+def _validate_positive_effort_hours(
     requirements: list[Mapping[str, object]],
 ) -> None:
     for requirement in requirements:
         effort = float(requirement.get("effort_hours", 0))
-        if effort <= 0 or not math.isclose(effort, round(effort), abs_tol=EPSILON):
+        if not math.isfinite(effort) or effort <= 0:
             requirement_id = requirement.get("requirement_id", "<unknown>")
             raise ValueError(
-                "role requirement effort_hours must be a positive whole number "
+                "role requirement effort_hours must be positive "
                 f"for {requirement_id!r}"
             )
 

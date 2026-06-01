@@ -15,6 +15,5 @@ fi
 
 "${PYTHON_CMD[@]}" -m projdash.service.bootstrap \
   --storage "${PROJDASH_STORAGE}" \
-  --db "${PROJDASH_DB_PATH}" \
-  --migrate-from-ladybug "${PROJDASH_LADYBUG_MIGRATION_SOURCE:-projdash.lbug}"
+  --db "${PROJDASH_DB_PATH}"
 "${STREAMLIT_CMD[@]}" run app.py

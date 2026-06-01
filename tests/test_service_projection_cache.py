@@ -298,7 +298,7 @@ def test_resource_projection_cache_is_invalidated_after_successful_command():
         InMemoryProjectRepository(),
         resource_scheduler=_counting_scheduler(scheduler_calls),
     )
-    project_id, _role_id, _calendar_id, _resource_id, process_id = (
+    project_id, role_id, _calendar_id, resource_id, process_id = (
         _seed_allocatable_project(service)
     )
 
@@ -309,12 +309,15 @@ def test_resource_projection_cache_is_invalidated_after_successful_command():
     result = _handle(
         service,
         {
-            "action": "set_process_status",
+            "action": "upsert_process_role_pin",
             "project_id": project_id,
             "process_id": process_id,
-            "status": "in_progress",
-            "edit_at": _iso(13, 12),
-            "started_at": _iso(13, 12),
+            "requirement_id": "req-api-eng",
+            "role_id": role_id,
+            "resource_id": resource_id,
+            "pinned_at": _iso(13, 12),
+            "forecast_finish_at": _iso(13, 15),
+            "updated_at": _iso(13, 12),
         },
     )
     assert result.ok is True

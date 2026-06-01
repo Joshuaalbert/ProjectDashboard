@@ -132,6 +132,122 @@ class ResourceOptionsMixin(StrictModel):
     planning_granularity: PlanningGranularity = PlanningGranularity.HOUR
     max_iterations: PositiveInt = 20
     convergence_tolerance_hours: NonNegativeFloat = 0
+    resource_schedule_backend: Literal[
+        "greedy",
+        "mcts",
+    ] = "greedy"
+    resource_schedule_mcts_c_puct: NonNegativeFloat | None = None
+    resource_schedule_mcts_max_actions: PositiveInt | None = None
+    include_resource_sensitivity: bool = False
+    resource_schedule_sensitivity_backend: Literal[
+        "greedy",
+        "mcts",
+    ] | None = None
+    resource_schedule_sensitivity_workers: PositiveInt | None = None
+    resource_schedule_sensitivity_process_pool: bool = True
+
+
+class QueryPMCommunicationProtocol(QueryModel, ResourceOptionsMixin):
+    """Fetch verifiable PM communication obligations and evidence."""
+
+    action: Literal["query_pm_communication_protocol"] = (
+        "query_pm_communication_protocol"
+    )
+    project_id: str = Field(min_length=1)
+    as_of: AwareDatetime
+    now: AwareDatetime
+    include_satisfied: bool = True
+
+
+class QueryProcessEvidenceLineItems(QueryModel):
+    """Fetch persisted PM evidence recency rows for process line items."""
+
+    action: Literal["query_process_evidence_line_items"] = (
+        "query_process_evidence_line_items"
+    )
+    project_id: str = Field(min_length=1)
+    process_id: str | None = Field(default=None, min_length=1)
+    process_symbol: str | None = Field(default=None, min_length=1)
+    line_items: list[str] | None = None
+
+    @field_validator("line_items")
+    @classmethod
+    def _validate_line_items(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return validate_unique_non_empty(value, "line_items")
+
+    @model_validator(mode="after")
+    def _validate_process_filter(self) -> QueryProcessEvidenceLineItems:
+        if self.process_id is not None and self.process_symbol is not None:
+            raise ValueError("process_id and process_symbol are mutually exclusive.")
+        return self
+
+
+class QueryResourceEvidenceLineItems(QueryModel):
+    """Fetch persisted PM evidence recency rows for resource line items."""
+
+    action: Literal["query_resource_evidence_line_items"] = (
+        "query_resource_evidence_line_items"
+    )
+    project_id: str = Field(min_length=1)
+    resource_id: str | None = Field(default=None, min_length=1)
+    line_items: list[str] | None = None
+
+    @field_validator("line_items")
+    @classmethod
+    def _validate_line_items(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return validate_unique_non_empty(value, "line_items")
+
+
+class QueryProcessRolePins(QueryModel):
+    """Fetch process-role pins."""
+
+    action: Literal["query_process_role_pins"] = "query_process_role_pins"
+    project_id: str = Field(min_length=1)
+    as_of: AwareDatetime | None = None
+    process_id: str | None = Field(default=None, min_length=1)
+    process_symbol: str | None = Field(default=None, min_length=1)
+    resource_id: str | None = Field(default=None, min_length=1)
+    include_done: bool = True
+
+    @model_validator(mode="after")
+    def _validate_process_filter(self) -> QueryProcessRolePins:
+        if self.process_id is not None and self.process_symbol is not None:
+            raise ValueError("process_id and process_symbol are mutually exclusive.")
+        return self
+
+
+class QueryPMMarkdownContext(QueryModel, ResourceOptionsMixin):
+    """Generate service-prepared PM markdown context with evidence questions."""
+
+    action: Literal["query_pm_markdown_context"] = "query_pm_markdown_context"
+    project_id: str = Field(min_length=1)
+    as_of: AwareDatetime
+    now: AwareDatetime
+    scope: Scope | None = None
+    terminal_process_symbols: list[str] | None = None
+    snapshot_limit: PositiveInt = 5
+    resource_schedule_backend: Literal[
+        "greedy",
+        "mcts",
+    ] = "mcts"
+    include_resource_sensitivity: bool = True
+    resource_schedule_sensitivity_backend: Literal[
+        "greedy",
+        "mcts",
+    ] | None = "mcts"
+    resource_schedule_sensitivity_workers: PositiveInt | None = 1
+    resource_schedule_sensitivity_process_pool: bool = False
+
+    @field_validator("terminal_process_symbols")
+    @classmethod
+    def _validate_terminal_symbols(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return validate_unique_non_empty(value, "terminal_process_symbols")
 
 
 class HorizonMixin(StrictModel):
@@ -358,6 +474,11 @@ Query = Annotated[
     | QuerySlackRuns
     | QueryPendingSlackOutbox
     | QuerySlackOutbox
+    | QueryPMCommunicationProtocol
+    | QueryProcessEvidenceLineItems
+    | QueryResourceEvidenceLineItems
+    | QueryProcessRolePins
+    | QueryPMMarkdownContext
     | QuerySchedule
     | QueryCriticalPath
     | QueryProcessGraph
@@ -389,6 +510,11 @@ __all__ = [
     "QueryScheduleSnapshots",
     "QueryEnvelope",
     "QueryMilestones",
+    "QueryPMCommunicationProtocol",
+    "QueryPMMarkdownContext",
+    "QueryProcessEvidenceLineItems",
+    "QueryResourceEvidenceLineItems",
+    "QueryProcessRolePins",
     "QuerySlackBotToken",
     "QuerySlackOutbox",
     "QuerySlackRuns",

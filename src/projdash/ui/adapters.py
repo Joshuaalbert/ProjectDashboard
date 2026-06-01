@@ -3,11 +3,57 @@
 from __future__ import annotations
 
 import datetime as dt
-import math
 from decimal import Decimal
 from typing import Any
 
 from graphviz import Digraph
+
+GANTT_WAITING_COLOR = "#64748b"
+GANTT_EARLY_START_COLOR = "#7c3aed"
+GANTT_READY_COLOR = "#2563eb"
+GANTT_STARTED_COLOR = "#f59e0b"
+GANTT_DUE_COLOR = "#eab308"
+GANTT_FINISHED_COLOR = "#16a34a"
+GANTT_COMPLETEDNESS_COLORS = {
+    "waiting": GANTT_WAITING_COLOR,
+    "early_start": GANTT_EARLY_START_COLOR,
+    "ready": GANTT_READY_COLOR,
+    "started": GANTT_STARTED_COLOR,
+    "due": GANTT_DUE_COLOR,
+    "finished": GANTT_FINISHED_COLOR,
+}
+GANTT_COMPLETEDNESS_LEGEND = (
+    (
+        "waiting",
+        "Waiting - parents unfinished, unpinned",
+        GANTT_WAITING_COLOR,
+    ),
+    (
+        "early_start",
+        "Early start - pinned before parents finish",
+        GANTT_EARLY_START_COLOR,
+    ),
+    (
+        "ready",
+        "Ready - parents finished, unpinned",
+        GANTT_READY_COLOR,
+    ),
+    (
+        "started",
+        "Started - pinned, forecast has passed",
+        GANTT_STARTED_COLOR,
+    ),
+    (
+        "due",
+        "Due - pinned before forecast finish",
+        GANTT_DUE_COLOR,
+    ),
+    (
+        "finished",
+        "Finished - all roles verified done",
+        GANTT_FINISHED_COLOR,
+    ),
+)
 
 
 def as_dict(value: Any) -> dict[str, Any]:
@@ -100,6 +146,9 @@ def blocker_table_rows(
                 "severity": blocker.get("severity"),
                 "summary": blocker.get("summary"),
                 "details": blocker.get("details"),
+                "resolution_owner_resource_id": blocker.get(
+                    "resolution_owner_resource_id"
+                ),
                 "process_symbol": node.get("process_symbol") or process_symbol,
                 "process_name": node.get("name"),
                 "process_status": node.get("status"),
@@ -110,6 +159,16 @@ def blocker_table_rows(
                     resources_by_process.get(node_process_id)
                     or resources_by_process.get(process_symbol)
                     or []
+                ),
+                "needed_by_role_ids": ", ".join(
+                    blocker.get("needed_by_role_ids") or []
+                ),
+                "needed_by_resource_ids": ", ".join(
+                    blocker.get("needed_by_resource_ids") or []
+                ),
+                "immediate_blocked_processes": blocker.get(
+                    "immediate_blocked_processes",
+                    [],
                 ),
                 "created_at": blocker.get("created_at"),
                 "resolved_at": blocker.get("resolved_at"),
@@ -344,9 +403,8 @@ def gantt_rows(
     *,
     terminal_symbols: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """Normalize graph nodes for ES/LS/EF/LF Gantt plotting."""
+    """Normalize graph nodes for schedule-window Gantt plotting."""
     scoped_symbols = set(ancestor_scope_symbols(graph_data, terminal_symbols or ()))
-    critical_ids = set(graph_data.get("critical_path_process_ids") or [])
     rows = []
     for node in graph_data.get("nodes", []):
         symbol = node.get("process_symbol")
@@ -354,49 +412,285 @@ def gantt_rows(
             continue
         dependency = node.get("dependency_only") or {}
         resource = node.get("resource_aware") or {}
-        es_at = _parse_datetime(resource.get("es_at") or resource.get("starts_at"))
-        ef_at = _parse_datetime(resource.get("ef_at") or resource.get("ends_at"))
-        ls_at = _parse_datetime(resource.get("ls_at"))
-        lf_at = _parse_datetime(resource.get("lf_at"))
-        if es_at is None:
-            es_at = _parse_datetime(dependency.get("es_at"))
-        if ef_at is None:
-            ef_at = _parse_datetime(dependency.get("ef_at"))
-        if ls_at is None:
-            ls_at = _parse_datetime(dependency.get("ls_at"))
-        if lf_at is None:
-            lf_at = _parse_datetime(dependency.get("lf_at"))
+        planned_start_at = _parse_datetime(
+            resource.get("starts_at") or dependency.get("es_at")
+        )
+        planned_finish_at = _parse_datetime(
+            resource.get("ends_at") or dependency.get("ef_at")
+        )
+        window_starts_at = _parse_datetime(
+            resource.get("schedule_window_starts_at") or dependency.get("es_at")
+        )
+        window_ends_at = _parse_datetime(
+            resource.get("schedule_window_ends_at") or dependency.get("lf_at")
+        )
+        buffer_hours = resource.get("schedule_buffer_hours")
+        if buffer_hours is None:
+            buffer_hours = dependency.get("slack_hours")
+        sensitive = _is_sensitive_process(
+            node,
+            resource=resource,
+            dependency=dependency,
+        )
+        pin_markers = _gantt_pin_markers(node.get("role_requirements") or [])
         rows.append(
             {
                 "process_id": node.get("process_id"),
                 "symbol": symbol,
                 "name": node.get("name"),
-                "es_at": es_at,
-                "ef_at": ef_at,
-                "ls_at": ls_at,
-                "lf_at": lf_at,
-                "resource_starts_at": _parse_datetime(resource.get("starts_at")),
-                "resource_ends_at": _parse_datetime(resource.get("ends_at")),
-                "slack_hours": (
-                    resource.get("slack_hours")
-                    if resource.get("slack_hours") is not None
-                    else dependency.get("slack_hours")
+                "status": node.get("status"),
+                "computed_status": node.get("computed_status"),
+                "started_at": _parse_datetime(node.get("started_at")),
+                "finished_at": _parse_datetime(node.get("finished_at")),
+                "window_starts_at": window_starts_at,
+                "window_ends_at": window_ends_at,
+                "planned_start_at": planned_start_at,
+                "planned_finish_at": planned_finish_at,
+                "es_at": window_starts_at,
+                "ef_at": planned_finish_at,
+                "ls_at": planned_start_at,
+                "lf_at": window_ends_at,
+                "resource_starts_at": planned_start_at,
+                "resource_ends_at": planned_finish_at,
+                "schedule_buffer_hours": buffer_hours,
+                "slack_hours": buffer_hours,
+                "max_makespan_sensitivity_hours": resource.get(
+                    "max_makespan_sensitivity_hours"
                 ),
-                "critical": _is_critical_process(
-                    node,
-                    critical_ids=critical_ids,
-                    resource=resource,
-                    dependency=dependency,
-                ),
+                "sensitivity_label": resource.get("sensitivity_label"),
+                "sensitive": sensitive,
+                "critical": sensitive,
                 "allocation_state": resource.get("allocation_state"),
+                "pin_markers": pin_markers,
             }
         )
-    return rows
+    return _topologically_order_gantt_rows(rows, graph_data)
+
+
+def gantt_completedness_legend_items() -> list[dict[str, str]]:
+    """Return the process-state legend items for Gantt charts."""
+    return [
+        {"state": state, "label": label, "color": color}
+        for state, label, color in GANTT_COMPLETEDNESS_LEGEND
+    ]
+
+
+def _topologically_order_gantt_rows(
+    rows: list[dict[str, Any]],
+    graph_data: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if len(rows) < 2:
+        return rows
+    row_by_symbol = {str(row.get("symbol")): row for row in rows if row.get("symbol")}
+    selected_symbols = set(row_by_symbol)
+    original_index = {str(row.get("symbol")): index for index, row in enumerate(rows)}
+    id_to_symbol = {
+        str(node.get("process_id")): str(node.get("process_symbol"))
+        for node in graph_data.get("nodes", []) or []
+        if node.get("process_id") and node.get("process_symbol")
+    }
+    successors: dict[str, set[str]] = {symbol: set() for symbol in selected_symbols}
+    indegree: dict[str, int] = {symbol: 0 for symbol in selected_symbols}
+    dependency_edges = _gantt_dependency_edges(graph_data, selected_symbols, id_to_symbol)
+    for predecessor, successor in dependency_edges:
+        if successor in successors[predecessor]:
+            continue
+        successors[predecessor].add(successor)
+        indegree[successor] += 1
+
+    ready = sorted(
+        [symbol for symbol in selected_symbols if indegree[symbol] == 0],
+        key=original_index.get,
+    )
+    ordered_symbols = []
+    while ready:
+        symbol = ready.pop(0)
+        ordered_symbols.append(symbol)
+        newly_ready = []
+        for successor in sorted(successors[symbol], key=original_index.get):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                newly_ready.append(successor)
+        if newly_ready:
+            ready = newly_ready + ready
+    if len(ordered_symbols) != len(selected_symbols):
+        ordered = set(ordered_symbols)
+        ordered_symbols.extend(
+            symbol for symbol in row_by_symbol if symbol not in ordered
+        )
+    else:
+        ordered_symbols = _compact_gantt_topological_order(
+            ordered_symbols,
+            dependency_edges,
+            successors,
+        )
+    return [row_by_symbol[symbol] for symbol in ordered_symbols]
+
+
+def _gantt_dependency_edges(
+    graph_data: dict[str, Any],
+    selected_symbols: set[str],
+    id_to_symbol: dict[str, str],
+) -> list[tuple[str, str]]:
+    dependency_edges = []
+    seen = set()
+    for edge in graph_data.get("edges", []) or []:
+        predecessor = edge.get("predecessor_process_symbol")
+        successor = edge.get("successor_process_symbol")
+        if predecessor is None:
+            predecessor = id_to_symbol.get(str(edge.get("predecessor_process_id")))
+        if successor is None:
+            successor = id_to_symbol.get(str(edge.get("successor_process_id")))
+        predecessor = str(predecessor) if predecessor else ""
+        successor = str(successor) if successor else ""
+        if predecessor not in selected_symbols or successor not in selected_symbols:
+            continue
+        if (predecessor, successor) in seen:
+            continue
+        dependency_edges.append((predecessor, successor))
+        seen.add((predecessor, successor))
+    return dependency_edges
+
+
+def _compact_gantt_topological_order(
+    ordered_symbols: list[str],
+    dependency_edges: list[tuple[str, str]],
+    successors: dict[str, set[str]],
+) -> list[str]:
+    if len(ordered_symbols) < 3 or not dependency_edges:
+        return ordered_symbols
+    descendants = _gantt_descendants(successors)
+    compacted = list(ordered_symbols)
+    max_passes = len(compacted) * 2
+    for _ in range(max_passes):
+        improved = False
+        for index in range(len(compacted) - 1):
+            left = compacted[index]
+            right = compacted[index + 1]
+            if right in descendants.get(left, set()):
+                continue
+            current_score = _gantt_order_score(compacted, dependency_edges)
+            candidate = list(compacted)
+            candidate[index], candidate[index + 1] = right, left
+            candidate_score = _gantt_order_score(candidate, dependency_edges)
+            if candidate_score < current_score:
+                compacted = candidate
+                improved = True
+        if not improved:
+            break
+    return compacted
+
+
+def _gantt_descendants(successors: dict[str, set[str]]) -> dict[str, set[str]]:
+    descendants: dict[str, set[str]] = {symbol: set() for symbol in successors}
+
+    def visit(root: str, symbol: str) -> None:
+        for successor in successors.get(symbol, set()):
+            if successor in descendants[root]:
+                continue
+            descendants[root].add(successor)
+            visit(root, successor)
+
+    for symbol in successors:
+        visit(symbol, symbol)
+    return descendants
+
+
+def _gantt_order_score(
+    ordered_symbols: list[str],
+    dependency_edges: list[tuple[str, str]],
+) -> int:
+    position = {symbol: index for index, symbol in enumerate(ordered_symbols)}
+    distance_score = sum(
+        (position[successor] - position[predecessor]) ** 2
+        for predecessor, successor in dependency_edges
+    )
+    crossing_score = _gantt_dependency_crossing_count(position, dependency_edges)
+    return distance_score + (20 * crossing_score)
+
+
+def _gantt_dependency_crossing_count(
+    position: dict[str, int],
+    dependency_edges: list[tuple[str, str]],
+) -> int:
+    crossings = 0
+    for index, (first_parent, first_child) in enumerate(dependency_edges):
+        for second_parent, second_child in dependency_edges[index + 1 :]:
+            if len({first_parent, first_child, second_parent, second_child}) < 4:
+                continue
+            parent_order = position[first_parent] - position[second_parent]
+            child_order = position[first_child] - position[second_child]
+            if parent_order * child_order < 0:
+                crossings += 1
+    return crossings
+
+
+def _gantt_pin_markers(
+    role_requirements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    markers = []
+    for requirement in role_requirements:
+        if not isinstance(requirement, dict):
+            continue
+        for pin in requirement.get("pins") or []:
+            if not isinstance(pin, dict):
+                continue
+            started_at = _parse_datetime(
+                pin.get("pinned_started_at")
+                or pin.get("pinned_at")
+                or pin.get("starts_at")
+            )
+            if started_at is not None:
+                markers.append(
+                    {
+                        "kind": "pin_start",
+                        "at": started_at,
+                        "requirement_id": requirement.get("requirement_id")
+                        or pin.get("requirement_id"),
+                        "resource_id": pin.get("resource_id"),
+                    }
+                )
+            finished_at = _parse_datetime(
+                pin.get("verified_finished_at")
+                or pin.get("verified_done_at")
+                or pin.get("ends_at")
+            )
+            if finished_at is not None:
+                markers.append(
+                    {
+                        "kind": "pin_finish",
+                        "at": finished_at,
+                        "requirement_id": requirement.get("requirement_id")
+                        or pin.get("requirement_id"),
+                        "resource_id": pin.get("resource_id"),
+                    }
+                )
+    return sorted(markers, key=lambda item: (item["at"], item["kind"]))
+
+
+def gantt_bar_color(row: dict[str, Any], now: dt.datetime | None) -> str:
+    """Return the completedness-state color for a Gantt row."""
+    del now
+    computed_status = str(row.get("computed_status") or "").strip().lower()
+    started_at = _parse_datetime(row.get("started_at"))
+
+    if computed_status == "finished":
+        return GANTT_FINISHED_COLOR
+
+    if computed_status in GANTT_COMPLETEDNESS_COLORS:
+        return GANTT_COMPLETEDNESS_COLORS[computed_status]
+
+    if started_at is not None:
+        return GANTT_STARTED_COLOR
+
+    return GANTT_WAITING_COLOR
 
 
 def resource_utilization_heatmap(
     utilization_data: dict[str, Any],
     schedule_data: dict[str, Any] | None = None,
+    *,
+    now: dt.datetime | None = None,
 ) -> tuple[list[str], list[dt.datetime], list[list[float]]]:
     """Return resource utilization matrix as labels, bucket starts, values."""
     span = schedule_time_span(schedule_data or {})
@@ -404,32 +698,31 @@ def resource_utilization_heatmap(
         {
             row["resource_id"]
             for row in utilization_data.get("time_series", [])
-            if row.get("resource_id") and _bucket_overlaps_span(row, span)
+            if row.get("resource_id") and _bucket_overlaps_window(row, span, now)
         }
     )
     times = sorted(
         {
             _parse_datetime(row.get("starts_at"))
             for row in utilization_data.get("time_series", [])
-            if row.get("starts_at") and _bucket_overlaps_span(row, span)
+            if row.get("starts_at") and _bucket_overlaps_window(row, span, now)
         }
     )
-    matrix = [[math.nan for _time in times] for _label in labels]
+    matrix = [[0.0 for _time in times] for _label in labels]
     label_index = {label: index for index, label in enumerate(labels)}
     time_index = {time: index for index, time in enumerate(times)}
     for row in utilization_data.get("time_series", []):
         label = row.get("resource_id")
         starts_at = _parse_datetime(row.get("starts_at"))
-        if not _bucket_overlaps_span(row, span):
+        if not _bucket_overlaps_window(row, span, now):
             continue
         if label not in label_index or starts_at not in time_index:
             continue
         current_value = matrix[label_index[label]][time_index[starts_at]]
         utilization_ratio = float(row.get("utilization_ratio") or 0)
-        matrix[label_index[label]][time_index[starts_at]] = (
-            utilization_ratio
-            if math.isnan(current_value)
-            else max(current_value, utilization_ratio)
+        matrix[label_index[label]][time_index[starts_at]] = max(
+            current_value,
+            utilization_ratio,
         )
     return labels, times, matrix
 
@@ -437,6 +730,8 @@ def resource_utilization_heatmap(
 def role_utilization_heatmap(
     utilization_data: dict[str, Any],
     schedule_data: dict[str, Any],
+    *,
+    now: dt.datetime | None = None,
 ) -> tuple[list[str], list[dt.datetime], list[list[float]]]:
     """Return role utilization matrix from utilization buckets and allocations."""
     span = schedule_time_span(schedule_data)
@@ -444,20 +739,21 @@ def role_utilization_heatmap(
         {
             role_id
             for bucket in utilization_data.get("time_series", [])
-            if _bucket_overlaps_span(bucket, span)
+            if _bucket_overlaps_window(bucket, span, now)
             for role_id in bucket.get("role_ids", [])
         }
         | {
             slice_data["role_id"]
             for slice_data in schedule_data.get("allocation_slices", [])
             if slice_data.get("role_id")
+            and _allocation_slice_overlaps_window(slice_data, now)
         }
     )
     times = sorted(
         {
             _parse_datetime(bucket.get("starts_at"))
             for bucket in utilization_data.get("time_series", [])
-            if bucket.get("starts_at") and _bucket_overlaps_span(bucket, span)
+            if bucket.get("starts_at") and _bucket_overlaps_window(bucket, span, now)
         }
     )
     capacity = {
@@ -472,7 +768,7 @@ def role_utilization_heatmap(
     }
     for bucket in utilization_data.get("time_series", []):
         starts_at = _parse_datetime(bucket.get("starts_at"))
-        if not _bucket_overlaps_span(bucket, span):
+        if not _bucket_overlaps_window(bucket, span, now):
             continue
         if starts_at not in times:
             continue
@@ -481,6 +777,8 @@ def role_utilization_heatmap(
     for slice_data in schedule_data.get("allocation_slices", []):
         role_id = slice_data.get("role_id")
         if role_id not in labels:
+            continue
+        if not _allocation_slice_overlaps_window(slice_data, now):
             continue
         slice_start = _parse_datetime(slice_data.get("starts_at"))
         slice_end = _parse_datetime(slice_data.get("ends_at"))
@@ -499,22 +797,31 @@ def role_utilization_heatmap(
             value = (
                 allocated[(role_id, time)] / capacity_hours
                 if capacity_hours
-                else math.nan
+                else 0.0
             )
             row.append(value)
         matrix.append(row)
     return labels, times, matrix
 
 
-def _is_critical_process(
+def _is_sensitive_process(
     node: dict[str, Any],
     *,
-    critical_ids: set[Any],
     resource: dict[str, Any],
     dependency: dict[str, Any],
 ) -> bool:
-    if critical_ids:
-        return node.get("process_id") in critical_ids
+    sensitivity = _float_or_none(resource.get("max_makespan_sensitivity_hours"))
+    if sensitivity is None:
+        sensitivity = _float_or_none(dependency.get("max_makespan_sensitivity_hours"))
+    if sensitivity is not None:
+        return sensitivity > 0
+    if resource.get("sensitivity_label") == "makespan_sensitive":
+        return True
+    if dependency.get("sensitivity_label") == "makespan_sensitive":
+        return True
+    legacy_ids = node.get("critical_path_process_ids")
+    if isinstance(legacy_ids, (list, tuple, set)) and node.get("process_id") in legacy_ids:
+        return True
     return (
         resource.get("criticality_label") == "critical"
         or dependency.get("criticality_label") == "critical"
@@ -602,6 +909,29 @@ def _bucket_overlaps_span(
     return starts_at < span_end and ends_at > span_start
 
 
+def _bucket_overlaps_window(
+    bucket: dict[str, Any],
+    span: tuple[dt.datetime, dt.datetime] | None,
+    now: dt.datetime | None,
+) -> bool:
+    if not _bucket_overlaps_span(bucket, span):
+        return False
+    if now is None:
+        return True
+    ends_at = _parse_datetime(bucket.get("ends_at"))
+    return ends_at is not None and ends_at > now
+
+
+def _allocation_slice_overlaps_window(
+    slice_data: dict[str, Any],
+    now: dt.datetime | None,
+) -> bool:
+    if now is None:
+        return True
+    ends_at = _parse_datetime(slice_data.get("ends_at"))
+    return ends_at is not None and ends_at > now
+
+
 def aggregate_process_properties(
     graph_data: dict[str, Any],
     process_symbols: list[str] | tuple[str, ...],
@@ -665,7 +995,7 @@ def role_priority_rows(
     *,
     terminal_symbols: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return role-scoped process priorities from ES/LS/LF schedule windows."""
+    """Return role-scoped process priorities from planned schedule windows."""
     rows = []
     for node, priority in _priority_nodes(graph_data, now, terminal_symbols):
         for requirement in node.get("role_requirements") or []:
@@ -694,6 +1024,11 @@ def resource_priority_rows(
         node.get("process_id"): priority
         for node, priority in _priority_nodes(graph_data, now, terminal_symbols)
     }
+    node_by_process = {
+        node.get("process_id"): node
+        for node in graph_data.get("nodes", []) or []
+        if node.get("process_id")
+    }
     assignments: dict[tuple[str, str], dict[str, Any]] = {}
     for slice_data in schedule_data.get("allocation_slices", []):
         process_id = slice_data.get("process_id")
@@ -715,6 +1050,43 @@ def resource_priority_rows(
         if role_id:
             assignment["role_ids"].add(role_id)
 
+    for process_id, priority in priority_by_process.items():
+        node = node_by_process.get(process_id) or {}
+        for requirement in node.get("role_requirements") or []:
+            role_id = requirement.get("role_id")
+            if not role_id:
+                continue
+            active_pins = [
+                pin
+                for pin in requirement.get("pins", []) or []
+                if isinstance(pin, dict)
+                and pin.get("status") == "pinned_started"
+            ]
+            for pin in active_pins:
+                resource_id = pin.get("resource_id")
+                if not resource_id:
+                    continue
+                key = (str(resource_id), str(process_id))
+                assignment = assignments.setdefault(
+                    key,
+                    {
+                        **priority,
+                        "resource_id": str(resource_id),
+                        "effort_hours": float(
+                            requirement.get("effort_hours") or 0.0,
+                        ),
+                        "role_ids": set(),
+                    },
+                )
+                assignment["role_ids"].add(str(role_id))
+                assignment["active_pin"] = True
+                assignment["pin_id"] = pin.get("pin_id")
+                assignment["pin_status"] = pin.get("status")
+                assignment["pin_started_at"] = pin.get("pinned_at") or pin.get("starts_at")
+                assignment["pin_forecast_finish_at"] = pin.get("forecast_finish_at")
+                assignment["pin_verified_done_at"] = pin.get("verified_done_at")
+                assignment["pin_overdue"] = bool(pin.get("overdue"))
+
     rows = []
     for assignment in assignments.values():
         rows.append(
@@ -731,17 +1103,15 @@ def build_process_graph_dot(
     *,
     collapsed_process_ids: set[str] | None = None,
 ) -> str:
-    """Build a Graphviz DOT process graph with critical-path styling."""
+    """Build a Graphviz DOT process graph with sensitivity styling."""
     collapsed_process_ids = collapsed_process_ids or set()
-    critical_ids = set(graph_data.get("critical_path_process_ids") or [])
     nodes = {node.get("process_id"): node for node in graph_data.get("nodes", [])}
-    critical_process_ids = {
+    sensitive_process_ids = {
         process_id
         for process_id, node in nodes.items()
         if process_id
-        and _is_critical_process(
+        and _is_sensitive_process(
             node,
-            critical_ids=critical_ids,
             resource=node.get("resource_aware") or {},
             dependency=node.get("dependency_only") or {},
         )
@@ -754,18 +1124,18 @@ def build_process_graph_dot(
     for process_id, node in nodes.items():
         if not process_id:
             continue
-        is_critical = process_id in critical_process_ids
+        is_sensitive = process_id in sensitive_process_ids
         status = str(node.get("computed_status") or node.get("status") or "planned")
         fill = _node_fill(status)
-        border = "#dc2626" if is_critical else "#64748b"
-        penwidth = "3" if is_critical else "1.4"
+        border = "#dc2626" if is_sensitive else "#64748b"
+        penwidth = "3" if is_sensitive else "1.4"
         if process_id in collapsed_process_ids:
             fill = "#f3f4f6"
             penwidth = "2"
         label = _node_label(
             node,
             collapsed=process_id in collapsed_process_ids,
-            critical=is_critical,
+            sensitive=is_sensitive,
         )
         dot.node(
             process_id,
@@ -780,14 +1150,14 @@ def build_process_graph_dot(
         successor = edge.get("successor_process_id")
         if predecessor not in nodes or successor not in nodes:
             continue
-        is_critical_edge = (
-            predecessor in critical_process_ids and successor in critical_process_ids
+        is_sensitive_edge = (
+            predecessor in sensitive_process_ids and successor in sensitive_process_ids
         )
         dot.edge(
             predecessor,
             successor,
-            color="#dc2626" if is_critical_edge else "#94a3b8",
-            penwidth="2.4" if is_critical_edge else "1.2",
+            color="#dc2626" if is_sensitive_edge else "#94a3b8",
+            penwidth="2.4" if is_sensitive_edge else "1.2",
         )
 
     return dot.source
@@ -813,50 +1183,58 @@ def cost_time_series_rows(cost_data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _node_fill(status: str) -> str:
-    if status in {"complete", "done"}:
+    if status in {"finished", "complete", "done"}:
         return "#dcfce7"
-    if status == "blocked":
-        return "#ffedd5"
-    if status in {"late_risk", "late"}:
-        return "#fee2e2"
-    if status == "work_now":
+    if status == "early_start":
+        return "#ede9fe"
+    if status in {"started", "due"}:
+        return "#fef3c7"
+    if status == "ready":
         return "#dbeafe"
+    if status == "waiting":
+        return "#f1f5f9"
     if status in {"canceled", "cancelled"}:
         return "#e5e7eb"
     return "#f8fafc"
 
 
-def _node_label(node: dict[str, Any], *, collapsed: bool, critical: bool) -> str:
+def _node_label(node: dict[str, Any], *, collapsed: bool, sensitive: bool) -> str:
     symbol = node.get("process_symbol") or node.get("process_id")
     name = node.get("name") or ""
     status = node.get("computed_status") or node.get("status") or ""
-    timing = _node_timing_label(node, critical=critical)
+    timing = _node_timing_label(node, sensitive=sensitive)
     prefix = "[+]" if collapsed else ""
     label = f"{prefix}{symbol}\\n{name}\\n{status}\\n{timing}"
     return label[:180]
 
 
-def _node_timing_label(node: dict[str, Any], *, critical: bool) -> str:
+def _node_timing_label(node: dict[str, Any], *, sensitive: bool) -> str:
     resource = node.get("resource_aware") or {}
     dependency = node.get("dependency_only") or {}
     duration_hours = _schedule_window_hours(
         resource,
         dependency,
-        start_fields=("es_at", "starts_at"),
-        end_fields=("lf_at", "ends_at"),
+        start_fields=("starts_at", "es_at"),
+        end_fields=("ends_at", "ef_at"),
     )
-    if critical:
-        return f"duration: {_format_hours(duration_hours)}"
-
-    slack_hours = _schedule_window_hours(
+    buffer_hours = _first_number(
         resource,
         dependency,
-        start_fields=("ls_at",),
-        end_fields=("lf_at",),
+        ("schedule_buffer_hours", "slack_hours"),
     )
+    sensitivity_hours = _first_number(
+        resource,
+        dependency,
+        ("max_makespan_sensitivity_hours",),
+    )
+    if sensitive:
+        return (
+            f"duration: {_format_hours(duration_hours)}; "
+            f"sensitivity: {_format_hours(sensitivity_hours)}"
+        )
     return (
         f"duration: {_format_hours(duration_hours)}; "
-        f"slack: {_format_hours(slack_hours)}"
+        f"buffer: {_format_hours(buffer_hours)}"
     )
 
 
@@ -885,6 +1263,28 @@ def _first_datetime(
             if value is not None:
                 return value
     return None
+
+
+def _first_number(
+    resource: dict[str, Any],
+    dependency: dict[str, Any],
+    fields: tuple[str, ...],
+) -> float | None:
+    for field in fields:
+        for source in (resource, dependency):
+            value = _float_or_none(source.get(field))
+            if value is not None:
+                return value
+    return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _format_hours(value: float | None) -> str:
@@ -964,28 +1364,42 @@ def _priority_nodes(
         symbol = node.get("process_symbol")
         if scoped_symbols and symbol not in scoped_symbols:
             continue
-        if node.get("status") in {"done", "canceled"}:
+        status = str(node.get("computed_status") or node.get("status") or "")
+        if status in {"done", "finished", "canceled"}:
             continue
         dependency = node.get("dependency_only") or {}
         resource = node.get("resource_aware") or {}
-        es_at = _parse_datetime(resource.get("es_at") or resource.get("starts_at"))
-        ls_at = _parse_datetime(resource.get("ls_at"))
-        lf_at = _parse_datetime(resource.get("lf_at"))
-        if es_at is None:
-            es_at = _parse_datetime(dependency.get("es_at"))
-        if ls_at is None:
-            ls_at = _parse_datetime(dependency.get("ls_at"))
-        if lf_at is None:
-            lf_at = _parse_datetime(dependency.get("lf_at"))
-        if es_at is None or ls_at is None or lf_at is None:
+        planned_start_at = _parse_datetime(
+            resource.get("starts_at") or dependency.get("es_at")
+        )
+        planned_finish_at = _parse_datetime(
+            resource.get("ends_at") or dependency.get("ef_at")
+        )
+        schedule_window_starts_at = _parse_datetime(
+            resource.get("schedule_window_starts_at")
+            or dependency.get("schedule_window_starts_at")
+            or resource.get("es_at")
+            or dependency.get("es_at")
+        )
+        schedule_window_ends_at = _parse_datetime(
+            resource.get("schedule_window_ends_at")
+            or dependency.get("schedule_window_ends_at")
+            or resource.get("lf_at")
+            or dependency.get("lf_at")
+        )
+        if planned_start_at is None or planned_finish_at is None:
             continue
-        if now >= lf_at:
+        time_until_start = planned_start_at - now
+        if status in {"started", "due", "early_start"}:
             priority = "P0"
             priority_rank = 0
-        elif now >= ls_at:
+        elif time_until_start < dt.timedelta(days=3):
+            priority = "P0"
+            priority_rank = 0
+        elif time_until_start < dt.timedelta(days=7):
             priority = "P1"
             priority_rank = 1
-        elif now >= es_at:
+        elif time_until_start < dt.timedelta(days=14):
             priority = "P2"
             priority_rank = 2
         else:
@@ -997,9 +1411,24 @@ def _priority_nodes(
                 {
                     "priority": priority,
                     "priority_rank": priority_rank,
+                    "process_id": node.get("process_id"),
                     "process_symbol": symbol,
                     "process_name": node.get("name"),
-                    "hours_until_ls": (ls_at - now).total_seconds() / 3600,
+                    "planned_start_at": planned_start_at,
+                    "planned_finish_at": planned_finish_at,
+                    "schedule_window_starts_at": schedule_window_starts_at,
+                    "schedule_window_ends_at": schedule_window_ends_at,
+                    "hours_until_planned_start": (
+                        planned_start_at - now
+                    ).total_seconds() / 3600,
+                    "hours_until_planned_finish": (
+                        planned_finish_at - now
+                    ).total_seconds() / 3600,
+                    "schedule_buffer_hours": resource.get("schedule_buffer_hours"),
+                    "max_makespan_sensitivity_hours": resource.get(
+                        "max_makespan_sensitivity_hours"
+                    ),
+                    "sensitivity_label": resource.get("sensitivity_label"),
                 },
             )
         )
@@ -1011,7 +1440,7 @@ def _sort_priority_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows,
         key=lambda row: (
             row["priority_rank"],
-            row["hours_until_ls"],
+            row["hours_until_planned_start"],
             str(row.get("role_id") or row.get("resource_id") or ""),
             str(row.get("process_symbol") or ""),
         ),

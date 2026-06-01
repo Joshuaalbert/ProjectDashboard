@@ -136,7 +136,7 @@ def test_critical_path_query_returns_ordered_process_ids():
     assert result.data["critical_path"] == [design_id, implementation_id, review_id]
 
 
-def test_late_process_does_not_mark_process_done():
+def test_unstarted_blocked_by_dependencies_does_not_mark_process_done():
     service, project_id, _, implementation_id, _ = _project_with_processes()
 
     result = service.handle_query(
@@ -150,8 +150,8 @@ def test_late_process_does_not_mark_process_done():
     )
     nodes = {node["process_id"]: node for node in result.data["nodes"]}
 
-    assert nodes[implementation_id]["status"] == "planned"
-    assert nodes[implementation_id]["computed_status"] == "late_risk"
+    assert nodes[implementation_id]["status"] == "waiting"
+    assert nodes[implementation_id]["computed_status"] == "waiting"
     assert nodes[implementation_id]["finished_at"] is None
 
 
@@ -191,9 +191,15 @@ def test_dependency_cycles_are_rejected():
         result.error.message
         == "Adding this process revision would create a dependency cycle."
     )
-    assert result.error.details == {
-        "field_path": "dependencies",
-        "entity_id": design_id,
+    assert result.error.details["field_path"] == "dependencies"
+    assert result.error.details["entity_id"] == design_id
+    assert result.error.details["as_of"] == _at(14).isoformat()
+    assert {
+        (edge["predecessor_process_id"], edge["successor_process_id"])
+        for edge in result.error.details["cycle"]
+    } == {
+        (implementation_id, design_id),
+        (design_id, implementation_id),
     }
     assert (implementation_id, design_id) not in edges
     assert (design_id, implementation_id) in edges

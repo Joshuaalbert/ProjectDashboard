@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
 import math
 from collections import defaultdict
 from typing import Any, Protocol
@@ -19,11 +20,15 @@ from projdash.service.models import (
     CalendarWeeklyWindowCommand,
     CostUnit,
     MilestoneRecord,
+    PMCommunicationEvidenceRecord,
+    ProcessEvidenceLineItemRecord,
     ProcessRecord,
     ProcessRevisionRecord,
+    ProcessRolePinRecord,
     ProcessStatus,
     ProjectRecord,
     ResourceCalendarOverrideCommand,
+    ResourceEvidenceLineItemRecord,
     ResourceHolidayCommand,
     RoleRequirementCommand,
     ScheduleSnapshotRecord,
@@ -38,6 +43,75 @@ from projdash.service.models import (
     SlackRunStatus,
 )
 
+LEGACY_PROCESS_EVIDENCE_LINE_ITEMS = frozenset(
+    {
+        "finished",
+        "historically_staked_resources",
+        "pinned_resources",
+        "planned_resources_uptodate_on_process",
+        "role_requirements",
+        "staked_resources",
+    }
+)
+
+
+def slack_outbox_target_key(
+    message: SlackOutboxMessageCommand | SlackOutboxRecord,
+    project_id: str | None = None,
+) -> tuple[str, str, str, str]:
+    """Return the durable dedupe key for a Slack outbox target."""
+    target_type = getattr(message, "target_type", None) or "dm"
+    target_id = (
+        getattr(message, "slack_channel_id", None)
+        if target_type == "channel"
+        else getattr(message, "slack_user_id", None)
+    )
+    if not target_id:
+        raise ServiceValidationError(
+            code="slack_outbox_target_missing",
+            message="Slack outbox target id is missing.",
+            entity_id=getattr(message, "outbox_id", None),
+        )
+    return (
+        str(project_id or getattr(message, "project_id", "")),
+        str(target_type),
+        str(target_id),
+        str(message.content_hash),
+    )
+
+
+def _outbox_body_hash(body: str) -> str:
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _pm_claim_key(claim) -> tuple[object, ...]:
+    return (
+        claim.evidence_type,
+        claim.resource_id,
+        claim.process_id,
+        claim.process_symbol,
+        claim.obligation_id,
+        claim.content_hash,
+    )
+
+
+def _merge_pm_evidence_claims(existing: list, incoming: list) -> list:
+    output = list(existing)
+    seen = {_pm_claim_key(claim) for claim in output}
+    for claim in incoming:
+        key = _pm_claim_key(claim)
+        if key in seen:
+            continue
+        output.append(claim)
+        seen.add(key)
+    return output
+
+
+DEFAULT_MISSING_PROCESS_ROLE_ID = "role_res_josh"
+DEFAULT_MISSING_PROCESS_ROLE_NAME = "Josh"
+DEFAULT_MISSING_PROCESS_RESOURCE_ID = "res_josh"
+DEFAULT_MISSING_PROCESS_RESOURCE_NAME = "Josh"
+
 
 class RetiredProcessRecord(ProcessRecord):
     """Process projection with soft-retirement audit fields."""
@@ -48,7 +122,7 @@ class RetiredProcessRecord(ProcessRecord):
     def model_dump(self, *args, **kwargs):
         data = super().model_dump(*args, **kwargs)
         if kwargs.get("mode") == "json":
-            for field in ("retired_at", "started_at", "finished_at"):
+            for field in ("retired_at",):
                 if isinstance(data.get(field), str) and data[field].endswith("Z"):
                     data[field] = f"{data[field][:-1]}+00:00"
         return data
@@ -118,6 +192,7 @@ class ProjectRepository(Protocol):
         self,
         project_id: str,
         process_id: str | None,
+        process_type: str,
         name: str,
         description: str,
         effective_at: dt.datetime,
@@ -128,10 +203,17 @@ class ProjectRepository(Protocol):
         delay_after_dependencies_business_days: int,
         required_roles: dict[str, float],
         role_requirements: list[RoleRequirementCommand],
-        staked_resource_ids: list[str],
         assumption_note: str | None,
     ) -> tuple[ProcessRecord, ProcessRevisionRecord]:
         """Create a process if needed and append a planning revision."""
+
+    def delete_process(
+        self,
+        project_id: str,
+        process_id: str,
+        edit_at: dt.datetime,
+    ) -> dict[str, Any]:
+        """Delete a process and remove graph facts that reference it."""
 
     def set_process_status(
         self,
@@ -139,10 +221,40 @@ class ProjectRepository(Protocol):
         process_id: str,
         status: ProcessStatus,
         edit_at: dt.datetime,
-        started_at: dt.datetime | None = None,
-        finished_at: dt.datetime | None = None,
     ) -> tuple[ProcessRecord, str]:
-        """Set explicit process status."""
+        """Validate a lifecycle assertion without storing process state."""
+
+    def upsert_process_role_pin(
+        self,
+        pin: ProcessRolePinRecord,
+    ) -> ProcessRolePinRecord:
+        """Create or update a process-role pin."""
+
+    def delete_process_role_pin(
+        self,
+        project_id: str,
+        pin_id: str,
+    ) -> None:
+        """Delete a process-role pin."""
+
+    def list_process_role_pins(
+        self,
+        project_id: str,
+        as_of: dt.datetime | None = None,
+        process_id: str | None = None,
+        resource_id: str | None = None,
+        include_done: bool = True,
+    ) -> list[ProcessRolePinRecord]:
+        """List process-role pins."""
+
+    def delete_invalid_process_role_pins(
+        self,
+        *,
+        project_id: str | None = None,
+        process_id: str | None = None,
+        edit_at: dt.datetime | None = None,
+    ) -> dict[str, Any]:
+        """Delete process-role pins that cannot be valid at the edit time."""
 
     def resolve_process_id(self, project_id: str, process_symbol: str) -> str:
         """Resolve a project-scoped process symbol or alias to a process id."""
@@ -214,6 +326,7 @@ class ProjectRepository(Protocol):
         project_id: str,
         resource_id: str | None,
         name: str,
+        resource_type: str,
         role_ids: list[str],
         calendar_id: str,
         available_from_at: dt.datetime,
@@ -389,6 +502,46 @@ class ProjectRepository(Protocol):
     ) -> list[SlackOutboxRecord]:
         """List Slack outbox rows matching statuses."""
 
+    def record_pm_communication_evidence(
+        self,
+        evidence: PMCommunicationEvidenceRecord,
+    ) -> PMCommunicationEvidenceRecord:
+        """Persist proof that a PM communication protocol item was sent."""
+
+    def list_pm_communication_evidence(
+        self,
+        project_id: str,
+    ) -> list[PMCommunicationEvidenceRecord]:
+        """List PM communication evidence for a project."""
+
+    def upsert_process_evidence_line_item(
+        self,
+        record: ProcessEvidenceLineItemRecord,
+    ) -> ProcessEvidenceLineItemRecord:
+        """Create or update PM evidence recency for a process line item."""
+
+    def list_process_evidence_line_items(
+        self,
+        project_id: str,
+        process_id: str | None = None,
+        line_items: list[str] | None = None,
+    ) -> list[ProcessEvidenceLineItemRecord]:
+        """List PM evidence recency rows for process line items."""
+
+    def upsert_resource_evidence_line_item(
+        self,
+        record: ResourceEvidenceLineItemRecord,
+    ) -> ResourceEvidenceLineItemRecord:
+        """Create or update PM evidence recency for a resource line item."""
+
+    def list_resource_evidence_line_items(
+        self,
+        project_id: str,
+        resource_id: str | None = None,
+        line_items: list[str] | None = None,
+    ) -> list[ResourceEvidenceLineItemRecord]:
+        """List PM evidence recency rows for resource line items."""
+
     def deactivate_role(
         self,
         project_id: str,
@@ -406,6 +559,7 @@ class ProjectRepository(Protocol):
         blocker_id: str | None = None,
         details: str | None = None,
         severity: str | None = None,
+        resolution_owner_resource_id: str | None = None,
     ) -> BlockerRecord:
         """Add a process blocker."""
 
@@ -415,8 +569,17 @@ class ProjectRepository(Protocol):
         blocker_id: str,
         resolved_at: dt.datetime,
         resolution: str | None = None,
+        resolution_owner_resource_id: str | None = None,
     ) -> BlockerRecord:
         """Resolve a process blocker."""
+
+    def set_blocker_resolution_owner(
+        self,
+        project_id: str,
+        blocker_id: str,
+        resolution_owner_resource_id: str | None,
+    ) -> BlockerRecord:
+        """Set or clear the resource responsible for resolving a blocker."""
 
     def reopen_blocker(
         self,
@@ -471,6 +634,8 @@ class InMemoryProjectRepository:
         self.blockers: dict[str, BlockerRecord] = {}
         self.blocker_ids_by_project: dict[str, list[str]] = defaultdict(list)
         self.role_requirements: dict[str, RoleRequirementCommand] = {}
+        self.process_role_pins: dict[str, ProcessRolePinRecord] = {}
+        self.process_role_pin_ids_by_project: dict[str, list[str]] = defaultdict(list)
         self.roles: dict[str, dict[str, Any]] = {}
         self.role_ids_by_project: dict[str, list[str]] = defaultdict(list)
         self.resources: dict[str, dict[str, Any]] = {}
@@ -498,7 +663,22 @@ class InMemoryProjectRepository:
         self.slack_run_ids_by_project: dict[str, list[str]] = defaultdict(list)
         self.slack_outbox: dict[str, SlackOutboxRecord] = {}
         self.slack_outbox_ids_by_project: dict[str, list[str]] = defaultdict(list)
-        self.slack_outbox_dedupe: dict[tuple[str, str, str], str] = {}
+        self.slack_outbox_dedupe: dict[tuple[str, str, str, str], str] = {}
+        self.pm_communication_evidence: dict[str, PMCommunicationEvidenceRecord] = {}
+        self.pm_communication_evidence_ids_by_project: dict[
+            str,
+            list[str],
+        ] = defaultdict(list)
+        self.process_evidence_line_items: dict[str, ProcessEvidenceLineItemRecord] = {}
+        self.process_evidence_line_item_ids_by_project: dict[
+            str,
+            list[str],
+        ] = defaultdict(list)
+        self.resource_evidence_line_items: dict[str, ResourceEvidenceLineItemRecord] = {}
+        self.resource_evidence_line_item_ids_by_project: dict[
+            str,
+            list[str],
+        ] = defaultdict(list)
 
     def create_project(
         self,
@@ -565,6 +745,10 @@ class InMemoryProjectRepository:
 
         for process_id in process_ids:
             self.processes.pop(process_id, None)
+            for pin_id in list(self.process_role_pin_ids_by_project.get(project_id, [])):
+                pin = self.process_role_pins.get(pin_id)
+                if pin is not None and pin.process_id == process_id:
+                    self.process_role_pins.pop(pin_id, None)
             for revision in self.revisions_by_process.pop(process_id, []):
                 for requirement in revision.role_requirements:
                     if requirement.requirement_id is not None:
@@ -590,6 +774,7 @@ class InMemoryProjectRepository:
         self.milestone_ids_by_project.pop(project_id, None)
         self.process_aliases.pop(project_id, None)
         self.process_alias_sources.pop(project_id, None)
+        self.process_role_pin_ids_by_project.pop(project_id, None)
         self.dependency_edge_ids = {
             key: edge_id
             for key, edge_id in self.dependency_edge_ids.items()
@@ -623,6 +808,21 @@ class InMemoryProjectRepository:
             for key, outbox_id in self.slack_outbox_dedupe.items()
             if key[0] != project_id
         }
+        for evidence_id in self.pm_communication_evidence_ids_by_project.pop(
+            project_id,
+            [],
+        ):
+            self.pm_communication_evidence.pop(evidence_id, None)
+        for evidence_line_id in self.process_evidence_line_item_ids_by_project.pop(
+            project_id,
+            [],
+        ):
+            self.process_evidence_line_items.pop(evidence_line_id, None)
+        for evidence_line_id in self.resource_evidence_line_item_ids_by_project.pop(
+            project_id,
+            [],
+        ):
+            self.resource_evidence_line_items.pop(evidence_line_id, None)
 
     def create_role(
         self,
@@ -693,6 +893,7 @@ class InMemoryProjectRepository:
         self,
         project_id: str,
         process_id: str | None,
+        process_type: str,
         name: str,
         description: str,
         effective_at: dt.datetime,
@@ -703,32 +904,46 @@ class InMemoryProjectRepository:
         delay_after_dependencies_business_days: int,
         required_roles: dict[str, float],
         role_requirements: list[RoleRequirementCommand],
-        staked_resource_ids: list[str],
         assumption_note: str | None,
     ) -> tuple[ProcessRecord, ProcessRevisionRecord]:
         self.get_project(project_id)
-
-        self._validate_active_role_requirements(project_id, role_requirements)
-        self._validate_staked_resource_ids(project_id, staked_resource_ids)
+        if len(role_requirements) > 1:
+            raise ServiceValidationError(
+                code="process_role_requirement_count_invalid",
+                message="Active processes must define exactly one role requirement.",
+                field_path="role_requirements",
+            )
 
         if process_id is None:
             process = ProcessRecord(
                 process_id=new_id(),
                 project_id=project_id,
                 symbol=self._unique_symbol(project_id, self._symbol_from_name(name)),
+                process_type=process_type,
             )
             self.processes[process.process_id] = process
             self.process_ids_by_project[project_id].append(process.process_id)
         elif process_id in self.processes:
             process = self._get_process(project_id, process_id)
+            if process.process_type != process_type:
+                process = process.model_copy(update={"process_type": process_type})
+                self.processes[process.process_id] = process
         else:
             process = ProcessRecord(
                 process_id=process_id,
                 project_id=project_id,
                 symbol=self._unique_symbol(project_id, process_id),
+                process_type=process_type,
             )
             self.processes[process.process_id] = process
             self.process_ids_by_project[project_id].append(process.process_id)
+
+        role_requirements = self._role_requirements_or_default(
+            project_id,
+            process.process_id,
+            role_requirements,
+        )
+        self._validate_active_role_requirements(project_id, role_requirements)
 
         for dependency_id in dependencies:
             self._get_process(project_id, dependency_id)
@@ -754,7 +969,6 @@ class InMemoryProjectRepository:
             delay_after_dependencies_business_days=delay_after_dependencies_business_days,
             required_roles=required_roles,
             role_requirements=role_requirements,
-            staked_resource_ids=staked_resource_ids,
             assumption_note=assumption_note,
         )
         self._validate_acyclic_after_revision(project_id, revision)
@@ -762,7 +976,256 @@ class InMemoryProjectRepository:
         for requirement in role_requirements:
             if requirement.requirement_id is not None:
                 self.role_requirements[requirement.requirement_id] = requirement
+        self.delete_invalid_process_role_pins(
+            project_id=project_id,
+            process_id=process.process_id,
+            edit_at=effective_at,
+        )
         return process, revision
+
+    def delete_process(
+        self,
+        project_id: str,
+        process_id: str,
+        edit_at: dt.datetime,
+    ) -> dict[str, Any]:
+        """Delete a process and remove graph facts that reference it."""
+        self.get_project(project_id)
+        self._get_process(project_id, process_id)
+
+        process_ids_to_delete: list[str] = []
+        process_id_set: set[str] = set()
+        blocker_ids_to_delete: list[str] = []
+        blocker_id_set: set[str] = set()
+
+        def project_blockers() -> list[BlockerRecord]:
+            return [
+                self.blockers[blocker_id]
+                for blocker_id in self.blocker_ids_by_project.get(project_id, [])
+                if blocker_id in self.blockers
+            ]
+
+        def resolver_process_id(blocker: BlockerRecord) -> str | None:
+            resolver_symbol = self._blocker_resolver_symbol(blocker.blocker_id)
+            try:
+                return self.resolve_process_id(project_id, resolver_symbol)
+            except ServiceValidationError as exc:
+                if exc.code != "not_found":
+                    raise
+                return None
+
+        def remaining_successors(
+            predecessor_id: str | None,
+            excluding_process_ids: set[str],
+        ) -> list[str]:
+            if predecessor_id is None:
+                return []
+            successors = []
+            for candidate_id in self.process_ids_by_project.get(project_id, []):
+                if candidate_id in excluding_process_ids:
+                    continue
+                revision = self._latest_revision_as_of(candidate_id, edit_at)
+                if revision is None:
+                    continue
+                if predecessor_id in revision.dependencies:
+                    successors.append(candidate_id)
+            return sorted(successors)
+
+        def collect_blocker(blocker_id: str) -> None:
+            blocker = self.blockers.get(blocker_id)
+            if blocker is None or blocker.project_id != project_id:
+                return
+            if blocker_id not in blocker_id_set:
+                blocker_id_set.add(blocker_id)
+                blocker_ids_to_delete.append(blocker_id)
+            resolver_id = resolver_process_id(blocker)
+            if resolver_id is not None and resolver_id not in process_id_set:
+                collect_process(resolver_id)
+
+        def collect_process(candidate_id: str) -> None:
+            self._get_process(project_id, candidate_id)
+            if candidate_id in process_id_set:
+                return
+            process_id_set.add(candidate_id)
+            process_ids_to_delete.append(candidate_id)
+
+        collect_process(process_id)
+
+        changed = True
+        while changed:
+            changed = False
+            for blocker in project_blockers():
+                if blocker.blocker_id in blocker_id_set:
+                    continue
+                resolver_id = resolver_process_id(blocker)
+                if resolver_id in process_id_set:
+                    collect_blocker(blocker.blocker_id)
+                    changed = True
+                    continue
+                if blocker.process_id not in process_id_set:
+                    continue
+                if not remaining_successors(resolver_id, process_id_set):
+                    collect_blocker(blocker.blocker_id)
+                    changed = True
+
+        for blocker in project_blockers():
+            if blocker.blocker_id in blocker_id_set:
+                continue
+            if blocker.process_id not in process_id_set:
+                continue
+            successors = remaining_successors(
+                resolver_process_id(blocker),
+                process_id_set,
+            )
+            if successors:
+                self.blockers[blocker.blocker_id] = blocker.model_copy(
+                    update={"process_id": successors[0]}
+                )
+
+        removed_dependency_pairs: set[tuple[str, str]] = set()
+        for candidate_id, revisions in list(self.revisions_by_process.items()):
+            for revision in revisions:
+                if candidate_id in process_id_set:
+                    for dependency_id in revision.dependencies:
+                        removed_dependency_pairs.add((dependency_id, candidate_id))
+                    continue
+                for dependency_id in revision.dependencies:
+                    if dependency_id in process_id_set:
+                        removed_dependency_pairs.add((dependency_id, candidate_id))
+
+        for candidate_id, revisions in list(self.revisions_by_process.items()):
+            if candidate_id in process_id_set:
+                continue
+            cleaned_revisions = []
+            for revision in revisions:
+                dependencies = [
+                    dependency_id
+                    for dependency_id in revision.dependencies
+                    if dependency_id not in process_id_set
+                ]
+                if dependencies != revision.dependencies:
+                    revision = revision.model_copy(update={"dependencies": dependencies})
+                cleaned_revisions.append(revision)
+            self.revisions_by_process[candidate_id] = cleaned_revisions
+
+        deleted_symbols: set[str] = set()
+        for candidate_id in process_ids_to_delete:
+            process = self.processes.pop(candidate_id, None)
+            if process is not None:
+                deleted_symbols.add(process.symbol)
+            for revision in self.revisions_by_process.pop(candidate_id, []):
+                for requirement in revision.role_requirements:
+                    if requirement.requirement_id is not None:
+                        self.role_requirements.pop(requirement.requirement_id, None)
+            self.retired_processes.pop(candidate_id, None)
+
+        self.process_ids_by_project[project_id] = [
+            candidate_id
+            for candidate_id in self.process_ids_by_project.get(project_id, [])
+            if candidate_id not in process_id_set
+        ]
+
+        deleted_aliases: set[str] = set()
+        aliases = self.process_aliases.get(project_id, {})
+        alias_sources = self.process_alias_sources.get(project_id, {})
+        for alias, target_id in list(aliases.items()):
+            if target_id in process_id_set:
+                deleted_aliases.add(alias)
+                aliases.pop(alias, None)
+                alias_sources.pop(alias, None)
+
+        for blocker_id in blocker_ids_to_delete:
+            self.blockers.pop(blocker_id, None)
+        self.blocker_ids_by_project[project_id] = [
+            blocker_id
+            for blocker_id in self.blocker_ids_by_project.get(project_id, [])
+            if blocker_id not in blocker_id_set
+        ]
+
+        self.dependency_edge_ids = {
+            key: edge_id
+            for key, edge_id in self.dependency_edge_ids.items()
+            if key[0] != project_id
+            or (key[1] not in process_id_set and key[2] not in process_id_set)
+        }
+
+        pin_ids_to_delete = [
+            pin_id
+            for pin_id in self.process_role_pin_ids_by_project.get(project_id, [])
+            if (
+                pin_id in self.process_role_pins
+                and self.process_role_pins[pin_id].process_id in process_id_set
+            )
+        ]
+        for pin_id in pin_ids_to_delete:
+            self.process_role_pins.pop(pin_id, None)
+        self.process_role_pin_ids_by_project[project_id] = [
+            pin_id
+            for pin_id in self.process_role_pin_ids_by_project.get(project_id, [])
+            if pin_id not in set(pin_ids_to_delete)
+        ]
+
+        evidence_line_ids_to_delete = [
+            evidence_line_id
+            for evidence_line_id in self.process_evidence_line_item_ids_by_project.get(
+                project_id,
+                [],
+            )
+            if (
+                evidence_line_id in self.process_evidence_line_items
+                and self.process_evidence_line_items[evidence_line_id].process_id
+                in process_id_set
+            )
+        ]
+        for evidence_line_id in evidence_line_ids_to_delete:
+            self.process_evidence_line_items.pop(evidence_line_id, None)
+        self.process_evidence_line_item_ids_by_project[project_id] = [
+            evidence_line_id
+            for evidence_line_id in self.process_evidence_line_item_ids_by_project.get(
+                project_id,
+                [],
+            )
+            if evidence_line_id not in set(evidence_line_ids_to_delete)
+        ]
+
+        deleted_symbol_names = deleted_symbols | deleted_aliases
+        for milestone_id in self.milestone_ids_by_project.get(project_id, []):
+            milestone = self.milestones.get(milestone_id)
+            if milestone is None:
+                continue
+            process_symbols = [
+                symbol
+                for symbol in milestone.process_symbols
+                if symbol not in deleted_symbol_names
+            ]
+            if process_symbols != milestone.process_symbols:
+                self.milestones[milestone_id] = milestone.model_copy(
+                    update={"process_symbols": process_symbols, "updated_at": edit_at}
+                )
+
+        self.role_requirements = {
+            requirement.requirement_id: requirement
+            for revisions in self.revisions_by_process.values()
+            for revision in revisions
+            for requirement in revision.role_requirements
+            if requirement.requirement_id is not None
+        }
+
+        return {
+            "process_id": process_id,
+            "deleted_process_ids": process_ids_to_delete,
+            "deleted_blocker_ids": blocker_ids_to_delete,
+            "removed_dependency_count": len(removed_dependency_pairs),
+            "removed_dependencies": [
+                {
+                    "predecessor_process_id": predecessor_id,
+                    "successor_process_id": successor_id,
+                }
+                for predecessor_id, successor_id in sorted(removed_dependency_pairs)
+            ],
+            "deleted_process_role_pin_ids": pin_ids_to_delete,
+            "deleted_evidence_line_ids": evidence_line_ids_to_delete,
+        }
 
     def set_process_status(
         self,
@@ -770,32 +1233,170 @@ class InMemoryProjectRepository:
         process_id: str,
         status: ProcessStatus,
         edit_at: dt.datetime,
-        started_at: dt.datetime | None = None,
-        finished_at: dt.datetime | None = None,
     ) -> tuple[ProcessRecord, str]:
         process = self._get_process(project_id, process_id)
-        lifecycle_started_at = self._resolve_lifecycle_started_at(
-            process=process,
-            status=status,
-            edit_at=edit_at,
-            started_at=started_at,
-            finished_at=finished_at,
+        if status in {ProcessStatus.PAUSED, ProcessStatus.CANCELED}:
+            raise ServiceValidationError(
+                code="process_state_not_stored",
+                message=(
+                    "Process lifecycle state is derived from process-role pins; "
+                    "paused and canceled are not stored process states."
+                ),
+                field_path="status",
+                entity_id=process_id,
+            )
+        if status == ProcessStatus.PLANNED and self.list_process_role_pins(
+            project_id,
+            process_id=process_id,
+            include_done=True,
+        ):
+            raise ServiceValidationError(
+                code="started_state_derived_from_pins",
+                message=(
+                    "Started state is derived from process-role pins. "
+                    "Delete process-role pins before returning a process to planned."
+                ),
+                entity_id=process_id,
+            )
+        if status in {ProcessStatus.IN_PROGRESS, ProcessStatus.PAUSED}:
+            self._validate_process_has_started_pin(
+                project_id=project_id,
+                process_id=process_id,
+                edit_at=edit_at,
+            )
+        if status == ProcessStatus.DONE:
+            self._validate_process_role_pins_done_for_done(
+                project_id=project_id,
+                process_id=process_id,
+                edit_at=edit_at,
+            )
+        return process, new_id()
+
+    def upsert_process_role_pin(
+        self,
+        pin: ProcessRolePinRecord,
+    ) -> ProcessRolePinRecord:
+        self.get_project(pin.project_id)
+        self._get_process(pin.project_id, pin.process_id)
+        self._validate_process_role_pin(pin)
+        existing = self.process_role_pins.get(pin.pin_id)
+        if existing is not None and existing.project_id != pin.project_id:
+            raise ServiceValidationError(
+                code="cross_project_process_role_pin",
+                message="Process-role pin belongs to another project.",
+                entity_id=pin.pin_id,
+            )
+        if existing is None and pin.pin_id not in self.process_role_pin_ids_by_project[
+            pin.project_id
+        ]:
+            self.process_role_pin_ids_by_project[pin.project_id].append(pin.pin_id)
+        created_at = existing.created_at if existing is not None else pin.created_at
+        normalized = pin.model_copy(update={"created_at": created_at})
+        self.process_role_pins[normalized.pin_id] = normalized
+        return normalized
+
+    def delete_process_role_pin(
+        self,
+        project_id: str,
+        pin_id: str,
+    ) -> None:
+        pin = self.process_role_pins.get(pin_id)
+        if pin is None:
+            raise ServiceValidationError(
+                code="process_role_pin_not_found",
+                message=f"Process-role pin {pin_id!r} does not exist.",
+                entity_id=pin_id,
+            )
+        if pin.project_id != project_id:
+            raise ServiceValidationError(
+                code="cross_project_process_role_pin",
+                message="Process-role pin does not belong to the requested project.",
+                entity_id=pin_id,
+            )
+        self.process_role_pins.pop(pin_id, None)
+        if pin_id in self.process_role_pin_ids_by_project.get(project_id, []):
+            self.process_role_pin_ids_by_project[project_id].remove(pin_id)
+        self._sync_process_lifecycle_after_pin_delete(project_id, pin.process_id, pin)
+
+    def list_process_role_pins(
+        self,
+        project_id: str,
+        as_of: dt.datetime | None = None,
+        process_id: str | None = None,
+        resource_id: str | None = None,
+        include_done: bool = True,
+    ) -> list[ProcessRolePinRecord]:
+        self.get_project(project_id)
+        rows = [
+            self.process_role_pins[pin_id]
+            for pin_id in self.process_role_pin_ids_by_project.get(project_id, [])
+            if pin_id in self.process_role_pins
+        ]
+        if as_of is not None:
+            rows = [row for row in rows if row.pinned_at <= as_of]
+        if process_id is not None:
+            rows = [row for row in rows if row.process_id == process_id]
+        if resource_id is not None:
+            rows = [row for row in rows if row.resource_id == resource_id]
+        if not include_done:
+            rows = [row for row in rows if row.status != "pinned_finished"]
+        return sorted(
+            rows,
+            key=lambda row: (
+                row.pinned_at,
+                row.forecast_finish_at,
+                row.resource_id,
+                row.process_id,
+                row.role_id,
+                row.pin_id,
+            ),
         )
-        lifecycle_finished_at = self._resolve_lifecycle_finished_at(
-            process=process,
-            status=status,
-            edit_at=edit_at,
-            finished_at=finished_at,
-        )
-        updated = process.model_copy(
-            update={
-                "status": status,
-                "started_at": lifecycle_started_at,
-                "finished_at": lifecycle_finished_at,
-            }
-        )
-        self.processes[process_id] = updated
-        return updated, new_id()
+
+    def delete_invalid_process_role_pins(
+        self,
+        *,
+        project_id: str | None = None,
+        process_id: str | None = None,
+        edit_at: dt.datetime | None = None,
+    ) -> dict[str, Any]:
+        """Delete future or process-role-orphaned pins."""
+        effective_at = edit_at or dt.datetime.now(dt.UTC)
+        project_ids = [project_id] if project_id is not None else sorted(self.projects)
+        deleted_pin_ids: list[str] = []
+        deleted_pin_reasons: dict[str, str] = {}
+        for current_project_id in project_ids:
+            self.get_project(current_project_id)
+            for pin_id in list(
+                self.process_role_pin_ids_by_project.get(current_project_id, [])
+            ):
+                pin = self.process_role_pins.get(pin_id)
+                if pin is None:
+                    continue
+                if process_id is not None and pin.process_id != process_id:
+                    continue
+                reason = self._invalid_process_role_pin_reason(pin, effective_at)
+                if reason is None:
+                    continue
+                self.process_role_pins.pop(pin_id, None)
+                if pin_id in self.process_role_pin_ids_by_project.get(
+                    current_project_id,
+                    [],
+                ):
+                    self.process_role_pin_ids_by_project[current_project_id].remove(
+                        pin_id,
+                    )
+                self._sync_process_lifecycle_after_pin_delete(
+                    current_project_id,
+                    pin.process_id,
+                    pin,
+                )
+                deleted_pin_ids.append(pin_id)
+                deleted_pin_reasons[pin_id] = reason
+        return {
+            "deleted_pin_ids": deleted_pin_ids,
+            "deleted_pin_count": len(deleted_pin_ids),
+            "deleted_pin_reasons": deleted_pin_reasons,
+        }
 
     def resolve_process_id(self, project_id: str, process_symbol: str) -> str:
         self.get_project(project_id)
@@ -1051,6 +1652,7 @@ class InMemoryProjectRepository:
         project_id: str,
         resource_id: str | None,
         name: str,
+        resource_type: str,
         role_ids: list[str],
         calendar_id: str,
         available_from_at: dt.datetime,
@@ -1119,6 +1721,7 @@ class InMemoryProjectRepository:
             "resource_id": resolved_resource_id,
             "project_id": project_id,
             "name": name,
+            "resource_type": resource_type,
             "role_ids": list(role_ids),
             "calendar_id": calendar_id,
             "available_from_at": available_from_at,
@@ -1195,11 +1798,14 @@ class InMemoryProjectRepository:
         self,
         mapping: SlackResourceMappingRecord,
     ) -> SlackResourceMappingRecord:
-        self._get_resource(mapping.project_id, mapping.resource_id)
+        resource = self._get_resource(mapping.project_id, mapping.resource_id)
         if not mapping.active:
             mapping = mapping.model_copy(
                 update={"slack_user_id": None, "display_name": None},
             )
+            resource["resource_type"] = "external"
+        elif mapping.slack_user_id:
+            resource["resource_type"] = "internal"
         self.slack_resource_mappings[(mapping.project_id, mapping.resource_id)] = (
             mapping
         )
@@ -1361,6 +1967,87 @@ class InMemoryProjectRepository:
             return rows[:limit]
         return rows
 
+    def _sync_process_lifecycle_after_pin_delete(
+        self,
+        project_id: str,
+        process_id: str,
+        deleted_pin: ProcessRolePinRecord,
+    ) -> None:
+        del deleted_pin
+        self._get_process(project_id, process_id)
+
+    def _process_pin_finished_at_if_all_requirements(
+        self,
+        project_id: str,
+        process_id: str,
+        pins: list[ProcessRolePinRecord],
+        deleted_pin: ProcessRolePinRecord,
+    ) -> dt.datetime | None:
+        as_of = max(
+            [
+                deleted_pin.updated_at,
+                deleted_pin.pinned_at,
+                *[pin.updated_at for pin in pins],
+                *[
+                    pin.verified_done_at
+                    for pin in pins
+                    if pin.verified_done_at is not None
+                ],
+            ]
+        )
+        revision = self._latest_revision_as_of(process_id, as_of)
+        if revision is None or not revision.role_requirements:
+            return None
+        verified_by_requirement: dict[str, dt.datetime] = {}
+        for pin in pins:
+            if (
+                pin.status != "pinned_finished"
+                or pin.verified_done_at is None
+                or pin.verified_done_at > as_of
+            ):
+                continue
+            verified_by_requirement[self._pin_requirement_id(pin)] = pin.verified_done_at
+        for index, requirement in enumerate(revision.role_requirements):
+            requirement_id = (
+                requirement.requirement_id
+                or self._synthetic_requirement_id(process_id, index)
+            )
+            if requirement_id not in verified_by_requirement:
+                return None
+        return max(verified_by_requirement.values(), default=None)
+
+    def _process_pin_finished_at_as_of(
+        self,
+        project_id: str,
+        process_id: str,
+        as_of: dt.datetime,
+    ) -> dt.datetime | None:
+        revision = self._latest_revision_as_of(process_id, as_of)
+        if revision is None or not revision.role_requirements:
+            return None
+        verified_by_requirement: dict[str, dt.datetime] = {}
+        for pin in self.list_process_role_pins(
+            project_id,
+            as_of=as_of,
+            process_id=process_id,
+            include_done=True,
+        ):
+            if (
+                pin.status != "pinned_finished"
+                or pin.verified_done_at is None
+                or pin.verified_done_at > as_of
+            ):
+                continue
+            verified_by_requirement[self._pin_requirement_id(pin)] = pin.verified_done_at
+        for index, requirement in enumerate(revision.role_requirements):
+            requirement_id = (
+                requirement.requirement_id
+                or self._synthetic_requirement_id(process_id, index)
+            )
+            if requirement_id not in verified_by_requirement:
+                return None
+        return max(verified_by_requirement.values(), default=None)
+
     def create_slack_outbox_messages(
         self,
         project_id: str,
@@ -1373,25 +2060,48 @@ class InMemoryProjectRepository:
         for message in messages:
             if message.resource_id is not None:
                 self._get_resource(project_id, message.resource_id)
-            dedupe_key = (project_id, message.slack_user_id, message.content_hash)
+            dedupe_key = slack_outbox_target_key(message, project_id)
             existing_id = self.slack_outbox_dedupe.get(dedupe_key)
             if existing_id is not None:
-                matched_ids.append(existing_id)
-                skipped_ids.append(existing_id)
-                continue
+                existing = self.slack_outbox[existing_id]
+                if existing.status == SlackOutboxStatus.DRAFT:
+                    merged_claims = _merge_pm_evidence_claims(
+                        list(existing.pm_evidence_claims),
+                        list(message.pm_evidence_claims),
+                    )
+                    if merged_claims != list(existing.pm_evidence_claims):
+                        self.slack_outbox[existing_id] = existing.model_copy(
+                            update={
+                                "pm_evidence_claims": merged_claims,
+                                "run_id": message.run_id or existing.run_id,
+                                "updated_at": message.created_at,
+                            }
+                        )
+                        matched_ids.append(existing_id)
+                        continue
+                    matched_ids.append(existing_id)
+                    skipped_ids.append(existing_id)
+                    continue
             outbox_id = new_id()
             record = SlackOutboxRecord(
                 outbox_id=outbox_id,
                 project_id=project_id,
-                status=message.status,
+                # Creation always stages a draft. Delivery status is only set by
+                # mark_slack_outbox_sent, which also stores Slack's channel and ts
+                # needed for PM evidence audit.
+                status=SlackOutboxStatus.DRAFT,
+                target_type=message.target_type,
                 resource_id=message.resource_id,
                 slack_user_id=message.slack_user_id,
+                slack_channel_id=message.slack_channel_id,
                 body=message.body,
+                blocks=message.blocks,
                 generated_body=message.generated_body or message.body,
                 content_hash=message.content_hash,
                 run_id=message.run_id,
                 created_at=message.created_at,
                 updated_at=message.created_at,
+                pm_evidence_claims=message.pm_evidence_claims,
             )
             self.slack_outbox[outbox_id] = record
             self.slack_outbox_ids_by_project[project_id].append(outbox_id)
@@ -1467,12 +2177,21 @@ class InMemoryProjectRepository:
         updated = record.model_copy(
             update={
                 "body": body,
+                "blocks": [],
+                "content_hash": _outbox_body_hash(body),
+                # Editing in the UI changes the plain body only; generated Block Kit
+                # and evidence claims must not survive as stale proof of the edit.
+                "pm_evidence_claims": [],
                 "edited_at": updated_at,
                 "updated_at": updated_at,
                 "run_id": run_id or record.run_id,
             },
         )
         self.slack_outbox[outbox_id] = updated
+        self.slack_outbox_dedupe.pop(slack_outbox_target_key(record, project_id), None)
+        self.slack_outbox_dedupe[slack_outbox_target_key(updated, project_id)] = (
+            outbox_id
+        )
         return updated
 
     def mark_slack_outbox_skipped(
@@ -1516,6 +2235,158 @@ class InMemoryProjectRepository:
             return rows[:limit]
         return rows
 
+    def record_pm_communication_evidence(
+        self,
+        evidence: PMCommunicationEvidenceRecord,
+    ) -> PMCommunicationEvidenceRecord:
+        self.get_project(evidence.project_id)
+        self._get_slack_outbox(evidence.project_id, evidence.outbox_id)
+        if (
+            evidence.evidence_id not in self.pm_communication_evidence
+            and evidence.evidence_id
+            not in self.pm_communication_evidence_ids_by_project[evidence.project_id]
+        ):
+            self.pm_communication_evidence_ids_by_project[evidence.project_id].append(
+                evidence.evidence_id,
+            )
+        self.pm_communication_evidence[evidence.evidence_id] = evidence
+        return evidence
+
+    def list_pm_communication_evidence(
+        self,
+        project_id: str,
+    ) -> list[PMCommunicationEvidenceRecord]:
+        self.get_project(project_id)
+        return sorted(
+            [
+                self.pm_communication_evidence[evidence_id]
+                for evidence_id in self.pm_communication_evidence_ids_by_project.get(
+                    project_id,
+                    [],
+                )
+                if evidence_id in self.pm_communication_evidence
+            ],
+            key=lambda row: (row.communicated_at, row.evidence_id),
+        )
+
+    def upsert_process_evidence_line_item(
+        self,
+        record: ProcessEvidenceLineItemRecord,
+    ) -> ProcessEvidenceLineItemRecord:
+        self.get_project(record.project_id)
+        process = self._get_process(record.project_id, record.process_id)
+        if process.symbol != record.process_symbol:
+            record = record.model_copy(update={"process_symbol": process.symbol})
+        existing = self.process_evidence_line_items.get(record.evidence_line_id)
+        if existing is not None:
+            if existing.project_id != record.project_id:
+                raise ServiceValidationError(
+                    code="cross_project_process_evidence",
+                    message="Process evidence line item belongs to another project.",
+                    entity_id=record.evidence_line_id,
+                )
+            record = record.model_copy(update={"created_at": existing.created_at})
+        elif (
+            record.evidence_line_id
+            not in self.process_evidence_line_item_ids_by_project[record.project_id]
+        ):
+            self.process_evidence_line_item_ids_by_project[record.project_id].append(
+                record.evidence_line_id,
+            )
+        self.process_evidence_line_items[record.evidence_line_id] = record
+        return record
+
+    def list_process_evidence_line_items(
+        self,
+        project_id: str,
+        process_id: str | None = None,
+        line_items: list[str] | None = None,
+    ) -> list[ProcessEvidenceLineItemRecord]:
+        self.get_project(project_id)
+        line_filter = set(line_items or [])
+        rows = [
+            self.process_evidence_line_items[evidence_line_id]
+            for evidence_line_id in self.process_evidence_line_item_ids_by_project.get(
+                project_id,
+                [],
+            )
+            if evidence_line_id in self.process_evidence_line_items
+        ]
+        if process_id is not None:
+            self._get_process(project_id, process_id)
+            rows = [row for row in rows if row.process_id == process_id]
+        if line_filter:
+            rows = [row for row in rows if row.line_item in line_filter]
+        return sorted(
+            rows,
+            key=lambda row: (row.process_symbol, row.line_item, row.evidence_line_id),
+        )
+
+    def delete_process_evidence_line_items(
+        self,
+        *,
+        line_items: set[str] | frozenset[str],
+    ) -> dict[str, Any]:
+        deleted_ids = []
+        for evidence_line_id, row in list(self.process_evidence_line_items.items()):
+            if row.line_item not in line_items:
+                continue
+            deleted_ids.append(evidence_line_id)
+            self.process_evidence_line_items.pop(evidence_line_id, None)
+            ids = self.process_evidence_line_item_ids_by_project.get(row.project_id, [])
+            self.process_evidence_line_item_ids_by_project[row.project_id] = [
+                item for item in ids if item != evidence_line_id
+            ]
+        return {"deleted_evidence_line_ids": sorted(deleted_ids)}
+
+    def upsert_resource_evidence_line_item(
+        self,
+        record: ResourceEvidenceLineItemRecord,
+    ) -> ResourceEvidenceLineItemRecord:
+        self.get_project(record.project_id)
+        self._get_resource(record.project_id, record.resource_id)
+        existing = self.resource_evidence_line_items.get(record.evidence_line_id)
+        if existing is not None:
+            if existing.project_id != record.project_id:
+                raise ServiceValidationError(
+                    code="cross_project_resource_evidence",
+                    message="Resource evidence line item belongs to another project.",
+                    entity_id=record.evidence_line_id,
+                )
+            record = record.model_copy(update={"created_at": existing.created_at})
+        elif (
+            record.evidence_line_id
+            not in self.resource_evidence_line_item_ids_by_project[record.project_id]
+        ):
+            self.resource_evidence_line_item_ids_by_project[record.project_id].append(
+                record.evidence_line_id,
+            )
+        self.resource_evidence_line_items[record.evidence_line_id] = record
+        return record
+
+    def list_resource_evidence_line_items(
+        self,
+        project_id: str,
+        resource_id: str | None = None,
+        line_items: list[str] | None = None,
+    ) -> list[ResourceEvidenceLineItemRecord]:
+        self.get_project(project_id)
+        line_filter = set(line_items or [])
+        rows = [
+            self.resource_evidence_line_items[evidence_line_id]
+            for evidence_line_id in self.resource_evidence_line_item_ids_by_project.get(
+                project_id,
+                [],
+            )
+            if evidence_line_id in self.resource_evidence_line_items
+        ]
+        if resource_id is not None:
+            self._get_resource(project_id, resource_id)
+            rows = [row for row in rows if row.resource_id == resource_id]
+        if line_filter:
+            rows = [row for row in rows if row.line_item in line_filter]
+        return sorted(rows, key=lambda row: (row.resource_id, row.line_item))
+
     def deactivate_role(
         self,
         project_id: str,
@@ -1540,10 +2411,37 @@ class InMemoryProjectRepository:
         blocker_id: str | None = None,
         details: str | None = None,
         severity: str | None = None,
+        resolution_owner_resource_id: str | None = None,
     ) -> BlockerRecord:
         self._get_process(project_id, process_id)
+        if resolution_owner_resource_id is not None:
+            self._get_resource(project_id, resolution_owner_resource_id)
+        resolved_blocker_id = blocker_id or self._unique_blocker_id(
+            project_id,
+            description,
+        )
+        existing = self.blockers.get(resolved_blocker_id)
+        if existing is not None:
+            if existing.project_id != project_id:
+                raise ServiceValidationError(
+                    code="cross_project_blocker",
+                    message="Blocker id belongs to another project.",
+                    entity_id=resolved_blocker_id,
+                )
+            if existing.process_id != process_id:
+                raise ServiceValidationError(
+                    code="blocker_process_reference_conflict",
+                    message="A blocker can reference exactly one process.",
+                    field_path="process_id",
+                    entity_id=resolved_blocker_id,
+                    details={
+                        "existing_process_id": existing.process_id,
+                        "requested_process_id": process_id,
+                    },
+                )
+            return existing
         blocker = BlockerRecord(
-            blocker_id=blocker_id or self._unique_blocker_id(project_id, description),
+            blocker_id=resolved_blocker_id,
             project_id=project_id,
             process_id=process_id,
             description=description,
@@ -1552,9 +2450,11 @@ class InMemoryProjectRepository:
             details=details,
             severity=severity or "blocking",
             created_at=opened_at,
+            resolution_owner_resource_id=resolution_owner_resource_id,
         )
         self.blockers[blocker.blocker_id] = blocker
-        self.blocker_ids_by_project[project_id].append(blocker.blocker_id)
+        if blocker.blocker_id not in self.blocker_ids_by_project[project_id]:
+            self.blocker_ids_by_project[project_id].append(blocker.blocker_id)
         return blocker
 
     def resolve_blocker(
@@ -1563,6 +2463,7 @@ class InMemoryProjectRepository:
         blocker_id: str,
         resolved_at: dt.datetime,
         resolution: str | None = None,
+        resolution_owner_resource_id: str | None = None,
     ) -> BlockerRecord:
         if blocker_id not in self.blockers:
             raise ServiceValidationError(
@@ -1577,16 +2478,59 @@ class InMemoryProjectRepository:
                 message="Blocker does not belong to the requested project.",
                 entity_id=blocker_id,
             )
+        if resolution_owner_resource_id is not None:
+            self._get_resource(project_id, resolution_owner_resource_id)
         if blocker.resolved_at is not None:
-            if blocker.resolved_at == resolved_at and blocker.resolution == resolution:
+            desired_owner = (
+                resolution_owner_resource_id
+                if resolution_owner_resource_id is not None
+                else blocker.resolution_owner_resource_id
+            )
+            if (
+                blocker.resolved_at == resolved_at
+                and blocker.resolution == resolution
+                and blocker.resolution_owner_resource_id == desired_owner
+            ):
                 return blocker
             raise ServiceValidationError(
                 code="idempotency_conflict",
                 message="Blocker was already resolved with different values.",
                 entity_id=blocker_id,
             )
+        update = {"resolved_at": resolved_at, "resolution": resolution}
+        if resolution_owner_resource_id is not None:
+            update["resolution_owner_resource_id"] = resolution_owner_resource_id
         updated = blocker.model_copy(
-            update={"resolved_at": resolved_at, "resolution": resolution},
+            update=update,
+        )
+        self.blockers[blocker_id] = updated
+        return updated
+
+    def set_blocker_resolution_owner(
+        self,
+        project_id: str,
+        blocker_id: str,
+        resolution_owner_resource_id: str | None,
+    ) -> BlockerRecord:
+        if blocker_id not in self.blockers:
+            raise ServiceValidationError(
+                code="blocker_not_found",
+                message=f"Blocker {blocker_id!r} does not exist.",
+                entity_id=blocker_id,
+            )
+        blocker = self.blockers[blocker_id]
+        if blocker.project_id != project_id:
+            raise ServiceValidationError(
+                code="cross_project_blocker",
+                message="Blocker does not belong to the requested project.",
+                entity_id=blocker_id,
+            )
+        if resolution_owner_resource_id is not None:
+            self._get_resource(project_id, resolution_owner_resource_id)
+        if blocker.resolution_owner_resource_id == resolution_owner_resource_id:
+            return blocker
+        updated = blocker.model_copy(
+            update={"resolution_owner_resource_id": resolution_owner_resource_id},
         )
         self.blockers[blocker_id] = updated
         return updated
@@ -1651,8 +2595,17 @@ class InMemoryProjectRepository:
                 for blocker in blockers_as_of
                 if blocker.process_id == process_id
                 and self._enum_value(blocker.severity) == "blocking"
-                and process.status.value not in {"done", "canceled"}
             ]
+            pinned_started_at = self._process_pin_started_at(
+                project_id,
+                process_id,
+                as_of,
+            )
+            pinned_finished_at = self._process_pin_finished_at_as_of(
+                project_id,
+                process_id,
+                as_of,
+            )
             processes.append(
                 ProcessScheduleInput(
                     process_id=process_id,
@@ -1660,8 +2613,16 @@ class InMemoryProjectRepository:
                     description=revision.description,
                     dependencies=tuple(revision.dependencies),
                     duration_business_days=revision.duration_business_days,
-                    explicit_status=process.status.value,
-                    started_at=process.started_at,
+                    derived_status=(
+                        "finished"
+                        if pinned_finished_at is not None
+                        else "started"
+                        if pinned_started_at is not None
+                        else "planned"
+                    ),
+                    process_type=process.process_type,
+                    pin_started_at=pinned_started_at,
+                    pin_finished_at=pinned_finished_at,
                     earliest_start_at=revision.earliest_start_at,
                     start_at_earliest=revision.start_at_earliest,
                     delay_after_dependencies_business_days=(
@@ -1956,11 +2917,22 @@ class InMemoryProjectRepository:
             edit_at,
             selected_process_ids,
         )
+        incoming = {
+            process_id
+            for process_id in incoming
+            if getattr(
+                self.processes.get(process_id),
+                "process_type",
+                "standard",
+            )
+            != "blocker"
+        }
         for child in processes:
             duration_days = math.ceil(float(child.duration_hours) / 8)
             process, _revision = self.upsert_process_revision(
                 project_id=project_id,
                 process_id=f"process-{child.process_symbol}",
+                process_type="standard",
                 name=child.name,
                 description=child.description,
                 effective_at=edit_at,
@@ -1971,14 +2943,11 @@ class InMemoryProjectRepository:
                 delay_after_dependencies_business_days=0,
                 required_roles={},
                 role_requirements=child.role_requirements,
-                staked_resource_ids=[],
                 assumption_note=None,
             )
             self.processes[process.process_id] = process.model_copy(
                 update={
                     "symbol": child.process_symbol,
-                    "status": child.status,
-                    "finished_at": child.finished_at,
                 }
             )
             for alias in child.aliases:
@@ -2071,6 +3040,10 @@ class InMemoryProjectRepository:
                     ):
                         self.process_aliases[project_id][alias] = alias_process_id
                         self.process_alias_sources[project_id][alias] = "retirement"
+        blocker_cleanup = self.delete_orphaned_blocker_processes(
+            project_id=project_id,
+            edit_at=edit_at,
+        )
         self._validate_active_dependency_graph_acyclic(
             project_id,
             edit_at,
@@ -2082,6 +3055,8 @@ class InMemoryProjectRepository:
             "retirement_event_ids": retirement_event_ids,
             "edge_ids": list(dict.fromkeys(edge_ids)),
             "retired_edge_ids": list(dict.fromkeys(retired_edge_ids)),
+            "deleted_blocker_process_ids": blocker_cleanup["deleted_process_ids"],
+            "deleted_blocker_ids": blocker_cleanup["deleted_blocker_ids"],
             **({"alias_process_id": alias_process_id} if alias_process_id else {}),
         }
 
@@ -2130,6 +3105,16 @@ class InMemoryProjectRepository:
             edit_at,
             selected_process_ids,
         )
+        incoming = {
+            process_id
+            for process_id in incoming
+            if getattr(
+                self.processes.get(process_id),
+                "process_type",
+                "standard",
+            )
+            != "blocker"
+        }
         selected_revisions = [
             self._latest_revision_as_of(process_id, edit_at)
             for process_id in ordered_process_ids
@@ -2151,7 +3136,7 @@ class InMemoryProjectRepository:
             role_requirement_process_ids = [
                 revision.process_id
                 for revision in selected_revisions
-                if revision.role_requirements
+                if self._non_default_role_requirements(revision)
             ]
             legacy_required_role_process_ids = [
                 revision.process_id
@@ -2192,6 +3177,7 @@ class InMemoryProjectRepository:
         replacement, _revision = self.upsert_process_revision(
             project_id=project_id,
             process_id=f"process-{process_symbol}",
+            process_type="standard",
             name=new_process.name,
             description=new_process.description,
             effective_at=edit_at,
@@ -2202,14 +3188,11 @@ class InMemoryProjectRepository:
             delay_after_dependencies_business_days=0,
             required_roles=required_roles,
             role_requirements=role_requirements,
-            staked_resource_ids=[],
             assumption_note=None,
         )
         replacement = replacement.model_copy(
             update={
                 "symbol": process_symbol,
-                "status": new_process.status,
-                "finished_at": new_process.finished_at,
             }
         )
         self.processes[replacement.process_id] = replacement
@@ -2263,6 +3246,10 @@ class InMemoryProjectRepository:
             )
             for process_id in ordered_process_ids
         ]
+        blocker_cleanup = self.delete_orphaned_blocker_processes(
+            project_id=project_id,
+            edit_at=edit_at,
+        )
         self._validate_active_dependency_graph_acyclic(
             project_id,
             edit_at,
@@ -2274,6 +3261,8 @@ class InMemoryProjectRepository:
             "retirement_event_ids": retirement_event_ids,
             "edge_ids": list(dict.fromkeys(edge_ids)),
             "retired_edge_ids": list(dict.fromkeys(retired_edge_ids)),
+            "deleted_blocker_process_ids": blocker_cleanup["deleted_process_ids"],
+            "deleted_blocker_ids": blocker_cleanup["deleted_blocker_ids"],
             "requirement_ids": requirement_ids,
         }
 
@@ -2329,12 +3318,16 @@ class InMemoryProjectRepository:
     def replace_with(self, other: ProjectRepository) -> None:
         if not isinstance(other, InMemoryProjectRepository):
             raise TypeError("InMemoryProjectRepository can only replace with the same type")
+        other._validate_process_role_definition_invariants()
+        other._validate_no_orphaned_blocker_processes()
         self.projects = other.projects
         self.processes = other.processes
         self.process_ids_by_project = other.process_ids_by_project
         self.revisions_by_process = other.revisions_by_process
         self.blockers = other.blockers
         self.blocker_ids_by_project = other.blocker_ids_by_project
+        self.process_role_pins = other.process_role_pins
+        self.process_role_pin_ids_by_project = other.process_role_pin_ids_by_project
         self.roles = other.roles
         self.role_ids_by_project = other.role_ids_by_project
         self.role_requirements = other.role_requirements
@@ -2358,6 +3351,156 @@ class InMemoryProjectRepository:
         self.slack_outbox = other.slack_outbox
         self.slack_outbox_ids_by_project = other.slack_outbox_ids_by_project
         self.slack_outbox_dedupe = other.slack_outbox_dedupe
+        self.pm_communication_evidence = other.pm_communication_evidence
+        self.pm_communication_evidence_ids_by_project = (
+            other.pm_communication_evidence_ids_by_project
+        )
+        self.process_evidence_line_items = other.process_evidence_line_items
+        self.process_evidence_line_item_ids_by_project = (
+            other.process_evidence_line_item_ids_by_project
+        )
+        self.resource_evidence_line_items = other.resource_evidence_line_items
+        self.resource_evidence_line_item_ids_by_project = (
+            other.resource_evidence_line_item_ids_by_project
+        )
+
+    def ensure_default_process_roles_for_missing_requirements(
+        self,
+        *,
+        project_id: str | None = None,
+        edit_at: dt.datetime | None = None,
+    ) -> dict[str, Any]:
+        """Repair legacy process revisions that have no role requirement."""
+        _ = edit_at or dt.datetime.now(dt.UTC)
+        project_ids = [project_id] if project_id is not None else sorted(self.projects)
+        updated_process_ids: list[str] = []
+        selected_role_ids: dict[str, str] = {}
+        for current_project_id in project_ids:
+            self.get_project(current_project_id)
+            for process_id in list(self.process_ids_by_project.get(current_project_id, [])):
+                revisions = list(self.revisions_by_process.get(process_id, []))
+                if not revisions:
+                    continue
+                role_id: str | None = None
+                changed = False
+                repaired_revisions = []
+                for revision in revisions:
+                    if revision.role_requirements:
+                        repaired_revisions.append(revision)
+                        continue
+                    if role_id is None:
+                        role_id = self._ensure_default_missing_process_role(
+                            current_project_id
+                        )
+                    role_requirements = [
+                        RoleRequirementCommand(
+                            requirement_id=f"{process_id}-{role_id}",
+                            role_id=role_id,
+                            effort_hours=1,
+                        )
+                    ]
+                    repaired_revisions.append(
+                        revision.model_copy(update={"role_requirements": role_requirements})
+                    )
+                    changed = True
+                if changed:
+                    self.revisions_by_process[process_id] = repaired_revisions
+                    updated_process_ids.append(process_id)
+                    if role_id is not None:
+                        selected_role_ids[process_id] = role_id
+        if updated_process_ids:
+            self._rebuild_role_requirement_index()
+        return {
+            "updated_process_ids": updated_process_ids,
+            "updated_process_count": len(updated_process_ids),
+            "default_role_id": DEFAULT_MISSING_PROCESS_ROLE_ID,
+            "selected_role_ids": selected_role_ids,
+        }
+
+    def normalize_process_role_requirements_to_single(
+        self,
+        *,
+        project_id: str | None = None,
+        edit_at: dt.datetime | None = None,
+    ) -> dict[str, Any]:
+        """Repair legacy process revisions that contain multiple role requirements."""
+        _ = edit_at or dt.datetime.now(dt.UTC)
+        project_ids = [project_id] if project_id is not None else sorted(self.projects)
+        updated_process_ids: list[str] = []
+        selected_role_ids: dict[str, str] = {}
+        for current_project_id in project_ids:
+            self.get_project(current_project_id)
+            for process_id in list(self.process_ids_by_project.get(current_project_id, [])):
+                revisions = list(self.revisions_by_process.get(process_id, []))
+                if not revisions:
+                    continue
+                changed = False
+                repaired_revisions = []
+                for revision in revisions:
+                    if len(revision.role_requirements) <= 1:
+                        repaired_revisions.append(revision)
+                        continue
+                    requirement = self._single_role_requirement_from_legacy_requirements(
+                        current_project_id,
+                        process_id,
+                        revision.role_requirements,
+                    )
+                    repaired_revisions.append(
+                        revision.model_copy(update={"role_requirements": [requirement]})
+                    )
+                    self._rewrite_process_pins_for_single_requirement(
+                        current_project_id,
+                        process_id,
+                        requirement,
+                    )
+                    selected_role_ids[process_id] = requirement.role_id
+                    changed = True
+                if not changed:
+                    continue
+                self.revisions_by_process[process_id] = repaired_revisions
+                updated_process_ids.append(process_id)
+        if updated_process_ids:
+            self._rebuild_role_requirement_index()
+        return {
+            "updated_process_ids": updated_process_ids,
+            "updated_process_count": len(updated_process_ids),
+            "selected_role_ids": selected_role_ids,
+        }
+
+    def delete_orphaned_blocker_processes(
+        self,
+        *,
+        project_id: str | None = None,
+        edit_at: dt.datetime | None = None,
+    ) -> dict[str, Any]:
+        """Delete active blocker resolver processes that have no active children."""
+        effective_at = edit_at or dt.datetime.now(dt.UTC)
+        project_ids = [project_id] if project_id is not None else sorted(self.projects)
+        deleted_process_ids: list[str] = []
+        deleted_blocker_ids: list[str] = []
+        changed = True
+        while changed:
+            changed = False
+            for current_project_id in project_ids:
+                self.get_project(current_project_id)
+                for process_id in self._orphaned_blocker_process_ids(
+                    current_project_id,
+                    effective_at,
+                ):
+                    if process_id not in self.processes:
+                        continue
+                    result = self.delete_process(
+                        current_project_id,
+                        process_id,
+                        effective_at,
+                    )
+                    deleted_process_ids.extend(result.get("deleted_process_ids", []))
+                    deleted_blocker_ids.extend(result.get("deleted_blocker_ids", []))
+                    changed = True
+        return {
+            "deleted_process_ids": list(dict.fromkeys(deleted_process_ids)),
+            "deleted_blocker_ids": list(dict.fromkeys(deleted_blocker_ids)),
+        }
 
     def _is_process_active_as_of(
         self,
@@ -2427,9 +3570,7 @@ class InMemoryProjectRepository:
             process_id=process.process_id,
             project_id=process.project_id,
             symbol=process.symbol,
-            status=process.status,
-            started_at=process.started_at,
-            finished_at=process.finished_at,
+            process_type=process.process_type,
             retired_at=retired_at,
         )
         return event_id
@@ -2446,6 +3587,19 @@ class InMemoryProjectRepository:
             edge_id = f"edge-{predecessor_id}-{successor_id}"
             self.dependency_edge_ids[key] = edge_id
         return edge_id
+
+    def _blocker_resolver_symbol(self, blocker_id: str) -> str:
+        stem = blocker_id.removeprefix("blocker-")
+        stem = self._slugify_identifier_stem(stem) or self._slugify_identifier_stem(
+            blocker_id,
+        )
+        return f"resolve-{stem}"
+
+    def _slugify_identifier_stem(self, value: str) -> str:
+        slug = "".join(char.lower() if char.isalnum() else "-" for char in value.strip())
+        while "--" in slug:
+            slug = slug.replace("--", "-")
+        return slug.strip("-") or "blocker"
 
     def _raise_validation(
         self,
@@ -2484,11 +3638,33 @@ class InMemoryProjectRepository:
         self,
         revisions: list[ProcessRevisionRecord],
     ) -> list[RoleRequirementCommand]:
+        requirements = [
+            requirement
+            for revision in revisions
+            for requirement in self._non_default_role_requirements(revision)
+        ]
+        if not requirements:
+            return []
+        project_id = revisions[0].project_id
+        self._merged_role_requirements_by_role(revisions)
+        return [
+            self._single_role_requirement_from_legacy_requirements(
+                project_id,
+                "collapse",
+                requirements,
+                requirement_id_prefix="req-collapse",
+            )
+        ]
+
+    def _merged_role_requirements_by_role(
+        self,
+        revisions: list[ProcessRevisionRecord],
+    ) -> list[RoleRequirementCommand]:
         grouped: dict[str, list[RoleRequirementCommand]] = defaultdict(list)
         process_ids_by_role: dict[str, list[str]] = defaultdict(list)
         requirement_ids_by_role: dict[str, list[str]] = defaultdict(list)
         for revision in revisions:
-            for requirement in revision.role_requirements:
+            for requirement in self._non_default_role_requirements(revision):
                 grouped[requirement.role_id].append(requirement)
                 process_ids_by_role[requirement.role_id].append(revision.process_id)
                 if requirement.requirement_id is not None:
@@ -2537,6 +3713,32 @@ class InMemoryProjectRepository:
                 )
             )
         return merged
+
+    def _non_default_role_requirements(
+        self,
+        revision: ProcessRevisionRecord,
+    ) -> list[RoleRequirementCommand]:
+        return [
+            requirement
+            for requirement in revision.role_requirements
+            if not self._is_default_missing_process_requirement(
+                revision.process_id,
+                requirement,
+            )
+        ]
+
+    def _is_default_missing_process_requirement(
+        self,
+        process_id: str,
+        requirement: RoleRequirementCommand,
+    ) -> bool:
+        role_id = requirement.role_id
+        role = self.roles.get(role_id)
+        return (
+            role is not None
+            and role.get("name") == DEFAULT_MISSING_PROCESS_ROLE_NAME
+            and requirement.requirement_id == f"{process_id}-{role_id}"
+        )
 
     def _merged_legacy_required_roles(
         self,
@@ -2831,6 +4033,12 @@ class InMemoryProjectRepository:
         project_id: str,
         role_requirements: list[RoleRequirementCommand],
     ) -> None:
+        if len(role_requirements) != 1:
+            raise ServiceValidationError(
+                code="process_role_requirement_count_invalid",
+                message="Active processes must define exactly one role requirement.",
+                field_path="role_requirements",
+            )
         for requirement in role_requirements:
             role = self._get_role(project_id, requirement.role_id)
             if not role["active"]:
@@ -2840,19 +4048,536 @@ class InMemoryProjectRepository:
                     entity_id=requirement.role_id,
                 )
 
-    def _validate_staked_resource_ids(
+    def _role_requirements_or_default(
         self,
         project_id: str,
-        staked_resource_ids: list[str],
+        process_id: str,
+        role_requirements: list[RoleRequirementCommand],
+    ) -> list[RoleRequirementCommand]:
+        if role_requirements:
+            return role_requirements
+        role_id = self._ensure_default_missing_process_role(project_id)
+        return [
+            RoleRequirementCommand(
+                requirement_id=f"{process_id}-{role_id}",
+                role_id=role_id,
+                effort_hours=1,
+            )
+        ]
+
+    def _ensure_default_missing_process_role(self, project_id: str) -> str:
+        project = self.get_project(project_id)
+        role_id = self._project_scoped_role_id(
+            project_id,
+            DEFAULT_MISSING_PROCESS_ROLE_ID,
+        )
+        role = self.roles.get(role_id)
+        if role is not None:
+            role["active"] = True
+        else:
+            self.roles[role_id] = {
+                "role_id": role_id,
+                "project_id": project_id,
+                "name": DEFAULT_MISSING_PROCESS_ROLE_NAME,
+                "active": True,
+            }
+            if role_id not in self.role_ids_by_project[project_id]:
+                self.role_ids_by_project[project_id].append(role_id)
+        self._ensure_default_missing_process_resource(
+            project_id,
+            project.start_at,
+            role_id,
+        )
+        return role_id
+
+    def _ensure_default_missing_process_resource(
+        self,
+        project_id: str,
+        available_from_at: dt.datetime,
+        role_id: str,
     ) -> None:
-        for resource_id in staked_resource_ids:
-            resource = self._get_resource(project_id, resource_id)
-            if not resource["active"]:
-                raise ServiceValidationError(
-                    code="inactive_staked_resource",
-                    message="Inactive resources cannot be staked to new process revisions.",
-                    entity_id=resource_id,
+        if any(
+            resource.get("active", True)
+            and role_id in set(resource.get("role_ids") or [])
+            for resource in self.resources.values()
+            if resource.get("project_id") == project_id
+        ):
+            return
+        for resource_id in self.resource_ids_by_project.get(project_id, []):
+            resource = self.resources.get(resource_id)
+            if (
+                resource is not None
+                and resource.get("active", True)
+                and resource.get("name") == DEFAULT_MISSING_PROCESS_RESOURCE_NAME
+            ):
+                self.set_resource_roles(
+                    project_id,
+                    resource_id,
+                    list(
+                        dict.fromkeys(
+                            [
+                                *list(resource.get("role_ids") or []),
+                                role_id,
+                            ]
+                        )
+                    ),
                 )
+                return
+        calendar_id = f"calendar-{symbolify(project_id)}-josh-default"
+        if calendar_id not in self.calendars:
+            self.upsert_resource_calendar(
+                project_id=project_id,
+                calendar_id=calendar_id,
+                name="Josh default",
+                timezone="UTC",
+                weekly_windows=[
+                    CalendarWeeklyWindowCommand(
+                        weekday=weekday,
+                        start_local_time="09:00",
+                        end_local_time="17:00",
+                        capacity_hours=8,
+                    )
+                    for weekday in range(5)
+                ],
+                active=True,
+            )
+        resource_id = DEFAULT_MISSING_PROCESS_RESOURCE_ID
+        existing = self.resources.get(resource_id)
+        if existing is not None and existing.get("project_id") != project_id:
+            resource_id = f"res_{symbolify(project_id)}_josh"
+        self.upsert_resource(
+            project_id=project_id,
+            resource_id=resource_id,
+            name=DEFAULT_MISSING_PROCESS_RESOURCE_NAME,
+            resource_type="external",
+            role_ids=[role_id],
+            calendar_id=calendar_id,
+            available_from_at=available_from_at,
+            cost_rate=0,
+            cost_unit=CostUnit.HOUR,
+            active=True,
+        )
+
+    def _single_role_requirement_from_legacy_requirements(
+        self,
+        project_id: str,
+        process_id: str,
+        role_requirements: list[RoleRequirementCommand],
+        *,
+        requirement_id_prefix: str | None = None,
+    ) -> RoleRequirementCommand:
+        total_effort = sum(int(requirement.effort_hours) for requirement in role_requirements)
+        resource_id = self._best_resource_for_role_requirements(
+            project_id,
+            role_requirements,
+        )
+        exact_role_id = self._ensure_resource_exact_role(project_id, resource_id)
+        requirement_id = f"{requirement_id_prefix or process_id}-{exact_role_id}"
+        return RoleRequirementCommand(
+            requirement_id=requirement_id,
+            role_id=exact_role_id,
+            effort_hours=max(total_effort, 1),
+        )
+
+    def _best_resource_for_role_requirements(
+        self,
+        project_id: str,
+        role_requirements: list[RoleRequirementCommand],
+    ) -> str:
+        scored: list[tuple[int, str]] = []
+        for resource_id in self.resource_ids_by_project.get(project_id, []):
+            resource = self.resources.get(resource_id)
+            if resource is None or not resource.get("active", True):
+                continue
+            resource_roles = {str(role_id) for role_id in resource.get("role_ids", [])}
+            score = sum(
+                int(requirement.effort_hours)
+                for requirement in role_requirements
+                if requirement.role_id in resource_roles
+            )
+            if score > 0:
+                scored.append((score, resource_id))
+        if scored:
+            return sorted(scored, key=lambda item: (-item[0], item[1]))[0][1]
+        self._ensure_default_missing_process_role(project_id)
+        return self._default_missing_process_resource_id(project_id)
+
+    def _default_missing_process_resource_id(self, project_id: str) -> str:
+        role_id = self._project_scoped_role_id(
+            project_id,
+            DEFAULT_MISSING_PROCESS_ROLE_ID,
+        )
+        candidates = [
+            resource_id
+            for resource_id in self.resource_ids_by_project.get(project_id, [])
+            if self.resources[resource_id].get("active", True)
+            and role_id
+            in {
+                str(resource_role_id)
+                for resource_role_id in self.resources[resource_id].get("role_ids", [])
+            }
+        ]
+        if DEFAULT_MISSING_PROCESS_RESOURCE_ID in candidates:
+            return DEFAULT_MISSING_PROCESS_RESOURCE_ID
+        if candidates:
+            return sorted(candidates)[0]
+        raise ServiceValidationError(
+            code="default_missing_process_resource_unavailable",
+            message="Default missing-process resource could not be created.",
+            entity_id=project_id,
+        )
+
+    def _ensure_resource_exact_role(self, project_id: str, resource_id: str) -> str:
+        resource = self._get_resource(project_id, resource_id)
+        role_id = self._project_scoped_role_id(project_id, f"role_{resource_id}")
+        existing = self.roles.get(role_id)
+        if existing is not None:
+            existing["active"] = True
+        else:
+            self.roles[role_id] = {
+                "role_id": role_id,
+                "project_id": project_id,
+                "name": f"Exact assignment: {resource.get('name') or resource_id}",
+                "active": True,
+            }
+            self.role_ids_by_project[project_id].append(role_id)
+        role_ids = list(resource.get("role_ids", []) or [])
+        if role_id not in role_ids:
+            resource["role_ids"] = [*role_ids, role_id]
+        return role_id
+
+    def _project_scoped_role_id(self, project_id: str, base_role_id: str) -> str:
+        existing = self.roles.get(base_role_id)
+        if existing is None or existing["project_id"] == project_id:
+            return base_role_id
+        stem = f"role_{symbolify(project_id)}_{base_role_id.removeprefix('role_')}"
+        candidate = stem
+        suffix = 2
+        while True:
+            existing = self.roles.get(candidate)
+            if existing is None or existing["project_id"] == project_id:
+                return candidate
+            candidate = f"{stem}_{suffix}"
+            suffix += 1
+
+    def _rewrite_process_pins_for_single_requirement(
+        self,
+        project_id: str,
+        process_id: str,
+        requirement: RoleRequirementCommand,
+    ) -> None:
+        for pin_id in list(self.process_role_pin_ids_by_project.get(project_id, [])):
+            pin = self.process_role_pins.get(pin_id)
+            if pin is None or pin.process_id != process_id:
+                continue
+            if requirement.role_id not in {
+                str(role_id)
+                for role_id in self.resources.get(pin.resource_id, {}).get("role_ids", [])
+            }:
+                continue
+            self.process_role_pins[pin_id] = pin.model_copy(
+                update={
+                    "requirement_id": requirement.requirement_id,
+                    "role_id": requirement.role_id,
+                }
+            )
+
+    def _rebuild_role_requirement_index(self) -> None:
+        self.role_requirements = {
+            requirement.requirement_id: requirement
+            for revisions in self.revisions_by_process.values()
+            for revision in revisions
+            for requirement in revision.role_requirements
+            if requirement.requirement_id is not None
+        }
+
+    def _validate_process_role_definition_invariants(self) -> None:
+        for project_id in sorted(self.projects):
+            for process_id in self.process_ids_by_project.get(project_id, []):
+                for revision in self.revisions_by_process.get(process_id, []):
+                    if not revision.role_requirements:
+                        raise ServiceValidationError(
+                            code="process_role_requirements_missing",
+                            message="Processes must define exactly one role requirement.",
+                            entity_id=process_id,
+                            details={"revision_id": revision.revision_id},
+                        )
+                    if len(revision.role_requirements) != 1:
+                        raise ServiceValidationError(
+                            code="process_role_requirement_count_invalid",
+                            message="Processes must define exactly one role requirement.",
+                            entity_id=process_id,
+                            details={"revision_id": revision.revision_id},
+                        )
+                    for index, requirement in enumerate(revision.role_requirements):
+                        if requirement.effort_hours <= 0:
+                            raise ServiceValidationError(
+                                code="process_role_effort_nonpositive",
+                                message="Process-role effort_hours must be positive.",
+                                field_path=f"role_requirements.{index}.effort_hours",
+                                entity_id=process_id,
+                                details={"revision_id": revision.revision_id},
+                            )
+
+    def _validate_no_orphaned_blocker_processes(self) -> None:
+        as_of = dt.datetime.max.replace(tzinfo=dt.UTC)
+        for project_id in sorted(self.projects):
+            orphaned = self._orphaned_blocker_process_ids(project_id, as_of)
+            if orphaned:
+                raise ServiceValidationError(
+                    code="orphaned_blocker_resolver_process",
+                    message="Blocker resolver processes must have a child process.",
+                    details={"process_ids": orphaned},
+                )
+
+    def _orphaned_blocker_process_ids(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+    ) -> list[str]:
+        active_ids = set(self.active_process_ids_as_of(project_id, as_of))
+        successors_by_predecessor: dict[str, set[str]] = {
+            process_id: set() for process_id in active_ids
+        }
+        for process_id in active_ids:
+            revision = self._latest_revision_as_of(process_id, as_of)
+            if revision is None:
+                continue
+            for dependency_id in revision.dependencies:
+                if dependency_id in active_ids:
+                    successors_by_predecessor.setdefault(dependency_id, set()).add(
+                        process_id
+                    )
+        return sorted(
+            process_id
+            for process_id in active_ids
+            if self.processes[process_id].process_type == "blocker"
+            and not successors_by_predecessor.get(process_id)
+        )
+
+    def _validate_process_role_pin(
+        self,
+        pin: ProcessRolePinRecord,
+    ) -> None:
+        process = self._get_process(pin.project_id, pin.process_id)
+        if pin.pinned_at > pin.updated_at:
+            raise ServiceValidationError(
+                code="validation_error",
+                message="pinned_at must be no later than updated_at.",
+                field_path="pinned_at",
+            )
+        self._get_role(pin.project_id, pin.role_id)
+        resource = self._get_resource(pin.project_id, pin.resource_id)
+        if not resource.get("active", True):
+            raise ServiceValidationError(
+                code="inactive_pinned_resource",
+                message="Inactive resources cannot be pinned to process-roles.",
+                entity_id=pin.resource_id,
+            )
+        if pin.role_id not in {str(value) for value in resource.get("role_ids", [])}:
+            raise ServiceValidationError(
+                code="pinned_resource_role_mismatch",
+                message="A resource can only be pinned to roles it can perform.",
+                entity_id=pin.resource_id,
+            )
+        revision = self._latest_revision_as_of(process.process_id, pin.pinned_at)
+        if revision is None:
+            raise ServiceValidationError(
+                code="process_revision_not_found",
+                message="Process-role pins require a process revision at pinned_at.",
+                entity_id=process.process_id,
+            )
+        matching = []
+        for index, requirement in enumerate(revision.role_requirements):
+            requirement_id = requirement.requirement_id or self._synthetic_requirement_id(
+                process.process_id,
+                index,
+            )
+            if pin.requirement_id is not None and pin.requirement_id != requirement_id:
+                continue
+            if requirement.role_id == pin.role_id:
+                matching.append(requirement_id)
+        if not matching:
+            raise ServiceValidationError(
+                code="pin_requirement_not_found",
+                message="Process-role pin must reference an existing process-role.",
+                entity_id=pin.process_id,
+            )
+        if pin.requirement_id is None and len(matching) > 1:
+            raise ServiceValidationError(
+                code="ambiguous_pin_requirement",
+                message=(
+                    "requirement_id is required when a process has multiple "
+                    "requirements for the same role."
+                ),
+                field_path="requirement_id",
+            )
+        resolved_requirement_id = pin.requirement_id or matching[0]
+        for existing in self.process_role_pins.values():
+            if existing.pin_id == pin.pin_id:
+                continue
+            if existing.project_id != pin.project_id:
+                continue
+            if existing.status == "pinned_finished":
+                continue
+            existing_requirement_id = existing.requirement_id
+            if existing_requirement_id is None:
+                existing_requirement_id = self._pin_requirement_id(existing)
+            if (
+                existing.process_id == pin.process_id
+                and existing_requirement_id == resolved_requirement_id
+            ):
+                raise ServiceValidationError(
+                    code="process_role_already_pinned",
+                    message="A process-role can only have one active pin.",
+                    entity_id=existing.pin_id,
+                )
+
+    def _invalid_process_role_pin_reason(
+        self,
+        pin: ProcessRolePinRecord,
+        as_of: dt.datetime,
+    ) -> str | None:
+        if pin.pinned_at > as_of:
+            return "future_pinned_at"
+        if pin.process_id not in self.processes:
+            return "missing_process"
+        if not self._is_process_active_as_of(pin.process_id, as_of):
+            return "inactive_process"
+        revision = self._latest_revision_as_of(pin.process_id, as_of)
+        if revision is None:
+            return "missing_process_revision"
+        matches = []
+        for index, requirement in enumerate(revision.role_requirements):
+            requirement_id = requirement.requirement_id or self._synthetic_requirement_id(
+                pin.process_id,
+                index,
+            )
+            if pin.requirement_id is not None and pin.requirement_id != requirement_id:
+                continue
+            if requirement.role_id == pin.role_id:
+                matches.append(requirement_id)
+        if pin.requirement_id is None and len(matches) > 1:
+            return "ambiguous_current_process_role"
+        if not matches:
+            return "missing_current_process_role"
+        return None
+
+    def _pin_requirement_id(self, pin: ProcessRolePinRecord) -> str:
+        if pin.requirement_id is not None:
+            return pin.requirement_id
+        revision = self._latest_revision_as_of(pin.process_id, pin.pinned_at)
+        if revision is None:
+            return f"{pin.process_id}:{pin.role_id}"
+        for index, requirement in enumerate(revision.role_requirements):
+            if requirement.role_id != pin.role_id:
+                continue
+            return requirement.requirement_id or self._synthetic_requirement_id(
+                pin.process_id,
+                index,
+            )
+        return f"{pin.process_id}:{pin.role_id}"
+
+    @staticmethod
+    def _synthetic_requirement_id(process_id: str, index: int) -> str:
+        return f"{process_id}-requirement-{index + 1}"
+
+    def _validate_process_has_started_pin(
+        self,
+        *,
+        project_id: str,
+        process_id: str,
+        edit_at: dt.datetime,
+    ) -> None:
+        if any(
+            pin.pinned_at <= edit_at
+            for pin in self.list_process_role_pins(
+                project_id,
+                as_of=edit_at,
+                process_id=process_id,
+                include_done=True,
+            )
+        ):
+            return
+        raise ServiceValidationError(
+            code="started_requires_process_role_pin",
+            message=(
+                "A process cannot be marked started until at least one "
+                "process-role is pinned started."
+            ),
+            field_path="status",
+            entity_id=process_id,
+        )
+
+    def _process_pin_started_at(
+        self,
+        project_id: str,
+        process_id: str,
+        as_of: dt.datetime,
+    ) -> dt.datetime | None:
+        return min(
+            (
+                pin.pinned_at
+                for pin in self.list_process_role_pins(
+                    project_id,
+                    as_of=as_of,
+                    process_id=process_id,
+                    include_done=True,
+                )
+            ),
+            default=None,
+        )
+
+    def _validate_process_role_pins_done_for_done(
+        self,
+        *,
+        project_id: str,
+        process_id: str,
+        edit_at: dt.datetime,
+    ) -> dt.datetime | None:
+        revision = self._latest_revision_as_of(process_id, edit_at)
+        if revision is None or not revision.role_requirements:
+            return None
+        verified_by_requirement: dict[str, dt.datetime] = {}
+        for pin in self.list_process_role_pins(
+            project_id,
+            as_of=edit_at,
+            process_id=process_id,
+            include_done=True,
+        ):
+            if (
+                pin.status != "pinned_finished"
+                or pin.verified_done_at is None
+                or pin.verified_done_at > edit_at
+            ):
+                continue
+            verified_by_requirement[self._pin_requirement_id(pin)] = pin.verified_done_at
+        missing = []
+        for index, requirement in enumerate(revision.role_requirements):
+            requirement_id = (
+                requirement.requirement_id
+                or self._synthetic_requirement_id(process_id, index)
+            )
+            if requirement_id in verified_by_requirement:
+                continue
+            missing.append(
+                {
+                    "requirement_id": requirement_id,
+                    "role_id": requirement.role_id,
+                }
+            )
+        if missing:
+            raise ServiceValidationError(
+                code="done_requires_verified_process_role_pins",
+                message=(
+                    "A role-backed process cannot be marked done until every "
+                    "process-role has a verified done pin."
+                ),
+                field_path="status",
+                entity_id=process_id,
+                details={"missing_verified_pins": missing},
+            )
+        return max(verified_by_requirement.values(), default=None)
 
     def _validate_resource_assignment(
         self,
@@ -2961,74 +4686,6 @@ class InMemoryProjectRepository:
                 )
             previous_end = override.get("ends_at")
 
-    def _resolve_lifecycle_finished_at(
-        self,
-        *,
-        process: ProcessRecord,
-        status: ProcessStatus,
-        edit_at: dt.datetime,
-        finished_at: dt.datetime | None,
-    ) -> dt.datetime | None:
-        if finished_at is not None and finished_at > edit_at:
-            raise ServiceValidationError(
-                code="validation_error",
-                message="finished_at must be no later than edit_at.",
-                field_path="finished_at",
-            )
-        if status == ProcessStatus.DONE:
-            return finished_at or edit_at
-        if status == ProcessStatus.CANCELED:
-            if process.status == ProcessStatus.DONE:
-                if finished_at is not None and finished_at != process.finished_at:
-                    raise ServiceValidationError(
-                        code="validation_error",
-                        message=(
-                            "Canceling a done process can only preserve the existing "
-                            "finished_at value."
-                        ),
-                        field_path="finished_at",
-                    )
-                return process.finished_at
-            if finished_at is not None:
-                raise ServiceValidationError(
-                    code="validation_error",
-                    message="Canceling unfinished work must not set finished_at.",
-                    field_path="finished_at",
-                )
-            return None
-        if finished_at is not None:
-            raise ServiceValidationError(
-                code="validation_error",
-                message="finished_at is only accepted when status is done.",
-                field_path="finished_at",
-            )
-        return None
-
-    def _resolve_lifecycle_started_at(
-        self,
-        *,
-        process: ProcessRecord,
-        status: ProcessStatus,
-        edit_at: dt.datetime,
-        started_at: dt.datetime | None,
-        finished_at: dt.datetime | None,
-    ) -> dt.datetime | None:
-        if started_at is not None and started_at > edit_at:
-            raise ServiceValidationError(
-                code="validation_error",
-                message="started_at must be no later than edit_at.",
-                field_path="started_at",
-            )
-        if status == ProcessStatus.PLANNED:
-            return None
-        if status in {ProcessStatus.IN_PROGRESS, ProcessStatus.PAUSED}:
-            return process.started_at or started_at or edit_at
-        if status == ProcessStatus.DONE:
-            return process.started_at or started_at or finished_at or edit_at
-        if status == ProcessStatus.CANCELED:
-            return process.started_at or started_at
-        return process.started_at
-
     def _validated_weekly_windows(
         self,
         weekly_windows: list[CalendarWeeklyWindowCommand],
@@ -3123,7 +4780,9 @@ class InMemoryProjectRepository:
     ) -> ProcessRevisionRecord | None:
         latest = None
         for revision in self.revisions_by_process[process_id]:
-            if revision.effective_at <= as_of:
+            if revision.effective_at > as_of:
+                continue
+            if latest is None or revision.effective_at >= latest.effective_at:
                 latest = revision
         return latest
 
@@ -3184,25 +4843,65 @@ class InMemoryProjectRepository:
         project_id: str,
         candidate: ProcessRevisionRecord,
     ) -> None:
-        graph = nx.DiGraph()
-        graph.add_nodes_from(self.process_ids_by_project[project_id])
-        for process_id in self.process_ids_by_project[project_id]:
-            if process_id == candidate.process_id:
-                revision = candidate
-            else:
-                revision = self._latest_revision_as_of(process_id, candidate.effective_at)
-            if revision is None:
-                continue
-            for dependency_id in revision.dependencies:
-                graph.add_edge(dependency_id, process_id)
+        validation_times = self._revision_validation_times(project_id, candidate)
+        for as_of in validation_times:
+            graph = nx.DiGraph()
+            graph.add_nodes_from(self.process_ids_by_project[project_id])
+            for process_id in self.process_ids_by_project[project_id]:
+                if process_id == candidate.process_id:
+                    revision = candidate
+                else:
+                    revision = self._latest_revision_as_of(process_id, as_of)
+                if revision is None:
+                    continue
+                for dependency_id in revision.dependencies:
+                    graph.add_edge(dependency_id, process_id)
 
-        if not nx.is_directed_acyclic_graph(graph):
+            if nx.is_directed_acyclic_graph(graph):
+                continue
+            cycle = [
+                {
+                    "predecessor_process_id": predecessor,
+                    "successor_process_id": successor,
+                }
+                for predecessor, successor in nx.find_cycle(graph)
+            ]
             raise ServiceValidationError(
                 code="dependency_cycle",
                 message="Adding this process revision would create a dependency cycle.",
                 field_path="dependencies",
                 entity_id=candidate.process_id,
+                details={"as_of": as_of.isoformat(), "cycle": cycle},
             )
+
+    def _revision_validation_times(
+        self,
+        project_id: str,
+        candidate: ProcessRevisionRecord,
+    ) -> list[dt.datetime]:
+        next_candidate_revision_at = min(
+            (
+                revision.effective_at
+                for revision in self.revisions_by_process.get(
+                    candidate.process_id,
+                    [],
+                )
+                if revision.effective_at > candidate.effective_at
+            ),
+            default=None,
+        )
+        times = {candidate.effective_at}
+        for process_id in self.process_ids_by_project[project_id]:
+            for revision in self.revisions_by_process.get(process_id, []):
+                if revision.effective_at < candidate.effective_at:
+                    continue
+                if (
+                    next_candidate_revision_at is not None
+                    and revision.effective_at >= next_candidate_revision_at
+                ):
+                    continue
+                times.add(revision.effective_at)
+        return sorted(times)
 
     def _validate_active_dependency_graph_acyclic(
         self,

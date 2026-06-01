@@ -13,7 +13,6 @@ dependencies = [
     "networkx",
     "numpy",
     "pydantic>=2",
-    "real_ladybug",
     "slack_sdk",
     "cryptography",
     "streamlit",
@@ -35,7 +34,7 @@ python_files = ["test_*.py"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-extend-exclude = ["old_code"]
+extend-exclude = ["old_code", "src/rcpsp_mathprog_package"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

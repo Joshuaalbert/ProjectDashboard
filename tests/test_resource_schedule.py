@@ -385,6 +385,43 @@ def _assert_resource_focus_never_splits_processes(
             )
 
 
+def _assert_resource_switches_only_after_requirement_completed(
+    data: dict[str, object],
+    effort_by_requirement: dict[str, float],
+) -> None:
+    allocations_by_resource: dict[str, list[object]] = {}
+    for allocation in data["allocation_slices"]:
+        resource_id = str(_value(allocation, "resource_id"))
+        allocations_by_resource.setdefault(resource_id, []).append(allocation)
+
+    for resource_id, allocations in allocations_by_resource.items():
+        allocated_by_requirement: dict[str, float] = {}
+        current_requirement_id: str | None = None
+        for allocation in sorted(
+            allocations,
+            key=lambda item: (
+                _as_datetime(_value(item, "starts_at")),
+                _as_datetime(_value(item, "ends_at")),
+                str(_value(item, "requirement_id")),
+            ),
+        ):
+            requirement_id = str(_value(allocation, "requirement_id"))
+            if (
+                current_requirement_id is not None
+                and requirement_id != current_requirement_id
+            ):
+                assert (
+                    allocated_by_requirement.get(current_requirement_id, 0.0)
+                    + 0.0001
+                    >= effort_by_requirement[current_requirement_id]
+                ), (resource_id, current_requirement_id, requirement_id)
+            allocated_by_requirement[requirement_id] = (
+                allocated_by_requirement.get(requirement_id, 0.0)
+                + float(_value(allocation, "effort_hours"))
+            )
+            current_requirement_id = requirement_id
+
+
 def _base_input(
     *,
     processes: list[dict[str, object]],
@@ -441,7 +478,7 @@ def _process(
         "name": process_id.replace("_", " ").title(),
         "dependencies": dependencies or [],
         "duration_business_days": duration_business_days,
-        "explicit_status": "planned",
+        "derived_status": "ready",
     }
     if earliest_start_at is not None:
         process["earliest_start_at"] = earliest_start_at
@@ -611,9 +648,80 @@ def test_resource_allocation_uses_global_contention_ledger_without_overbooking()
     _assert_resource_focus_never_splits_processes(data)
 
 
+def test_resource_work_session_switches_process_role_only_after_completion():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[
+                    _process("alpha"),
+                    _process("beta"),
+                ],
+                role_requirements=[
+                    _requirement("alpha", 3, requirement_id="req_alpha"),
+                    _requirement("beta", 2, requirement_id="req_beta"),
+                ],
+            )
+        )
+    )
+
+    _assert_resource_utilization_never_exceeds_capacity(data)
+    _assert_resource_focus_never_splits_processes(data)
+    _assert_resource_switches_only_after_requirement_completed(
+        data,
+        {"req_alpha": 3.0, "req_beta": 2.0},
+    )
+
+
+def test_process_role_dependencies_inherit_process_edges_without_same_process_edges():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[
+                    _process("parent"),
+                    _process("child", dependencies=["parent"]),
+                ],
+                role_requirements=[
+                    _requirement("parent", 2, requirement_id="req_parent_dev"),
+                    _requirement(
+                        "parent",
+                        5,
+                        requirement_id="req_parent_qa",
+                        role_id="role_qa",
+                    ),
+                    _requirement("child", 2, requirement_id="req_child_dev"),
+                    _requirement(
+                        "child",
+                        2,
+                        requirement_id="req_child_qa",
+                        role_id="role_qa",
+                    ),
+                ],
+                roles=[_role("role_dev"), _role("role_qa")],
+                resources=[
+                    _resource("res_dev", role_ids=["role_dev"]),
+                    _resource("res_qa", role_ids=["role_qa"]),
+                ],
+            )
+        )
+    )
+
+    by_requirement = {
+        str(_value(slice_, "requirement_id")): slice_
+        for slice_ in data["allocation_slices"]
+    }
+    parent_dev_start = _as_datetime(_value(by_requirement["req_parent_dev"], "starts_at"))
+    parent_qa_start = _as_datetime(_value(by_requirement["req_parent_qa"], "starts_at"))
+    parent_qa_finish = _as_datetime(_value(by_requirement["req_parent_qa"], "ends_at"))
+    child_dev_start = _as_datetime(_value(by_requirement["req_child_dev"], "starts_at"))
+    child_qa_start = _as_datetime(_value(by_requirement["req_child_qa"], "starts_at"))
+
+    assert parent_dev_start == parent_qa_start == _at(13)
+    assert child_dev_start == child_qa_start == parent_qa_finish
+
+
 def test_done_process_does_not_require_current_resource_capacity():
     process = _process("legacy_review")
-    process["explicit_status"] = "done"
+    process["derived_status"] = "finished"
     process["started_at"] = _at(13, 10)
     process["finished_at"] = _at(13, 12)
 
@@ -1276,6 +1384,42 @@ def test_include_normally_schedules_blocked_process_and_successor():
     assert {"blocked", "successor"}.issubset(allocated_process_ids)
 
 
+def test_blocker_process_type_schedules_like_an_ordinary_process():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[
+                    {**_process("resolve_decision"), "process_type": "blocker"},
+                    _process("implementation", dependencies=["resolve_decision"]),
+                ],
+                role_requirements=[
+                    _requirement("resolve_decision", 2),
+                    _requirement("implementation", 1),
+                ],
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    allocated_process_ids = {
+        str(_value(allocation, "process_id"))
+        for allocation in data["allocation_slices"]
+    }
+
+    assert _value(rows["resolve_decision"], "allocation_state") == "complete"
+    assert _iso(_value(rows["resolve_decision"], "starts_at")) == (
+        "2026-05-13T09:00:00+00:00"
+    )
+    assert _iso(_value(rows["resolve_decision"], "ends_at")) == (
+        "2026-05-13T11:00:00+00:00"
+    )
+    assert _value(rows["implementation"], "allocation_state") == "complete"
+    assert _iso(_value(rows["implementation"], "starts_at")) == (
+        "2026-05-13T11:00:00+00:00"
+    )
+    assert {"resolve_decision", "implementation"}.issubset(allocated_process_ids)
+
+
 def test_resource_schedule_allocation_slices_are_optional_and_shape_complete():
     input_data = _base_input(
         processes=[_process("build")],
@@ -1600,7 +1744,7 @@ def test_min_allocation_skips_tiny_fragment_when_more_work_remains():
     ) == pytest.approx(4.0)
 
 
-def test_min_allocation_schedules_final_remaining_effort_below_minimum():
+def test_min_allocation_schedules_final_unallocated_slice_below_minimum():
     data = _data(
         _compute_resource_schedule(
             _base_input(
@@ -1641,6 +1785,625 @@ def test_min_allocation_schedules_final_remaining_effort_below_minimum():
         starts_at=_at(14),
         ends_at=_at(14, 10),
     ) == pytest.approx(1.0)
+
+
+def test_mcts_backend_solves_dependency_and_resource_capacity():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[
+                    _process("design"),
+                    _process("build", dependencies=["design"]),
+                    _process("test", dependencies=["design"]),
+                ],
+                role_requirements=[
+                    _requirement("design", 2),
+                    _requirement("build", 2),
+                    _requirement("test", 2),
+                ],
+                options={"resource_schedule_backend": "mcts"},
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    assert _value(rows["design"], "allocation_state") == "complete"
+    assert _value(rows["build"], "allocation_state") == "complete"
+    assert _value(rows["test"], "allocation_state") == "complete"
+    assert _iso(_value(rows["design"], "starts_at")) == "2026-05-13T09:00:00+00:00"
+    assert _iso(_value(rows["design"], "ends_at")) == "2026-05-13T11:00:00+00:00"
+    assert _as_datetime(_value(rows["build"], "starts_at")) >= _as_datetime(
+        _value(rows["design"], "ends_at")
+    )
+    assert _as_datetime(_value(rows["test"], "starts_at")) >= _as_datetime(
+        _value(rows["design"], "ends_at")
+    )
+    assert sum(float(_value(item, "effort_hours")) for item in data["allocation_slices"]) == 6
+    _assert_resource_utilization_never_exceeds_capacity(data)
+    _assert_resource_focus_never_splits_processes(data)
+    assert data["warnings"][0]["code"] == "mcts_commitment_scheduler"
+
+
+def test_mcts_backend_handles_finished_predecessor_without_greedy_fallback():
+    done_process = _process("done")
+    done_process["derived_status"] = "finished"
+    done_process["finished_at"] = _at(13, 11)
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[
+                    done_process,
+                    _process("child", dependencies=["done"]),
+                ],
+                role_requirements=[
+                    _requirement("done", 8),
+                    _requirement("child", 2),
+                ],
+                options={"resource_schedule_backend": "mcts"},
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    assert data["warnings"][0]["code"] == "mcts_commitment_scheduler"
+    assert rows["done"]["allocation_state"] == "complete"
+    assert _iso(rows["done"]["ends_at"]) == "2026-05-13T11:00:00+00:00"
+    assert _as_datetime(rows["child"]["starts_at"]) >= _as_datetime(
+        rows["done"]["ends_at"]
+    )
+    assert sum(float(_value(item, "effort_hours")) for item in data["allocation_slices"]) == 2
+
+
+def test_mcts_fixed_role_completion_waits_for_predecessors_before_releasing_children():
+    input_data = _base_input(
+        processes=[
+            _process("parent"),
+            _process("pinned", dependencies=["parent"]),
+            _process("child", dependencies=["pinned"]),
+        ],
+        role_requirements=[
+            _requirement("parent", 8, role_id="role_parent"),
+            _requirement("pinned", 1, role_id="role_pinned"),
+            _requirement("child", 1, role_id="role_child"),
+        ],
+        roles=[
+            _role("role_parent"),
+            _role("role_pinned"),
+            _role("role_child"),
+        ],
+        resources=[
+            _resource("res_parent", role_ids=["role_parent"]),
+            _resource("res_pinned", role_ids=["role_pinned"]),
+            _resource("res_child", role_ids=["role_child"]),
+        ],
+        options={"resource_schedule_backend": "mcts"},
+    )
+    input_data["fixed_role_completions"] = [
+        {
+            "process_id": "pinned",
+            "requirement_id": "req_pinned",
+            "role_id": "role_pinned",
+            "resource_id": "res_pinned",
+            "starts_at": _at(13),
+            "finish_at": _at(13, 10),
+        }
+    ]
+
+    data = _data(_compute_resource_schedule(input_data))
+    rows = _rows_by_id(data)
+    child_slices = [
+        allocation
+        for allocation in data["allocation_slices"]
+        if allocation["process_id"] == "child"
+    ]
+
+    assert _iso(rows["parent"]["ends_at"]) == "2026-05-13T17:00:00+00:00"
+    assert _as_datetime(rows["pinned"]["ends_at"]) >= _as_datetime(
+        rows["parent"]["ends_at"]
+    )
+    assert _as_datetime(rows["child"]["starts_at"]) >= _as_datetime(
+        rows["pinned"]["ends_at"]
+    )
+    assert child_slices
+    assert all(
+        _as_datetime(slice_data["starts_at"]) >= _as_datetime(rows["pinned"]["ends_at"])
+        for slice_data in child_slices
+    )
+    assert all(
+        _as_datetime(slice_data["starts_at"]) < _as_datetime(slice_data["ends_at"])
+        for slice_data in data["allocation_slices"]
+    )
+
+
+@pytest.mark.parametrize("backend", ["greedy", "mcts"])
+def test_resource_schedule_respects_fixed_historical_allocations(backend: str):
+    input_data = _base_input(
+        processes=[
+            _process("historical"),
+            _process("remaining"),
+        ],
+        role_requirements=[
+            _requirement("remaining", 2),
+        ],
+        options={"resource_schedule_backend": backend},
+    )
+    input_data["fixed_allocation_slices"] = [
+        {
+            "slice_id": "",
+            "project_id": "project",
+            "process_id": "historical",
+            "requirement_id": "req_historical",
+            "role_id": "role_dev",
+            "resource_id": "res_alex",
+            "starts_at": _at(13),
+            "ends_at": _at(13, 11),
+            "effort_hours": 2.0,
+            "capacity_hours": 2.0,
+            "cost_amount": None,
+            "cost_currency": "USD",
+            "iteration": 0,
+            "allocation_source": "historical_stake",
+            "stake_id": "stake-history",
+        }
+    ]
+
+    data = _data(_compute_resource_schedule(input_data))
+    rows = _rows_by_id(data)
+    historical_slices = [
+        row
+        for row in data["allocation_slices"]
+        if row.get("allocation_source") == "historical_stake"
+    ]
+    remaining_slices = [
+        row
+        for row in data["allocation_slices"]
+        if row["process_id"] == "remaining"
+    ]
+
+    assert {row["stake_id"] for row in historical_slices} == {"stake-history"}
+    assert _iso(rows["historical"]["starts_at"]) == "2026-05-13T09:00:00+00:00"
+    assert _iso(rows["historical"]["ends_at"]) == "2026-05-13T11:00:00+00:00"
+    assert min(_as_datetime(row["starts_at"]) for row in remaining_slices) >= _at(13, 11)
+    assert sum(row["effort_hours"] for row in remaining_slices) == 2
+    if backend == "mcts":
+        assert data["warnings"][0]["code"] == "mcts_commitment_scheduler"
+
+
+def test_mcts_backend_rejects_greedy_only_constraints_instead_of_falling_back():
+    with pytest.raises(ValueError, match="cannot plan this input"):
+        _compute_resource_schedule(
+            _base_input(
+                processes=[_process("audit")],
+                role_requirements=[
+                    _requirement(
+                        "audit",
+                        3,
+                        allocation_policy="contiguous",
+                    )
+                ],
+                options={"resource_schedule_backend": "mcts"},
+            )
+        )
+
+
+def test_mcts_backend_allocates_process_roles_to_distinct_resources_in_parallel():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[_process("launch")],
+                role_requirements=[
+                    _requirement(
+                        "launch",
+                        2,
+                        requirement_id="req_launch_dev",
+                        role_id="role_dev",
+                    ),
+                    _requirement(
+                        "launch",
+                        2,
+                        requirement_id="req_launch_legal",
+                        role_id="role_legal",
+                    ),
+                ],
+                roles=[
+                    _role("role_dev", "Developer"),
+                    _role("role_legal", "Legal"),
+                ],
+                resources=[
+                    _resource("res_dev", role_ids=["role_dev"]),
+                    _resource("res_legal", role_ids=["role_legal"]),
+                ],
+                options={"resource_schedule_backend": "mcts"},
+            )
+        )
+    )
+
+    row = _rows_by_id(data)["launch"]
+    assert _iso(_value(row, "starts_at")) == "2026-05-13T09:00:00+00:00"
+    assert _iso(_value(row, "ends_at")) == "2026-05-13T11:00:00+00:00"
+    assert _allocation_effort_by_resource(data) == {
+        "res_dev": pytest.approx(2),
+        "res_legal": pytest.approx(2),
+    }
+    _assert_resource_utilization_never_exceeds_capacity(data)
+    _assert_resource_focus_never_splits_processes(data)
+
+
+def test_greedy_backend_uses_existing_contiguous_allocator_when_needed():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[_process("audit")],
+                role_requirements=[
+                    _requirement(
+                        "audit",
+                        3,
+                        allocation_policy="contiguous",
+                    )
+                ],
+                options={"resource_schedule_backend": "greedy"},
+            )
+        )
+    )
+
+    row = _rows_by_id(data)["audit"]
+    assert _value(row, "allocation_state") == "complete"
+    assert _iso(_value(row, "starts_at")) == "2026-05-13T09:00:00+00:00"
+    assert _iso(_value(row, "ends_at")) == "2026-05-13T12:00:00+00:00"
+    assert len(data["allocation_slices"]) == 1
+    _assert_resource_focus_never_splits_processes(data)
+
+
+def test_commitment_planner_legal_actions_respect_earliest_start():
+    heuristic_module = import_module("rcpsp_mathprog_package.rcpsp_heuristic")
+    mcts_module = import_module("rcpsp_mathprog_package.rcpsp_commitment_mcts")
+    problem = heuristic_module.HeuristicPlanningProblem(
+        roles=("role",),
+        resources=("res",),
+        processes=("future", "ready"),
+        buckets=(1, 2),
+        requirements={
+            ("role", "future"): 1.0,
+            ("role", "ready"): 1.0,
+        },
+        availability={
+            ("res", "role", 1): 1.0,
+            ("res", "role", 2): 1.0,
+        },
+        predecessors={},
+        bucket_hours={1: 1.0, 2: 1.0},
+        resource_capacity={("res", 1): 1.0, ("res", 2): 1.0},
+        bucket_start={1: 0.0, 2: 1.0},
+        bucket_end={1: 1.0, 2: 2.0},
+        earliest_start={"future": 1.0},
+    )
+    planner = mcts_module.CommitmentMCTSPlanner(
+        mcts_module.CommitmentMCTSOptions(use_mcts=False)
+    )
+    planner._prepare_commitment(problem)
+    state = planner._initial_state(problem, record=False)
+
+    legal = planner._legal_actions(
+        problem,
+        state,
+        "res",
+        include_idle_when_work_legal=False,
+    )
+
+    assert ("ready", "role") in legal
+    assert ("future", "role") not in legal
+    assert not planner._apply_action(
+        problem,
+        state,
+        "res",
+        ("future", "role"),
+        record=False,
+    )
+
+
+def test_mcts_backend_treats_blocker_metadata_as_non_planning_data():
+    data = _data(
+        _compute_resource_schedule(
+            _base_input(
+                processes=[
+                    _process("blocked"),
+                    _process("successor", dependencies=["blocked"]),
+                    _process("independent"),
+                ],
+                role_requirements=[
+                    _requirement("blocked", 2),
+                    _requirement("successor", 1),
+                    _requirement("independent", 1),
+                ],
+                blockers=[
+                    {
+                        "blocker_id": "blocker_1",
+                        "project_id": "project",
+                        "process_id": "blocked",
+                        "created_at": _at(13),
+                        "resolved_at": None,
+                    }
+                ],
+                options={
+                    "resource_schedule_backend": "mcts",
+                    "blocked_policy": "exclude",
+                },
+            )
+        )
+    )
+
+    rows = _rows_by_id(data)
+    allocated_process_ids = {
+        str(_value(allocation, "process_id")) for allocation in data["allocation_slices"]
+    }
+
+    assert _value(rows["blocked"], "allocation_state") == "complete"
+    assert _iso(_value(rows["blocked"], "starts_at")) == "2026-05-13T09:00:00+00:00"
+    assert _iso(_value(rows["blocked"], "ends_at")) == "2026-05-13T11:00:00+00:00"
+    assert _value(rows["successor"], "allocation_state") == "complete"
+    assert _iso(_value(rows["successor"], "starts_at")) == "2026-05-13T12:00:00+00:00"
+    assert _iso(_value(rows["successor"], "ends_at")) == "2026-05-13T13:00:00+00:00"
+    assert _value(rows["independent"], "allocation_state") == "complete"
+    assert allocated_process_ids == {"blocked", "successor", "independent"}
+    assert data["warnings"][0]["details"]["blocked_policy"] == "include_normally"
+    assert data["warnings"][0]["details"]["blocked_process_ids"] == []
+
+
+def test_mcts_terminal_reward_is_positive_clipped_relative_improvement():
+    import_module("projdash.engine.resource_schedule_commitment")
+    mcts_module = import_module("rcpsp_mathprog_package.rcpsp_commitment_mcts")
+    planner = mcts_module.CommitmentMCTSPlanner(mcts_module.CommitmentMCTSOptions())
+    reward = planner._terminal_reward
+
+    assert reward(baseline_makespan=7, rollout_makespan=8) == pytest.approx(0)
+    assert reward(baseline_makespan=7, rollout_makespan=7) == pytest.approx(0)
+    assert reward(baseline_makespan=7, rollout_makespan=6) > 0
+    assert reward(baseline_makespan=7, rollout_makespan=1) == pytest.approx(1)
+
+
+def test_rcpsp_commitment_counterexample_exact_dp_proves_mcts_optimal():
+    import_module("projdash.engine.resource_schedule_commitment")
+    mcts_module = import_module("rcpsp_mathprog_package.rcpsp_commitment_mcts")
+    problem = mcts_module.make_single_day_context_counterexample()
+    exact_makespan = mcts_module.CommitmentMCTSPlanner(
+        mcts_module.CommitmentMCTSOptions(use_mcts=False)
+    ).exact_optimal_makespan(problem)
+    raw_planner = mcts_module.CommitmentMCTSPlanner(
+        mcts_module.CommitmentMCTSOptions(use_mcts=False)
+    )
+    raw = raw_planner.solve_raw_heuristic(problem)
+    improved_planner = mcts_module.CommitmentMCTSPlanner(
+        mcts_module.CommitmentMCTSOptions(
+            use_mcts=True,
+            complete_rollouts_per_action=10,
+            allow_idle_when_work_legal=False,
+        )
+    )
+    improved = improved_planner.solve(problem)
+
+    assert exact_makespan == pytest.approx(32)
+    assert raw.objective_makespan == pytest.approx(56)
+    assert improved.objective_makespan == pytest.approx(32)
+    assert improved.objective_makespan == pytest.approx(exact_makespan)
+    assert improved_planner.stats.complete_rollouts == 20
+    assert improved_planner.stats.root_actions_evaluated == 2
+    assert improved_planner.stats.searched_decisions == 1
+
+
+def test_projdash_commitment_counterexample_projection_is_exhaustively_proven():
+    input_data = _commitment_counterexample_input()
+    commitment_backend = import_module("projdash.engine.resource_schedule_commitment")
+    mcts_module = import_module("rcpsp_mathprog_package.rcpsp_commitment_mcts")
+    exact_makespan = mcts_module.CommitmentMCTSPlanner(
+        mcts_module.CommitmentMCTSOptions(use_mcts=False)
+    ).exact_optimal_makespan(
+        commitment_backend.commitment_problem_from_schedule_input(input_data)
+    )
+    improved = _data(
+        _compute_resource_schedule(
+            {
+                **input_data,
+                "options": {
+                    **input_data["options"],
+                    "resource_schedule_backend": "mcts",
+                },
+            }
+        )
+    )
+    improved_finish = max(
+        _as_datetime(_value(row, "ends_at"))
+        for row in improved["processes"]
+        if _value(row, "ends_at") is not None
+    )
+
+    assert exact_makespan == pytest.approx(32)
+    assert improved_finish == _at(14, 17)
+    assert improved["warnings"][0]["details"]["mcts_complete_rollouts"] > 0
+    _assert_resource_utilization_never_exceeds_capacity(improved)
+
+
+def test_mcts_backend_improves_random_bottlenecked_medium_problems():
+    improvements = []
+    for seed in range(3):
+        input_data = _random_bottleneck_input(seed)
+        prior = _data(
+            _compute_resource_schedule(
+                {
+                    **input_data,
+                    "options": {
+                        **input_data["options"],
+                        "resource_schedule_backend": "greedy",
+                    },
+                }
+            )
+        )
+        improved = _data(
+            _compute_resource_schedule(
+                {
+                    **input_data,
+                    "options": {
+                        **input_data["options"],
+                        "resource_schedule_backend": "mcts",
+                        "resource_schedule_mcts_max_actions": 4,
+                    },
+                }
+            )
+        )
+        prior_finish = max(
+            _as_datetime(_value(row, "ends_at"))
+            for row in prior["processes"]
+            if _value(row, "ends_at") is not None
+        )
+        improved_finish = max(
+            _as_datetime(_value(row, "ends_at"))
+            for row in improved["processes"]
+            if _value(row, "ends_at") is not None
+        )
+        improvement_hours = (prior_finish - improved_finish).total_seconds() / 3600
+        improvements.append(improvement_hours)
+        assert improvement_hours >= 0
+        assert improved["warnings"][0]["code"] == "mcts_commitment_scheduler"
+        assert improved["warnings"][0]["details"]["mcts_rollouts_per_action"] == 10
+        _assert_resource_utilization_never_exceeds_capacity(improved)
+        _assert_resource_focus_never_splits_processes(improved)
+
+    assert min(improvements) >= 0
+
+
+def _commitment_counterexample_input() -> dict[str, object]:
+    roles = [
+        _role("X", "X"),
+        _role("Y", "Y"),
+    ]
+    calendars = [
+        _calendar(
+            "cal_flexible",
+            windows=[
+                WeeklyWindow(2, "09:00:00", "17:00:00", 8),
+                WeeklyWindow(3, "09:00:00", "17:00:00", 8),
+                WeeklyWindow(4, "09:00:00", "17:00:00", 8),
+            ],
+        ),
+        _calendar(
+            "cal_specialist_x",
+            windows=[WeeklyWindow(2, "09:00:00", "17:00:00", 8)],
+        ),
+    ]
+    resources = [
+        _resource(
+            "F",
+            role_ids=["X", "Y"],
+            calendar_id="cal_flexible",
+        ),
+        _resource("SX", role_ids=["X"], calendar_id="cal_specialist_x"),
+    ]
+    processes = [
+        _process("A"),
+        _process("B"),
+        _process("C", dependencies=["A"]),
+    ]
+    requirements = [
+        _requirement("A", 8, role_id="X"),
+        _requirement("B", 8, role_id="Y"),
+        _requirement("C", 8, role_id="Y"),
+    ]
+    return _base_input(
+        processes=processes,
+        role_requirements=requirements,
+        roles=roles,
+        resources=resources,
+        calendars=calendars,
+        horizon_ends_at=_at(15, 17),
+        options={"include_allocation_slices": True},
+    )
+
+
+def _random_bottleneck_input(seed: int) -> dict[str, object]:
+    import random
+
+    rng = random.Random(seed)
+    roles = [
+        _role("role_bottle", "Bottleneck"),
+        _role("role_common", "Common"),
+        _role("role_other", "Other"),
+        _role("role_review", "Review"),
+    ]
+    calendars = [
+        _calendar("cal_full"),
+        _calendar(
+            "cal_short",
+            windows=[
+                WeeklyWindow(weekday, "10:00:00", "15:00:00", 5)
+                for weekday in range(5)
+            ],
+        ),
+        _calendar(
+            "cal_sparse",
+            windows=[
+                WeeklyWindow(1, "12:00:00", "17:00:00", 5),
+                WeeklyWindow(3, "12:00:00", "17:00:00", 5),
+            ],
+        ),
+    ]
+    resources = [
+        _resource(
+            "res_bottle",
+            role_ids=["role_bottle", "role_common"],
+            calendar_id="cal_full",
+        ),
+        _resource("res_common", role_ids=["role_common"], calendar_id="cal_full"),
+        _resource(
+            "res_other",
+            role_ids=["role_other", "role_common"],
+            calendar_id="cal_short",
+        ),
+        _resource(
+            "res_review",
+            role_ids=["role_review", "role_common"],
+            calendar_id="cal_sparse",
+        ),
+    ]
+    processes = [
+        _process("side_bottleneck"),
+        _process("unlock_critical"),
+        _process("critical_bottleneck", dependencies=["unlock_critical"]),
+        _process("critical_common_finish", dependencies=["critical_bottleneck"]),
+    ]
+    requirements = [
+        _requirement(
+            "side_bottleneck",
+            6 + rng.randint(0, 1),
+            role_id="role_bottle",
+        ),
+        _requirement("unlock_critical", 2, role_id="role_common"),
+        _requirement("critical_bottleneck", 4, role_id="role_bottle"),
+        _requirement("critical_common_finish", 8, role_id="role_common"),
+    ]
+    for index in range(8):
+        process_id = f"extra_{seed}_{index}"
+        dependencies = ["unlock_critical"] if index in {2, 5} else []
+        role_id = (
+            "role_review"
+            if index == 0
+            else ["role_common", "role_other"][rng.randrange(2)]
+        )
+        processes.append(_process(process_id, dependencies=dependencies))
+        requirements.append(
+            _requirement(
+                process_id,
+                1,
+                role_id=role_id,
+            )
+        )
+    return _base_input(
+        processes=processes,
+        role_requirements=requirements,
+        roles=roles,
+        resources=resources,
+        calendars=calendars,
+        horizon_ends_at=_at(30, 17),
+        options={"include_allocation_slices": True},
+    )
 
 
 def test_max_daily_cap_can_resume_on_next_working_day():
@@ -2101,14 +2864,33 @@ def test_unknown_required_role_fails_validation():
         )
 
 
-def test_fractional_role_effort_fails_validation():
-    with pytest.raises(ValueError, match="positive whole number"):
+@pytest.mark.parametrize("effort_hours", [0, -1])
+def test_nonpositive_role_effort_fails_validation(effort_hours: float):
+    with pytest.raises(ValueError, match="must be positive"):
+        _compute_resource_schedule(
+            _base_input(
+                processes=[_process("build")],
+                role_requirements=[_requirement("build", effort_hours)],
+            )
+        )
+
+
+def test_fractional_remaining_role_effort_schedules_final_partial_slice():
+    data = _data(
         _compute_resource_schedule(
             _base_input(
                 processes=[_process("build")],
                 role_requirements=[_requirement("build", 1.5)],
             )
         )
+    )
+    rows = _rows_by_id(data)
+
+    assert _value(rows["build"], "allocation_state") == "complete"
+    assert sum(
+        float(_value(allocation, "effort_hours"))
+        for allocation in data["allocation_slices"]
+    ) == pytest.approx(1.5)
 
 
 def test_convergence_fingerprint_ignores_slice_id_iteration_and_cost_amount():

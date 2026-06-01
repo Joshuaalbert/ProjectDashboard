@@ -34,8 +34,9 @@ selection.
 ## Hard Invariants
 
 - All API datetimes are timezone-aware and use `*_at` names.
-- Processes do not have due dates. Schedule pressure comes from `ES`, `EF`,
-  `LS`, `LF`, critical path, blockers, and slippage snapshots.
+- Processes do not have due dates. Resource-aware schedule pressure comes from
+  planned starts, planned finishes, schedule windows, schedule buffer,
+  makespan sensitivity, blockers, and slippage snapshots.
 - Schedules have no user-supplied horizon. Recurring resource calendars extend
   indefinitely.
 - Process effort is stored as `role_requirements`: one row per role with
@@ -48,7 +49,7 @@ selection.
   such as a different August or September availability pattern.
 - Blockers do not delay the schedule. They affect PM prioritization and status.
 - `earliest_start_at` is a not-before constraint.
-- `started_at` pins a process start: `ES == LS == started_at`.
+- `started_at` is derived from process-role pins.
 - `done` processes are historical anchors and must have `finished_at`.
 - `commit_project_state` is what creates a slippage-history point.
 
@@ -72,7 +73,7 @@ Agent context, the default starting point:
 The response includes `project`, `summary`, `graph`, `schedule`, `slippage`,
 `prioritized_work`, `blockers`, and `available_queries`. `prioritized_work`
 contains `by_role` and `by_resource` groups. Each priority process includes the
-priority label, process symbol and name, latest-start timing, effort hours, and
+priority label, process symbol and name, planned-start timing, effort hours, and
 status fields needed for action planning.
 
 Use the JSON response as the canonical state for command construction. Markdown
@@ -85,9 +86,10 @@ Recommended Markdown context summary sections:
 
 - Snapshot: project id, `as_of`, `now`, scope, terminal targets, completion,
   status counts, blocked count, and schedule convergence.
-- Critical path.
+- Makespan sensitivity.
 - Role priorities and resource priorities, grouped by entity.
-- Schedule watchlist with LS/end times, slack, allocation state, and status.
+- Schedule watchlist with planned start/finish, buffer, sensitivity, allocation
+  state, and status.
 - Open blockers.
 - Resource calendar rules, including default calendars and bounded overrides.
 - Follow-up queries available for deeper evidence.
@@ -210,6 +212,22 @@ For a new process, omit both `process_id` and `process_symbol`; the service
 creates the symbol. Use symbols or aliases for human-facing references after
 creation.
 
+Delete a process when it should be removed from the project rather than merely
+canceled:
+
+```json
+{
+  "action": "delete_process",
+  "project_id": "project_id",
+  "process_symbol": "obsolete-process",
+  "edit_at": "2026-05-14T09:00:00+00:00"
+}
+```
+
+Deleting a process also removes dependency references to it. A blocker and its
+resolver process are deleted only when deleting the process leaves the resolver
+with no remaining child processes.
+
 ## Status and Blockers
 
 ```json
@@ -219,10 +237,14 @@ creation.
   "process_symbol": "process-symbol",
   "status": "in_progress",
   "edit_at": "2026-05-14T09:00:00+00:00",
-  "started_at": "2026-05-14T09:00:00+00:00",
   "note": "Started after kickoff."
 }
 ```
+
+Use `upsert_process_role_pin` to record the actual start of process-role work
+and the resource's forecast finish; process status alone is not start evidence.
+Use `delete_process_role_pin` to unpin a process-role; this removes the pin's
+forecast, verified finish, and verified work evidence.
 
 ```json
 {

@@ -43,8 +43,10 @@ class ProcessScheduleInput:
     name: str
     dependencies: tuple[str, ...]
     duration_business_days: int
-    explicit_status: str
-    started_at: dt.datetime | None = None
+    derived_status: str
+    process_type: str = "standard"
+    pin_started_at: dt.datetime | None = None
+    pin_finished_at: dt.datetime | None = None
     earliest_start_at: dt.datetime | None = None
     start_at_earliest: bool = False
     delay_after_dependencies_business_days: int = 0
@@ -58,7 +60,7 @@ class ScheduleRow:
 
     process_id: str
     name: str
-    explicit_status: str
+    derived_status: str
     computed_status: ComputedScheduleStatus
     dependencies: tuple[str, ...]
     earliest_start_at: dt.datetime
@@ -73,7 +75,7 @@ class ScheduleRow:
         return {
             "process_id": self.process_id,
             "name": self.name,
-            "explicit_status": self.explicit_status,
+            "derived_status": self.derived_status,
             "computed_status": self.computed_status.value,
             "dependencies": list(self.dependencies),
             "earliest_start_at": self.earliest_start_at.isoformat(),
@@ -151,26 +153,30 @@ def compute_schedule(
             (earliest_finish[dependency] for dependency in graph.predecessors(process_id)),
             default=project_start,
         )
-        if process.started_at is not None:
-            start = process.started_at
-        else:
-            constraints = [dependency_finish]
-            if process.earliest_start_at is not None:
-                constraints.append(next_business_day(process.earliest_start_at))
-            if process.delay_after_dependencies_business_days:
-                constraints.append(
-                    add_business_days(
-                        dependency_finish,
-                        process.delay_after_dependencies_business_days,
-                    )
+        constraints = [dependency_finish]
+        if process.pin_started_at is None and process.pin_finished_at is None:
+            constraints.append(now)
+        if process.pin_started_at is not None:
+            constraints.append(process.pin_started_at)
+        if process.earliest_start_at is not None:
+            constraints.append(next_business_day(process.earliest_start_at))
+        if process.delay_after_dependencies_business_days:
+            constraints.append(
+                add_business_days(
+                    dependency_finish,
+                    process.delay_after_dependencies_business_days,
                 )
-            start = max(constraints)
+            )
+        start = max(constraints)
 
         earliest_start[process_id] = start
-        earliest_finish[process_id] = add_business_days(
-            start,
-            process.duration_business_days,
-        )
+        if process.pin_finished_at is not None:
+            earliest_finish[process_id] = max(process.pin_finished_at, start)
+        else:
+            earliest_finish[process_id] = add_business_days(
+                start,
+                process.duration_business_days,
+            )
 
     completion_at = max(earliest_finish.values(), default=project_start)
     latest_start: dict[str, dt.datetime] = {}
@@ -179,8 +185,8 @@ def compute_schedule(
 
     for process_id in reversed(list(nx.topological_sort(graph))):
         process = process_by_id[process_id]
-        if process.started_at is not None:
-            latest_start[process_id] = process.started_at
+        if process.pin_finished_at is not None or process.pin_started_at is not None:
+            latest_start[process_id] = earliest_start[process_id]
             latest_finish[process_id] = earliest_finish[process_id]
             total_float[process_id] = 0
             continue
@@ -188,6 +194,7 @@ def compute_schedule(
             (latest_start[successor] for successor in graph.successors(process_id)),
             default=completion_at,
         )
+        finish = max(finish, earliest_finish[process_id])
         start = subtract_business_days(finish, process.duration_business_days)
         latest_start[process_id] = start
         latest_finish[process_id] = finish
@@ -209,7 +216,7 @@ def compute_schedule(
             ScheduleRow(
                 process_id=process.process_id,
                 name=process.name,
-                explicit_status=process.explicit_status,
+                derived_status=process.derived_status,
                 computed_status=computed_status,
                 dependencies=process.dependencies,
                 earliest_start_at=earliest_start[process_id],
@@ -236,9 +243,11 @@ def _compute_status(
     latest_start_at: dt.datetime,
     latest_finish_at: dt.datetime,
 ) -> ComputedScheduleStatus:
-    if process.explicit_status == "done":
+    if process.derived_status == "finished":
         return ComputedScheduleStatus.VALIDATED_DONE
-    if process.explicit_status == "blocked" or process.unresolved_blocker_count > 0:
+    if process.process_type == "blocker":
+        return ComputedScheduleStatus.BLOCKED
+    if process.unresolved_blocker_count > 0:
         return ComputedScheduleStatus.BLOCKED
     if latest_start_at < now:
         return ComputedScheduleStatus.LATE

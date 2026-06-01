@@ -1,5 +1,4 @@
 import datetime as dt
-import math
 
 import matplotlib.dates as mdates
 import pytest
@@ -15,6 +14,8 @@ from projdash.ui.adapters import (
     catalog_from_query_data,
     cost_time_series_rows,
     existing_dependency_symbols,
+    gantt_bar_color,
+    gantt_completedness_legend_items,
     gantt_rows,
     process_symbol_maps,
     process_table_rows,
@@ -156,6 +157,7 @@ def test_process_table_rows_and_role_defaults_include_pm_description_and_effort(
     assert rows[0]["description"] == "Definition of design completion"
     assert rows[0]["inferred_duration_hours"] == 6.5
     assert rows[0]["allocation_diagnostic"] == "Needs more calendar capacity."
+    assert "focus_evidence" not in rows[0]
     assert _role_effort_defaults(graph["nodes"][0]) == {
         "role_eng": 5.0,
         "role_qa": 1.0,
@@ -201,7 +203,7 @@ def test_blocker_table_rows_join_process_priority_roles_and_resources():
                 "process_symbol": "A",
                 "name": "Design",
                 "status": "planned",
-                "computed_status": "work_now",
+                "computed_status": "started",
                 "role_requirements": [
                     {"role_id": "role_eng", "effort_hours": 4},
                     {"role_id": "role_qa", "effort_hours": 2},
@@ -241,9 +243,9 @@ def test_blocker_table_rows_join_process_priority_roles_and_resources():
 
     assert rows[0]["blocker_id"] == "blocker-review"
     assert rows[0]["blocker_status"] == "blocking"
-    assert rows[0]["priority"] == "P2"
+    assert rows[0]["priority"] == "P0"
     assert rows[0]["process_status"] == "planned"
-    assert rows[0]["computed_status"] == "work_now"
+    assert rows[0]["computed_status"] == "started"
     assert rows[0]["role_ids"] == "role_eng, role_qa"
     assert rows[0]["resource_ids"] == "res_ada, res_grace"
     assert rows[1]["blocker_id"] == "blocker-archive"
@@ -528,10 +530,10 @@ def test_process_aggregation_and_priority_rows_use_schedule_windows():
                     {"role_id": "role_qa", "effort_hours": 5},
                 ],
                 "dependency_only": {
-                    "es_at": "2026-05-13T13:00:00+00:00",
-                    "ef_at": "2026-05-13T14:00:00+00:00",
-                    "ls_at": "2026-05-13T15:00:00+00:00",
-                    "lf_at": "2026-05-13T17:00:00+00:00",
+                    "es_at": "2026-05-18T12:00:00+00:00",
+                    "ef_at": "2026-05-18T13:00:00+00:00",
+                    "ls_at": "2026-05-18T14:00:00+00:00",
+                    "lf_at": "2026-05-18T16:00:00+00:00",
                 },
             },
         ],
@@ -567,22 +569,16 @@ def test_process_aggregation_and_priority_rows_use_schedule_windows():
     assert aggregate["children"] == []
     assert aggregate["role_efforts"] == {"role_eng": 5.0, "role_qa": 5.0}
     assert aggregate["blocker_ids"] == ["b1"]
-    assert role_rows[0]["priority"] == "P2"
+    assert role_rows[0]["priority"] == "P0"
     assert role_rows[0]["process_symbol"] == "A"
-    assert role_rows[0]["hours_until_ls"] == 1.0
-    assert role_rows[-1]["priority"] == "P3"
-    assert resource_rows == [
-        {
-            "priority": "P2",
-            "priority_rank": 2,
-            "process_symbol": "A",
-            "process_name": "Design",
-            "hours_until_ls": 1.0,
-            "resource_id": "res_alice",
-            "effort_hours": 2.0,
-            "role_ids": "role_eng",
-        }
-    ]
+    assert role_rows[0]["hours_until_planned_start"] == -3.0
+    assert role_rows[-1]["priority"] == "P1"
+    assert len(resource_rows) == 1
+    assert resource_rows[0]["priority"] == "P0"
+    assert resource_rows[0]["process_symbol"] == "A"
+    assert resource_rows[0]["resource_id"] == "res_alice"
+    assert resource_rows[0]["effort_hours"] == 2.0
+    assert resource_rows[0]["role_ids"] == "role_eng"
 
 
 def test_gantt_rows_use_terminal_ancestor_scope():
@@ -640,34 +636,35 @@ def test_gantt_rows_use_terminal_ancestor_scope():
     rows = gantt_rows(graph, terminal_symbols=["B"])
 
     assert [row["symbol"] for row in rows] == ["A", "B"]
-    assert all(row["critical"] for row in rows)
+    assert all(row["sensitive"] for row in rows)
 
 
-def test_gantt_rows_use_explicit_critical_path_over_criticality_labels():
+def test_gantt_rows_use_sensitivity_over_legacy_criticality_labels():
     graph = {
-        "critical_path_process_ids": ["p2"],
         "nodes": [
             {
                 "process_id": "p1",
                 "process_symbol": "A",
-                "dependency_only": {
-                    "es_at": "2026-05-13T09:00:00+00:00",
-                    "ef_at": "2026-05-13T10:00:00+00:00",
-                    "ls_at": "2026-05-13T09:00:00+00:00",
-                    "lf_at": "2026-05-13T10:00:00+00:00",
-                    "slack_hours": 0,
+                "resource_aware": {
+                    "starts_at": "2026-05-13T09:00:00+00:00",
+                    "ends_at": "2026-05-13T10:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T10:00:00+00:00",
+                    "schedule_buffer_hours": 0,
+                    "max_makespan_sensitivity_hours": 0,
                     "criticality_label": "critical",
                 },
             },
             {
                 "process_id": "p2",
                 "process_symbol": "B",
-                "dependency_only": {
-                    "es_at": "2026-05-13T10:00:00+00:00",
-                    "ef_at": "2026-05-13T11:00:00+00:00",
-                    "ls_at": "2026-05-13T10:00:00+00:00",
-                    "lf_at": "2026-05-13T11:00:00+00:00",
-                    "slack_hours": 0,
+                "resource_aware": {
+                    "starts_at": "2026-05-13T10:00:00+00:00",
+                    "ends_at": "2026-05-13T11:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T10:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T11:00:00+00:00",
+                    "schedule_buffer_hours": 0,
+                    "max_makespan_sensitivity_hours": 1,
                     "criticality_label": "non_critical",
                 },
             },
@@ -677,7 +674,293 @@ def test_gantt_rows_use_explicit_critical_path_over_criticality_labels():
     rows = gantt_rows(graph)
 
     assert [row["symbol"] for row in rows] == ["A", "B"]
-    assert [row["critical"] for row in rows] == [False, True]
+    assert [row["sensitive"] for row in rows] == [False, True]
+
+
+def test_gantt_bar_color_reflects_completedness_states():
+    now = dt.datetime(2026, 5, 13, 12, tzinfo=dt.UTC)
+    graph = {
+        "nodes": [
+            {
+                "process_id": "p-waiting",
+                "process_symbol": "WAITING",
+                "name": "Waiting",
+                "status": "planned",
+                "computed_status": "waiting",
+                "resource_aware": {
+                    "starts_at": "2026-05-14T09:00:00+00:00",
+                    "ends_at": "2026-05-14T17:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-14T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-14T17:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "p-early-start",
+                "process_symbol": "EARLY",
+                "name": "Early start",
+                "status": "planned",
+                "computed_status": "early_start",
+                "started_at": "2026-05-13T10:00:00+00:00",
+                "resource_aware": {
+                    "starts_at": "2026-05-14T09:00:00+00:00",
+                    "ends_at": "2026-05-14T17:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-14T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-14T17:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "p-ready",
+                "process_symbol": "READY",
+                "name": "Ready",
+                "status": "planned",
+                "computed_status": "ready",
+                "resource_aware": {
+                    "starts_at": "2026-05-13T13:00:00+00:00",
+                    "ends_at": "2026-05-13T17:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T13:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T17:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "p-started",
+                "process_symbol": "STARTED",
+                "name": "Started",
+                "status": "planned",
+                "computed_status": "started",
+                "started_at": "2026-05-13T10:00:00+00:00",
+                "resource_aware": {
+                    "starts_at": "2026-05-13T09:00:00+00:00",
+                    "ends_at": "2026-05-13T11:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T11:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "p-due",
+                "process_symbol": "DUE",
+                "name": "Due",
+                "status": "planned",
+                "computed_status": "due",
+                "started_at": "2026-05-13T10:00:00+00:00",
+                "resource_aware": {
+                    "starts_at": "2026-05-13T09:00:00+00:00",
+                    "ends_at": "2026-05-13T17:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T17:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "p-done",
+                "process_symbol": "FINISHED",
+                "name": "Finished",
+                "status": "done",
+                "computed_status": "finished",
+                "finished_at": "2026-05-13T10:00:00+00:00",
+                "resource_aware": {
+                    "starts_at": "2026-05-13T09:00:00+00:00",
+                    "ends_at": "2026-05-13T10:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T10:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "p-legacy-done",
+                "process_symbol": "DONE_READY",
+                "name": "Legacy done without verified pins",
+                "status": "done",
+                "computed_status": "ready",
+                "finished_at": "2026-05-13T10:00:00+00:00",
+                "resource_aware": {
+                    "starts_at": "2026-05-13T13:00:00+00:00",
+                    "ends_at": "2026-05-13T17:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T13:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T17:00:00+00:00",
+                },
+            },
+        ],
+    }
+
+    rows = {row["symbol"]: row for row in gantt_rows(graph)}
+
+    assert gantt_bar_color(rows["WAITING"], now) == "#64748b"
+    assert gantt_bar_color(rows["EARLY"], now) == "#7c3aed"
+    assert gantt_bar_color(rows["READY"], now) == "#2563eb"
+    assert gantt_bar_color(rows["STARTED"], now) == "#f59e0b"
+    assert gantt_bar_color(rows["DUE"], now) == "#eab308"
+    assert gantt_bar_color(rows["FINISHED"], now) == "#16a34a"
+    assert gantt_bar_color(rows["DONE_READY"], now) == "#2563eb"
+
+
+def test_gantt_rows_are_topological_and_include_process_role_pin_markers():
+    graph = {
+        "nodes": [
+            {
+                "process_id": "p-child",
+                "process_symbol": "B",
+                "name": "Child",
+                "status": "planned",
+                "computed_status": "started",
+                "resource_aware": {
+                    "starts_at": "2026-05-14T09:00:00+00:00",
+                    "ends_at": "2026-05-14T17:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-14T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-14T17:00:00+00:00",
+                },
+                "role_requirements": [
+                    {
+                        "requirement_id": "req-dev",
+                        "role_id": "role-dev",
+                        "pins": [
+                            {
+                                "pin_id": "pin-dev",
+                                "resource_id": "res-ada",
+                                "pinned_at": "2026-05-13T10:00:00+00:00",
+                                "forecast_finish_at": "2026-05-13T16:00:00+00:00",
+                                "status": "pinned_started",
+                            },
+                            {
+                                "pin_id": "pin-qa",
+                                "resource_id": "res-grace",
+                                "pinned_at": "2026-05-13T11:00:00+00:00",
+                                "forecast_finish_at": "2026-05-13T15:00:00+00:00",
+                                "verified_finished_at": "2026-05-13T14:00:00+00:00",
+                                "status": "pinned_finished",
+                            },
+                        ],
+                    }
+                ],
+            },
+            {
+                "process_id": "p-parent",
+                "process_symbol": "A",
+                "name": "Parent",
+                "status": "planned",
+                "computed_status": "ready",
+                "resource_aware": {
+                    "starts_at": "2026-05-13T09:00:00+00:00",
+                    "ends_at": "2026-05-13T17:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T17:00:00+00:00",
+                },
+            },
+        ],
+        "edges": [
+            {
+                "predecessor_process_id": "p-parent",
+                "successor_process_id": "p-child",
+            }
+        ],
+    }
+
+    rows = gantt_rows(graph)
+
+    assert [row["symbol"] for row in rows] == ["A", "B"]
+    markers = rows[1]["pin_markers"]
+    assert [marker["kind"] for marker in markers] == [
+        "pin_start",
+        "pin_start",
+        "pin_finish",
+    ]
+    assert [marker["at"].isoformat() for marker in markers] == [
+        "2026-05-13T10:00:00+00:00",
+        "2026-05-13T11:00:00+00:00",
+        "2026-05-13T14:00:00+00:00",
+    ]
+
+
+def test_gantt_rows_keep_newly_ready_children_close_to_parent():
+    def node(symbol: str) -> dict[str, object]:
+        return {
+            "process_id": f"p-{symbol.lower()}",
+            "process_symbol": symbol,
+            "computed_status": "ready",
+            "resource_aware": {
+                "starts_at": "2026-05-13T09:00:00+00:00",
+                "ends_at": "2026-05-13T10:00:00+00:00",
+                "schedule_window_starts_at": "2026-05-13T09:00:00+00:00",
+                "schedule_window_ends_at": "2026-05-13T10:00:00+00:00",
+            },
+        }
+
+    graph = {
+        "nodes": [
+            node("A"),
+            node("X"),
+            node("B"),
+            node("C"),
+        ],
+        "edges": [
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "B",
+            },
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "C",
+            },
+        ],
+    }
+
+    rows = gantt_rows(graph)
+
+    assert [row["symbol"] for row in rows] == ["A", "B", "C", "X"]
+
+
+def test_gantt_rows_compact_shared_child_dependencies_without_breaking_topology():
+    def node(symbol: str) -> dict[str, object]:
+        return {
+            "process_id": f"p-{symbol.lower()}",
+            "process_symbol": symbol,
+            "computed_status": "ready",
+            "resource_aware": {
+                "starts_at": "2026-05-13T09:00:00+00:00",
+                "ends_at": "2026-05-13T10:00:00+00:00",
+                "schedule_window_starts_at": "2026-05-13T09:00:00+00:00",
+                "schedule_window_ends_at": "2026-05-13T10:00:00+00:00",
+            },
+        }
+
+    graph = {
+        "nodes": [
+            node("A"),
+            node("X"),
+            node("C"),
+            node("D"),
+        ],
+        "edges": [
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "D",
+            },
+            {
+                "predecessor_process_symbol": "X",
+                "successor_process_symbol": "C",
+            },
+            {
+                "predecessor_process_symbol": "C",
+                "successor_process_symbol": "D",
+            },
+        ],
+    }
+
+    rows = gantt_rows(graph)
+
+    assert [row["symbol"] for row in rows] == ["X", "C", "A", "D"]
+
+
+def test_gantt_completedness_legend_describes_process_state_colors():
+    legend = gantt_completedness_legend_items()
+
+    assert [item["state"] for item in legend] == [
+        "waiting",
+        "early_start",
+        "ready",
+        "started",
+        "due",
+        "finished",
+    ]
+    assert legend[0]["label"] == "Waiting - parents unfinished, unpinned"
+    assert legend[-1]["label"] == "Finished - all roles verified done"
 
 
 def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
@@ -746,33 +1029,49 @@ def test_utilization_heatmap_adapters_normalize_resource_and_role_series():
     assert resource_labels == ["res_a", "res_b"]
     assert [time.hour for time in resource_times] == [9, 10]
     assert resource_matrix[0] == [0.5, 1.0]
-    assert math.isnan(resource_matrix[1][0])
+    assert resource_matrix[1][0] == 0.0
     assert resource_matrix[1][1] == 0.25
     assert role_labels == ["role_dev", "role_ops"]
     assert [time.hour for time in role_times] == [9, 10]
     assert role_matrix[0] == [0.5, 0.5]
-    assert math.isnan(role_matrix[1][0])
+    assert role_matrix[1][0] == 0.0
     assert role_matrix[1][1] == 0.0
+    now = dt.datetime(2026, 5, 13, 10, tzinfo=dt.UTC)
+    _, future_resource_times, future_resource_matrix = resource_utilization_heatmap(
+        utilization,
+        schedule,
+        now=now,
+    )
+    _, future_role_times, future_role_matrix = role_utilization_heatmap(
+        utilization,
+        schedule,
+        now=now,
+    )
+
+    assert [time.hour for time in future_resource_times] == [10]
+    assert future_resource_matrix == [[1.0], [0.25]]
+    assert [time.hour for time in future_role_times] == [10]
+    assert future_role_matrix == [[0.5], [0.0]]
     span = schedule_time_span(schedule)
     assert span is not None
     assert [span[0].hour, span[0].minute] == [9, 30]
     assert [span[1].hour, span[1].minute] == [10, 30]
 
 
-def test_graph_adapter_marks_critical_path_and_collapsed_nodes():
+def test_graph_adapter_marks_sensitive_and_collapsed_nodes():
     dot = build_process_graph_dot(
         {
-            "critical_path_process_ids": ["p1", "p2"],
             "nodes": [
                 {
                     "process_id": "p1",
                     "process_symbol": "A",
                     "name": "Start",
-                    "computed_status": "work_now",
-                    "dependency_only": {
-                        "es_at": "2026-05-13T09:00:00+00:00",
-                        "ls_at": "2026-05-13T09:00:00+00:00",
-                        "lf_at": "2026-05-13T11:00:00+00:00",
+                    "computed_status": "started",
+                    "resource_aware": {
+                        "starts_at": "2026-05-13T09:00:00+00:00",
+                        "ends_at": "2026-05-13T11:00:00+00:00",
+                        "schedule_buffer_hours": 0,
+                        "max_makespan_sensitivity_hours": 1,
                     },
                 },
                 {
@@ -780,10 +1079,11 @@ def test_graph_adapter_marks_critical_path_and_collapsed_nodes():
                     "process_symbol": "B",
                     "name": "Finish",
                     "computed_status": "ready",
-                    "dependency_only": {
-                        "es_at": "2026-05-13T11:00:00+00:00",
-                        "ls_at": "2026-05-13T11:00:00+00:00",
-                        "lf_at": "2026-05-13T13:00:00+00:00",
+                    "resource_aware": {
+                        "starts_at": "2026-05-13T11:00:00+00:00",
+                        "ends_at": "2026-05-13T13:00:00+00:00",
+                        "schedule_buffer_hours": 0,
+                        "max_makespan_sensitivity_hours": 1,
                     },
                 },
                 {
@@ -791,11 +1091,11 @@ def test_graph_adapter_marks_critical_path_and_collapsed_nodes():
                     "process_symbol": "C",
                     "name": "Optional",
                     "computed_status": "planned",
-                    "dependency_only": {
-                        "es_at": "2026-05-13T09:00:00+00:00",
-                        "ef_at": "2026-05-13T12:00:00+00:00",
-                        "ls_at": "2026-05-13T14:00:00+00:00",
-                        "lf_at": "2026-05-13T17:00:00+00:00",
+                    "resource_aware": {
+                        "starts_at": "2026-05-13T09:00:00+00:00",
+                        "ends_at": "2026-05-13T17:00:00+00:00",
+                        "schedule_buffer_hours": 3,
+                        "max_makespan_sensitivity_hours": 0,
                     },
                 },
             ],
@@ -811,8 +1111,8 @@ def test_graph_adapter_marks_critical_path_and_collapsed_nodes():
 
     assert "penwidth=3" in dot
     assert "[+]B" in dot
-    assert "duration: 2h" in dot
-    assert "duration: 8h; slack: 3h" in dot
+    assert "duration: 2h; sensitivity: 1h" in dot
+    assert "duration: 8h; buffer: 3h" in dot
     assert "p1 -> p2" in dot
 
 

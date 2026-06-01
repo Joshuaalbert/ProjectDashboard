@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import fnmatch
-import os
 import re
 import threading
 from dataclasses import dataclass
@@ -13,14 +12,9 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from projdash.service.commands import BatchCommandEnvelope, CommandEnvelope
-from projdash.service.ladybug_repository import LadybugProjectRepository
 from projdash.service.queries import QueryEnvelope
 from projdash.service.service import ProjectService
-from projdash.service.sqlite_repository import (
-    SQLiteProjectRepository,
-    is_sqlite_path,
-    migrate_ladybug_to_sqlite,
-)
+from projdash.service.sqlite_repository import SQLiteProjectRepository
 
 DEFAULT_TIMEZONE = "UTC"
 DISPLAY_DATETIME_FORMAT = "%a, %d %b %Y, %H:%M"
@@ -100,13 +94,10 @@ def create_project_service(db_path: str, storage: str | None = None) -> ProjectS
 
 
 def create_project_repository(db_path: str, storage: str | None = None):
-    """Create a repository for the database path, migrating defaults when safe."""
+    """Create a SQLite repository for the database path."""
     path = Path(db_path).expanduser().resolve()
-    resolved_storage = _resolve_storage(storage, str(path))
-    if resolved_storage == "sqlite":
-        _migrate_default_ladybug_if_needed(path)
-        return SQLiteProjectRepository(str(path))
-    return LadybugProjectRepository(str(path))
+    _resolve_storage(storage, str(path))
+    return SQLiteProjectRepository(str(path))
 
 
 def _clear_project_service_cache() -> None:
@@ -120,28 +111,12 @@ def _service_cache_key(db_path: str) -> str:
 
 
 def _resolve_storage(storage: str | None, db_path: str) -> str:
-    resolved = storage or os.environ.get("PROJDASH_STORAGE", "auto")
+    resolved = storage or "sqlite"
     if resolved == "auto":
-        return "sqlite" if is_sqlite_path(db_path) else "ladybug"
-    if resolved not in {"sqlite", "ladybug"}:
-        raise ValueError("PROJDASH_STORAGE must be 'sqlite', 'ladybug', or 'auto'.")
-    suffix = Path(db_path).suffix.casefold()
-    if resolved == "sqlite" and suffix == ".lbug":
-        raise ValueError("Refusing to initialize SQLite storage at a .lbug path.")
-    if resolved == "ladybug" and is_sqlite_path(db_path):
-        raise ValueError("Refusing to initialize Ladybug storage at a SQLite path.")
+        return "sqlite"
+    if resolved != "sqlite":
+        raise ValueError("ProjectDashboard only supports SQLite storage.")
     return resolved
-
-
-def _migrate_default_ladybug_if_needed(sqlite_path: Path) -> None:
-    if sqlite_path.exists():
-        return
-    if sqlite_path.name != "projdash.sqlite":
-        return
-    source = sqlite_path.with_suffix(".lbug")
-    if not source.exists():
-        return
-    migrate_ladybug_to_sqlite(source, sqlite_path)
 
 
 def combine_datetime(

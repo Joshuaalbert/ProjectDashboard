@@ -8,7 +8,7 @@ for implementation and independent review.
 
 1. Read `AGENTS.md`, `LEARNINGS.md`, and the relevant design docs.
 2. Inspect the current code paths before asking questions.
-3. Identify whether the objective touches service API, LadybugDB storage,
+3. Identify whether the objective touches service API, SQLite storage,
    scheduling engine, UI, tests, or docs.
 4. State the intended slice and the files or modules that are likely in scope.
 
@@ -50,7 +50,7 @@ Before implementing behavior:
 1. Add failing tests for the intended service, engine, or UI-facing contract.
 2. Keep tests deterministic by passing timezone-aware `as_of` and `now`
    datetimes explicitly.
-3. Use temporary LadybugDB databases for storage tests.
+3. Use temporary SQLite databases for storage tests.
 4. Assert structured Pydantic validation errors for bad agent JSON.
 
 Tests should exercise behavior, not implementation details. For agent APIs,
@@ -76,7 +76,7 @@ Reviewers should check:
 
 - Correctness against the design and tests.
 - Pydantic validation quality and error clarity.
-- LadybugDB graph consistency and transaction boundaries.
+- SQLite persistence consistency and transaction boundaries.
 - Deterministic scheduling behavior.
 - Whether UI code is a thin service client.
 - Whether abstractions obey the DRY rule.

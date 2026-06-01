@@ -28,26 +28,17 @@ sudo docker run -dp 8502:8501 project_dashboard
 # observe the app running at localhost:8502
 ```
 
-For local development, `./main.sh` now uses SQLite by default:
+For local development, `./main.sh` uses SQLite:
 
 ```
 ./main.sh
 ```
 
-The default database path is `projdash.sqlite`. If `projdash.sqlite` does not
-exist and `projdash.lbug` is present, startup copies the LadybugDB state into
-SQLite and leaves the `.lbug` source untouched. To keep using LadybugDB for a
-session:
+The default database path is `projdash.sqlite`. You can also bootstrap
+explicitly:
 
 ```
-PROJDASH_STORAGE=ladybug PROJDASH_DB_PATH=projdash.lbug ./main.sh
-```
-
-You can also bootstrap explicitly:
-
-```
-python -m projdash.service.bootstrap --storage sqlite --db projdash.sqlite \
-  --migrate-from-ladybug projdash.lbug
+python -m projdash.service.bootstrap --storage sqlite --db projdash.sqlite
 ```
 
 

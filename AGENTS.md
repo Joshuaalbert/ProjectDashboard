@@ -33,7 +33,7 @@ Common commands:
 conda run -n projdash_py pip install -e .
 conda run -n projdash_py pytest
 conda run -n projdash_py ruff check .
-conda run -n projdash_py python -m projdash.service.bootstrap --db projdash.lbug
+conda run -n projdash_py python -m projdash.service.bootstrap --db projdash.sqlite
 ```
 
 The app entrypoint is:
@@ -42,7 +42,7 @@ The app entrypoint is:
 ./main.sh
 ```
 
-`main.sh` initializes the durable LadybugDB service database and then runs
+`main.sh` initializes the durable SQLite service database and then runs
 Streamlit.
 
 ## System Dependencies
@@ -58,7 +58,7 @@ sudo apt-get install -y graphviz libgraphviz-dev pkg-config
 
 ## Architecture Direction
 
-- Durable storage is LadybugDB v1.
+- Durable storage is SQLite.
 - The service supports multiple projects in one database.
 - Project plan changes are append-only revisions.
 - Agents should interact through Python service APIs or validated JSON
@@ -98,7 +98,7 @@ abstraction.
 - Use deterministic fixtures; isolate time, filesystem, and database state.
 - Prefer small local fixtures or `NamedTuple` fixtures when test data needs a
   stable schema.
-- For storage tests, use temporary LadybugDB databases.
+- For storage tests, use temporary SQLite databases.
 
 ## Agent Workflow
 

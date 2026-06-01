@@ -11,11 +11,13 @@ import re
 import subprocess
 import threading
 import uuid
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import matplotlib.dates as mdates
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import streamlit as st
 from pydantic import ValidationError
@@ -29,8 +31,9 @@ from projdash.ui.adapters import (
     build_process_graph_dot,
     catalog_from_query_data,
     cost_time_series_rows,
-    edge_table_rows,
     existing_dependency_symbols,
+    gantt_bar_color,
+    gantt_completedness_legend_items,
     gantt_rows,
     process_symbol_maps,
     process_table_rows,
@@ -69,21 +72,19 @@ def _service(db_path: str, storage: str):
 
 _SLACK_RUN_JOBS: dict[str, dict[str, Any]] = {}
 _SLACK_RUN_JOBS_LOCK = threading.Lock()
+_SLIPPAGE_COMMIT_JOBS: dict[str, dict[str, Any]] = {}
+_SLIPPAGE_COMMIT_JOBS_LOCK = threading.Lock()
 _SERVICE_ACCESS_LOCK = threading.RLock()
+_WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MAIN_SECTIONS = [
-    "Dashboard",
     "Project",
-    "Context",
     "Processes",
     "Graph",
-    "Blockers",
     "Resources",
     "Slack",
     "Schedule",
     "Slippage",
     "Costs",
-    "History",
-    "Topology",
 ]
 _MAIN_SECTION_STATE_KEY = "projdash_previous_main_section"
 _SLACK_ACTION_PASSPHRASE_PREFIX = "slack_action_passphrase_"
@@ -169,18 +170,12 @@ def main() -> None:
     )
     _remember_main_section_and_clear_slack_action_passphrases(selected_section)
     _prepare_context_for_section(service, controls, context, selected_section)
-    if selected_section == "Dashboard":
-        _render_dashboard(service, controls, context)
-    elif selected_section == "Project":
+    if selected_section == "Project":
         _render_project_settings(service, controls, context)
-    elif selected_section == "Context":
-        _render_context_summary(service, controls, context)
     elif selected_section == "Processes":
         _render_processes(service, controls, context)
     elif selected_section == "Graph":
         _render_graph(service, controls, context)
-    elif selected_section == "Blockers":
-        _render_blockers(service, controls, context)
     elif selected_section == "Resources":
         _render_resources(service, controls, context)
     elif selected_section == "Slack":
@@ -191,10 +186,6 @@ def main() -> None:
         _render_slippage(service, controls, context)
     elif selected_section == "Costs":
         _render_costs(service, controls, context)
-    elif selected_section == "History":
-        _render_history(service, controls, context)
-    elif selected_section == "Topology":
-        _render_topology(service, controls, context)
 
 
 def _render_sidebar(db_path: str, projects: list[dict[str, Any]]) -> dict[str, Any]:
@@ -462,10 +453,13 @@ def _load_context(service, controls: dict[str, Any]) -> dict[str, Any]:
         ),
         "graph": None,
         "full_graph": None,
+        "graph_resource_schedule_backend": None,
         "blockers": None,
         "schedule_snapshots": None,
         "catalog": None,
         "resource_schedule": None,
+        "resource_schedule_backend": None,
+        "resource_schedule_has_sensitivity": False,
         "capacity": None,
         "utilization": None,
         "costs": None,
@@ -486,43 +480,39 @@ def _prepare_context_for_section(
     section: str,
 ) -> dict[str, Any]:
     """Populate the data required by one active UI section."""
-    if section == "Dashboard":
-        _ensure_catalog(service, controls, context)
-        _ensure_blockers(service, controls, context)
-    elif section == "Context":
-        _ensure_catalog(service, controls, context)
-        _ensure_agent_context(service, controls, context)
-    elif section == "Processes":
+    if section == "Processes":
         _ensure_catalog(service, controls, context)
         _ensure_graph_context(service, controls, context)
         _ensure_blockers(service, controls, context)
     elif section == "Graph":
         _ensure_graph_context(service, controls, context)
-    elif section == "Blockers":
-        _ensure_graph_context(service, controls, context)
-        _ensure_blockers(service, controls, context)
     elif section == "Resources":
         _ensure_catalog(service, controls, context)
-        _ensure_resource_schedule(service, controls, context)
-        _ensure_utilization(service, controls, context)
+        _ensure_resource_schedule(service, controls, context, resource_schedule_backend="mcts")
+        _ensure_utilization(service, controls, context, resource_schedule_backend="mcts")
     elif section == "Slack":
         _ensure_catalog(service, controls, context)
     elif section == "Schedule":
         _ensure_catalog(service, controls, context)
-        _ensure_graph_context(service, controls, context)
-        _ensure_resource_schedule(service, controls, context)
+        _ensure_graph_context(
+            service,
+            controls,
+            context,
+            resource_schedule_backend="mcts",
+        )
+        _ensure_resource_schedule(
+            service,
+            controls,
+            context,
+            resource_schedule_backend="mcts",
+        )
         _ensure_blockers(service, controls, context)
     elif section == "Slippage":
         _ensure_catalog(service, controls, context)
         _ensure_graph_context(service, controls, context)
     elif section == "Costs":
         _ensure_costs(service, controls, context)
-        _ensure_utilization(service, controls, context)
-    elif section == "History":
-        _ensure_blockers(service, controls, context)
-    elif section == "Topology":
-        _ensure_catalog(service, controls, context)
-        _ensure_graph_context(service, controls, context)
+        _ensure_utilization(service, controls, context, resource_schedule_backend="mcts")
     return context
 
 
@@ -547,11 +537,25 @@ def _ensure_graph_context(
     service,
     controls: dict[str, Any],
     context: dict[str, Any],
+    *,
+    resource_schedule_backend: str | None = None,
 ) -> dict[str, Any]:
-    if context.get("full_graph") is not None and context.get("graph") is not None:
+    if (
+        context.get("full_graph") is not None
+        and context.get("graph") is not None
+        and (
+            resource_schedule_backend is None
+            or context.get("graph_resource_schedule_backend") == resource_schedule_backend
+        )
+    ):
         return context
 
     project_id = controls["project_id"]
+    resource_options = (
+        {"resource_schedule_backend": resource_schedule_backend}
+        if resource_schedule_backend
+        else {}
+    )
     dependency_graph = _query(
         service,
         {
@@ -561,13 +565,17 @@ def _ensure_graph_context(
             "now": controls["now"],
             "include_resource_fields": True,
             "include_allocation_slices": True,
+            **resource_options,
         },
     )
     context["full_graph"] = dependency_graph
-    terminal_symbols = _valid_process_symbols(
-        st.session_state.get("terminal_process_symbols", []),
-        dependency_graph or {},
-    )
+    context["graph_resource_schedule_backend"] = resource_schedule_backend
+    terminal_symbols = _schedule_milestone_terminal_symbols(context)
+    if not terminal_symbols:
+        terminal_symbols = _valid_process_symbols(
+            st.session_state.get("terminal_process_symbols", []),
+            dependency_graph or {},
+        )
     scope = _terminal_scope(terminal_symbols)
     context["scope"] = scope
     context["terminal_symbols"] = terminal_symbols
@@ -583,6 +591,7 @@ def _ensure_graph_context(
                 **scoped_query,
                 "include_resource_fields": True,
                 "include_allocation_slices": True,
+                **resource_options,
             },
         )
     else:
@@ -627,6 +636,9 @@ def _resource_scope_query(
 
 
 def _context_terminal_symbols(context: dict[str, Any]) -> list[str]:
+    milestone_symbols = _schedule_milestone_terminal_symbols(context)
+    if milestone_symbols:
+        return milestone_symbols
     if context.get("terminal_symbols"):
         return list(context["terminal_symbols"])
     if context.get("full_graph"):
@@ -635,6 +647,25 @@ def _context_terminal_symbols(context: dict[str, Any]) -> list[str]:
             context.get("full_graph") or {},
         )
     return []
+
+
+def _schedule_milestone_terminal_symbols(context: dict[str, Any]) -> list[str]:
+    selected_milestone_ids = st.session_state.get("schedule_milestone_ids") or []
+    if not selected_milestone_ids:
+        return []
+    milestone_by_id = {
+        milestone.get("milestone_id"): milestone
+        for milestone in (context.get("catalog") or {}).get("milestones", [])
+        if milestone.get("active", True)
+    }
+    return sorted(
+        {
+            symbol
+            for milestone_id in selected_milestone_ids
+            if milestone_id in milestone_by_id
+            for symbol in milestone_by_id[milestone_id].get("process_symbols", [])
+        }
+    )
 
 
 def _selected_slippage_milestone(
@@ -654,20 +685,21 @@ def _schedule_snapshot_query_payload(
     context: dict[str, Any],
 ) -> dict[str, Any]:
     milestone = _selected_slippage_milestone(context)
+    as_of = context.get("schedule_snapshot_query_as_of") or controls["as_of"]
     if milestone is not None:
         context["terminal_symbols"] = list(milestone.get("process_symbols") or [])
         return {
             "action": "query_schedule_snapshots",
             "project_id": controls["project_id"],
-            "as_of": controls["as_of"],
+            "as_of": as_of,
             "milestone_id": milestone["milestone_id"],
         }
-    terminal_symbols = _context_terminal_symbols(context)
+    terminal_symbols = []
     context["terminal_symbols"] = terminal_symbols
     return {
         "action": "query_schedule_snapshots",
         "project_id": controls["project_id"],
-        "as_of": controls["as_of"],
+        "as_of": as_of,
         "terminal_process_symbols": terminal_symbols,
     }
 
@@ -684,6 +716,11 @@ def _commit_project_state_payload(
         "action": "commit_project_state",
         "project_id": controls["project_id"],
         "committed_at": committed_at,
+        "resource_schedule_backend": "mcts",
+        "include_resource_sensitivity": True,
+        "resource_schedule_sensitivity_backend": "mcts",
+        "resource_schedule_sensitivity_workers": max(1, os.cpu_count() or 1),
+        "resource_schedule_sensitivity_process_pool": True,
         "note": note,
     }
     if milestone is not None:
@@ -712,18 +749,35 @@ def _ensure_resource_schedule(
     service,
     controls: dict[str, Any],
     context: dict[str, Any],
+    *,
+    resource_schedule_backend: str = "mcts",
+    include_resource_sensitivity: bool = False,
+    heuristic_sensitivity: bool = False,
 ) -> dict[str, Any]:
-    if context.get("resource_schedule") is not None:
+    if (
+        context.get("resource_schedule") is not None
+        and context.get("resource_schedule_backend") == resource_schedule_backend
+        and (
+            not include_resource_sensitivity
+            or context.get("resource_schedule_has_sensitivity")
+        )
+    ):
         return context["resource_schedule"]
     resource_query = _resource_scope_query(controls, context)
-    context["resource_schedule"] = _query(
-        service,
-        {
-            "action": "query_resource_schedule",
-            **resource_query,
-            "include_allocation_slices": True,
-        },
-    )
+    query = {
+        "action": "query_resource_schedule",
+        **resource_query,
+        "include_allocation_slices": True,
+        "resource_schedule_backend": resource_schedule_backend,
+    }
+    if include_resource_sensitivity:
+        query["include_resource_sensitivity"] = True
+    if heuristic_sensitivity:
+        query["resource_schedule_backend"] = "greedy"
+        query["resource_schedule_sensitivity_backend"] = "greedy"
+    context["resource_schedule"] = _query(service, query)
+    context["resource_schedule_backend"] = resource_schedule_backend
+    context["resource_schedule_has_sensitivity"] = include_resource_sensitivity
     return context["resource_schedule"] or {}
 
 
@@ -731,13 +785,19 @@ def _ensure_utilization(
     service,
     controls: dict[str, Any],
     context: dict[str, Any],
+    *,
+    resource_schedule_backend: str = "mcts",
 ) -> dict[str, Any]:
     if context.get("utilization") is not None:
         return context["utilization"]
     resource_query = _resource_scope_query(controls, context)
     context["utilization"] = _query(
         service,
-        {"action": "query_utilization", **resource_query},
+        {
+            "action": "query_utilization",
+            **resource_query,
+            "resource_schedule_backend": resource_schedule_backend,
+        },
     )
     return context["utilization"] or {}
 
@@ -746,13 +806,19 @@ def _ensure_costs(
     service,
     controls: dict[str, Any],
     context: dict[str, Any],
+    *,
+    resource_schedule_backend: str = "mcts",
 ) -> dict[str, Any]:
     if context.get("costs") is not None:
         return context["costs"]
     resource_query = _resource_scope_query(controls, context)
     context["costs"] = _query(
         service,
-        {"action": "query_costs", **resource_query},
+        {
+            "action": "query_costs",
+            **resource_query,
+            "resource_schedule_backend": resource_schedule_backend,
+        },
     )
     return context["costs"] or {}
 
@@ -961,11 +1027,20 @@ def _project_context_markdown(
         f"- Status counts: {_markdown_status_counts(summary)}",
         f"- Resource schedule converged: {summary.get('converged', '-')}",
         "",
-        "## Critical Path",
+        "## Makespan Sensitivity",
     ]
-    critical_path = summary.get("critical_path") or schedule.get("critical_path") or []
-    if critical_path:
-        lines.extend(f"- `{symbol}`" for symbol in critical_path)
+    sensitivity_rows = summary.get("top_makespan_sensitivity") or [
+        row
+        for row in schedule.get("processes", [])
+        if float(row.get("max_makespan_sensitivity_hours") or 0) > 0
+    ][:10]
+    if sensitivity_rows:
+        for row in sensitivity_rows:
+            symbol = row.get("symbol") or row.get("process_symbol") or "-"
+            sensitivity = _markdown_duration_hours(
+                row.get("max_makespan_sensitivity_hours")
+            )
+            lines.append(f"- `{symbol}`: {sensitivity}")
     else:
         lines.append("- None")
     lines.extend(["", "## Role Priorities"])
@@ -1068,7 +1143,10 @@ def _agent_priority_process_markdown(row: dict[str, Any]) -> str:
     name = row.get("process_name") or ""
     label = f"**{priority}** `{symbol}`{f' - {name}' if name else ''}"
     details = [
-        f"start window: {_format_time_until_ls(row.get('hours_until_ls'))}",
+        (
+            "planned start: "
+            f"{_format_time_until_planned_start(row.get('hours_until_planned_start'))}"
+        ),
         f"effort: {_format_priority_hours(row.get('effort_hours'), 'hour')}",
     ]
     status = row.get("computed_status") or row.get("status")
@@ -1099,35 +1177,51 @@ def _schedule_watchlist_lines(
     rows = sorted(
         rows,
         key=lambda row: (
-            not bool(row.get("critical")),
-            _parse_iso_datetime(row.get("ls_at"), dt.datetime.max.replace(tzinfo=dt.UTC)),
+            not _is_makespan_sensitive_row(row),
+            _parse_iso_datetime(
+                row.get("planned_start_at"),
+                dt.datetime.max.replace(tzinfo=dt.UTC),
+            ),
             str(row.get("symbol") or ""),
         ),
     )
     lines = []
     for row in rows[:limit]:
-        label = "critical" if row.get("critical") else "watch"
+        label = "sensitive" if _is_makespan_sensitive_row(row) else "watch"
         symbol = row.get("symbol") or "-"
         name = row.get("name") or ""
         status = row.get("computed_status") or row.get("status") or "-"
-        ls_at = _markdown_datetime(row.get("ls_at"), timezone_name)
-        ends_at = _markdown_datetime(row.get("ends_at"), timezone_name)
-        slack = _markdown_duration_hours(row.get("slack_hours"))
-        allocation = row.get("allocation_state") or "-"
+        planned_start = _markdown_datetime(row.get("planned_start_at"), timezone_name)
+        planned_finish = _markdown_datetime(
+            row.get("planned_finish_at"),
+            timezone_name,
+        )
+        buffer = _markdown_duration_hours(row.get("schedule_buffer_hours"))
+        sensitivity = _markdown_duration_hours(
+            row.get("max_makespan_sensitivity_hours")
+        )
         lines.append(
             "- "
             f"**{label}** `{symbol}`"
             f"{f' - {name}' if name else ''}; "
             f"status: {status}; "
-            f"LS: {ls_at}; "
-            f"ends: {ends_at}; "
-            f"slack: {slack}; "
-            f"allocation: {allocation}"
+            f"planned start: {planned_start}; "
+            f"planned finish: {planned_finish}; "
+            f"buffer: {buffer}; "
+            f"sensitivity: {sensitivity}"
         )
     remaining = len(rows) - limit
     if remaining > 0:
         lines.append(f"- {remaining} more")
     return lines
+
+
+def _is_makespan_sensitive_row(row: dict[str, Any]) -> bool:
+    value = row.get("max_makespan_sensitivity_hours")
+    try:
+        return float(value or 0) > 0
+    except (TypeError, ValueError):
+        return row.get("sensitivity_label") == "makespan_sensitive"
 
 
 def _markdown_datetime(value: Any, timezone_name: str) -> str:
@@ -1143,7 +1237,14 @@ def _render_process_table(
     timezone_name: str,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     rows = process_table_rows(graph)
-    display_rows = format_display_datetimes(rows, timezone_name)
+    display_rows = []
+    for row in rows:
+        display_row = dict(row)
+        computed = display_row.pop("computed", None)
+        status = display_row.pop("status", None)
+        display_row["state"] = computed or status
+        display_rows.append(display_row)
+    display_rows = format_display_datetimes(display_rows, timezone_name)
     selected_symbols: list[str] = []
     try:
         event = st.dataframe(
@@ -1205,6 +1306,14 @@ def _render_processes(service, controls: dict[str, Any], context: dict[str, Any]
         graph,
         catalog,
         id_by_symbol,
+        node_by_symbol,
+        selected_symbols,
+    )
+    _render_process_role_pin_menu(
+        service,
+        controls,
+        graph,
+        context.get("catalog") or {},
         node_by_symbol,
         selected_symbols,
     )
@@ -1409,49 +1518,6 @@ def _render_modify_process_menu(
                 help="Definition of done, scope, and PM notes for this process.",
             )
 
-        update_status = st.checkbox(
-            "Update status",
-            key="process_modify_update_status",
-            help="Set lifecycle state for every selected process.",
-        )
-        status_options = ["planned", "in_progress", "paused", "done", "canceled"]
-        status = st.selectbox(
-            "Status",
-            status_options,
-            key="process_modify_status",
-            help="Lifecycle status for selected processes.",
-        )
-        started_enabled = st.checkbox(
-            "Set started time",
-            key="process_modify_started_enabled",
-            help="Record an actual start datetime that pins ES and LS.",
-        )
-        started_date = st.date_input(
-            "Started date",
-            key="process_modify_started_date",
-            help="Actual start date.",
-        )
-        started_time = st.time_input(
-            "Started time",
-            key="process_modify_started_time",
-            help="Actual start time.",
-        )
-        finished_enabled = st.checkbox(
-            "Set finished time",
-            key="process_modify_finished_enabled",
-            help="Record an actual completion datetime when status is done.",
-        )
-        finished_date = st.date_input(
-            "Finished date",
-            key="process_modify_finished_date",
-            help="Completion date.",
-        )
-        finished_time = st.time_input(
-            "Finished time",
-            key="process_modify_finished_time",
-            help="Completion time.",
-        )
-
         st.caption("Open blockers: " + (", ".join(aggregate["blocker_ids"]) or "none"))
         add_blocker = st.checkbox(
             "Add blocker",
@@ -1469,10 +1535,15 @@ def _render_modify_process_menu(
             help="Optional blocker detail.",
         )
         blocker_severity = st.selectbox(
-            "Blocker severity",
-            ["blocking", "warning", "info"],
+            "Blocker state",
+            ["blocking"],
             key="process_modify_blocker_severity",
-            help="Whether this blocker prevents work or is informational.",
+            help="A blocker prevents completion until its resolver process is done.",
+        )
+        blocker_owner = st.text_input(
+            "Blocker resolution owner resource id",
+            key="process_modify_blocker_owner",
+            help="Optional resource id responsible for driving resolution.",
         )
         blockers_to_resolve = st.multiselect(
             "Resolve blockers",
@@ -1574,36 +1645,10 @@ def _render_modify_process_menu(
                         if update_roles
                         else current_role_requirements
                     ),
-                    "staked_resource_ids": node.get("staked_resource_ids") or [],
                     "assumption_note": node.get("assumption_note"),
                 }
             )
 
-    if update_status:
-        for symbol in target_symbols:
-            commands.append(
-                {
-                    "action": "set_process_status",
-                    "project_id": controls["project_id"],
-                    "process_symbol": symbol,
-                    "status": status,
-                    "edit_at": controls["as_of"],
-                    "started_at": combine_datetime(
-                        started_date,
-                        started_time,
-                        controls["timezone"],
-                    )
-                    if started_enabled
-                    else None,
-                    "finished_at": combine_datetime(
-                        finished_date,
-                        finished_time,
-                        controls["timezone"],
-                    )
-                    if finished_enabled
-                    else None,
-                }
-            )
     if add_blocker and blocker_summary:
         for symbol in target_symbols:
             commands.append(
@@ -1614,6 +1659,7 @@ def _render_modify_process_menu(
                     "summary": blocker_summary,
                     "details": blocker_details or None,
                     "severity": blocker_severity,
+                    "resolution_owner_resource_id": blocker_owner or None,
                     "created_at": controls["as_of"],
                 }
             )
@@ -1625,11 +1671,55 @@ def _render_modify_process_menu(
                 "blocker_id": blocker_id,
                 "resolved_at": controls["as_of"],
                 "resolution": resolution or None,
+                "resolution_owner_resource_id": blocker_owner or None,
             }
         )
 
     if commands:
         _apply_batch(service, commands)
+
+
+def _render_process_role_pin_menu(
+    service,
+    controls: dict[str, Any],
+    graph: dict[str, Any],
+    catalog_data: dict[str, Any],
+    node_by_symbol: dict[str, dict[str, Any]],
+    selected_symbols: list[str],
+) -> None:
+    with st.expander("Process-role pins", expanded=True):
+        target_symbols = _valid_process_symbols(
+            st.session_state.get("process_modify_targets", selected_symbols),
+            graph,
+        )
+        if not target_symbols:
+            st.info("Select one or more process rows above to edit process-role pins.")
+            return
+        resources = list(catalog_data.get("resources") or [])
+        roles = list(catalog_data.get("roles") or [])
+        if not resources:
+            st.info("No active resources are configured for pinning.")
+            return
+        pinned_resource_usage = _pinned_resource_usage(graph)
+        for symbol in target_symbols:
+            row = node_by_symbol.get(symbol)
+            if not row:
+                continue
+            heading = f"{symbol}"
+            if row.get("name"):
+                heading = f"{heading} | {row['name']}"
+            st.markdown(f"### {heading}")
+            if not row.get("role_requirements"):
+                st.caption("No process-role requirements are defined for this process.")
+                continue
+            _render_process_role_pins_control(
+                service,
+                controls,
+                row,
+                resources,
+                roles,
+                pinned_resource_usage,
+            )
 
 
 def _render_milestone_menu(
@@ -1754,21 +1844,10 @@ def _sync_process_revision_defaults(
         st.session_state[f"process_modify_{role_id}_effort"] = float(
             aggregate["role_efforts"].get(role_id, 0.0)
         )
-    st.session_state["process_modify_status"] = aggregate.get("status") or "planned"
     st.session_state["process_modify_name"] = aggregate.get("name", "")
     st.session_state["process_modify_description"] = aggregate.get("description", "")
     earliest_at = _common_datetime_or_default(
         aggregate.get("earliest_start_at"),
-        controls["as_of"],
-        controls["timezone"],
-    )
-    started_at = _common_datetime_or_default(
-        aggregate.get("started_at"),
-        controls["as_of"],
-        controls["timezone"],
-    )
-    finished_at = _common_datetime_or_default(
-        aggregate.get("finished_at"),
         controls["as_of"],
         controls["timezone"],
     )
@@ -1777,16 +1856,6 @@ def _sync_process_revision_defaults(
     )
     st.session_state["process_modify_earliest_date"] = earliest_at.date()
     st.session_state["process_modify_earliest_time"] = earliest_at.time()
-    st.session_state["process_modify_started_enabled"] = (
-        aggregate.get("started_at") is not None
-    )
-    st.session_state["process_modify_started_date"] = started_at.date()
-    st.session_state["process_modify_started_time"] = started_at.time()
-    st.session_state["process_modify_finished_enabled"] = (
-        aggregate.get("finished_at") is not None
-    )
-    st.session_state["process_modify_finished_date"] = finished_at.date()
-    st.session_state["process_modify_finished_time"] = finished_at.time()
     st.session_state["process_modify_defaults_sig"] = signature
 
 
@@ -1806,12 +1875,9 @@ def _process_revision_defaults_signature(
         tuple(aggregate.get("predecessors", [])),
         tuple(aggregate.get("children", [])),
         role_efforts,
-        aggregate.get("status") or "",
         aggregate.get("name") or "",
         aggregate.get("description") or "",
         str(aggregate.get("earliest_start_at") or ""),
-        str(aggregate.get("started_at") or ""),
-        str(aggregate.get("finished_at") or ""),
         tuple(aggregate.get("blocker_ids", [])),
         controls["timezone"],
     )
@@ -1994,7 +2060,6 @@ def _render_graph(
             build_process_graph_dot(graph, collapsed_process_ids=collapsed),
             use_container_width=True,
         )
-    st.dataframe(edge_table_rows(graph), use_container_width=True, hide_index=True)
 
 
 def _render_blockers(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
@@ -2095,6 +2160,25 @@ def _render_blocker_expander(
         key=key,
         help="Check to resolve this blocker now, or uncheck to move it back to unresolved.",
     )
+    owner_key = f"blocker_owner_{blocker_id}"
+    owner_value = st.text_input(
+        "Resolution owner resource id",
+        value=row.get("resolution_owner_resource_id") or "",
+        key=owner_key,
+        help="Resource id responsible for driving this blocker to resolution.",
+    )
+    if st.button("Save owner", key=f"{owner_key}_save"):
+        edit_at = _current_ui_datetime(controls["timezone"])
+        _apply_command(
+            service,
+            {
+                "action": "set_blocker_resolution_owner",
+                "project_id": controls["project_id"],
+                "blocker_id": blocker_id,
+                "resolution_owner_resource_id": owner_value or None,
+                "edit_at": edit_at,
+            },
+        )
     if resolved_clicked and not is_resolved:
         edit_at = _current_ui_datetime(controls["timezone"])
         _apply_command(
@@ -2133,11 +2217,29 @@ def _blocker_detail_markdown(row: dict[str, Any], timezone_name: str) -> str:
         f"- Process status: {_blocker_process_status_text(row)}",
         f"- Priority: {row.get('priority') or '-'}",
         f"- Severity: {row.get('severity') or '-'}",
+        f"- Resolution owner: {row.get('resolution_owner_resource_id') or '-'}",
         f"- Roles: {row.get('role_ids') or '-'}",
         f"- Resources: {row.get('resource_ids') or '-'}",
+        f"- Needed by roles: {row.get('needed_by_role_ids') or '-'}",
+        f"- Needed by resources: {row.get('needed_by_resource_ids') or '-'}",
         f"- Created: {_markdown_datetime(row.get('created_at'), timezone_name)}",
         f"- Details: {details}",
     ]
+    immediate_processes = row.get("immediate_blocked_processes") or []
+    if immediate_processes:
+        labels = []
+        for item in immediate_processes:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("process_symbol") or item.get("process_id")
+            name = item.get("name")
+            relationship = item.get("relationship")
+            label = f"{symbol} ({relationship})" if relationship else str(symbol)
+            if name:
+                label = f"{label}: {name}"
+            labels.append(label)
+        if labels:
+            lines.append(f"- Immediately needed for: {', '.join(labels)}")
     if row.get("resolved_at"):
         lines.append(f"- Resolved: {_markdown_datetime(row.get('resolved_at'), timezone_name)}")
     if row.get("resolution"):
@@ -2177,6 +2279,7 @@ def _render_resources(service, controls: dict[str, Any], context: dict[str, Any]
     _render_utilization_heatmaps(
         context.get("utilization") or {},
         context.get("resource_schedule") or {},
+        now=controls["now"],
         timezone_name=controls["timezone"],
     )
 
@@ -2224,6 +2327,7 @@ def _resource_calendar_rules_markdown(
         )
         lines = [
             f"### {name} (`{resource_id}`)",
+            f"- Type: {resource.get('resource_type', 'internal')}",
             (
                 "- Availability: "
                 f"{available_from} to {available_until}"
@@ -2235,6 +2339,7 @@ def _resource_calendar_rules_markdown(
                 f" in {default_calendar.get('timezone', timezone_name)}"
             ),
         ]
+        lines.extend(_calendar_rule_lines(default_calendar, prefix="  - "))
         overrides = sorted(
             resource.get("calendar_overrides") or [],
             key=lambda rule: str(rule.get("starts_at", "")),
@@ -2260,10 +2365,60 @@ def _resource_calendar_rules_markdown(
                     f"(`{override.get('calendar_id')}`), "
                     f"{starts_at} to {ends_at}{suffix}"
                 )
+                lines.extend(_calendar_rule_lines(calendar, prefix="  - "))
         else:
             lines.append("- Overrides: none")
         sections.append("\n".join(lines))
     return "\n\n".join(sections)
+
+
+def _calendar_rule_lines(
+    calendar: dict[str, Any],
+    *,
+    prefix: str = "- ",
+) -> list[str]:
+    if not calendar:
+        return [f"{prefix}Rules: missing calendar"]
+    weekly = sorted(
+        calendar.get("weekly_windows") or [],
+        key=lambda window: (
+            int(window.get("weekday", 0)),
+            str(window.get("start_local_time", window.get("starts_at_local", ""))),
+        ),
+    )
+    lines = []
+    if weekly:
+        chunks = []
+        for window in weekly:
+            weekday = int(window.get("weekday", 0))
+            weekday_label = (
+                _WEEKDAY_LABELS[weekday] if 0 <= weekday < len(_WEEKDAY_LABELS) else str(weekday)
+            )
+            chunks.append(
+                f"{weekday_label} "
+                f"{window.get('start_local_time', window.get('starts_at_local'))}-"
+                f"{window.get('end_local_time', window.get('ends_at_local'))} "
+                f"({window.get('capacity_hours')}h)"
+            )
+        lines.append(f"{prefix}Weekly rules: {', '.join(chunks)}")
+    else:
+        lines.append(f"{prefix}Weekly rules: none")
+    exceptions = sorted(
+        calendar.get("exceptions") or [],
+        key=lambda item: str(item.get("starts_at", "")),
+    )
+    if exceptions:
+        chunks = []
+        for exception in exceptions:
+            reason = f", {exception.get('reason')}" if exception.get("reason") else ""
+            chunks.append(
+                f"{exception.get('starts_at')} to {exception.get('ends_at')}: "
+                f"{exception.get('capacity_hours')}h{reason}"
+            )
+        lines.append(f"{prefix}Exceptions: {'; '.join(chunks)}")
+    else:
+        lines.append(f"{prefix}Exceptions: none")
+    return lines
 
 
 def _capacity_buckets_for_display(
@@ -2379,10 +2534,13 @@ def _render_calendar_forms(
             help="Choose a defined calendar to update, or leave blank to create one.",
         )
         selected_calendar = calendars_by_id.get(selected_calendar_id, {})
-        with st.form("upsert_calendar"):
+        form_key = selected_calendar_id or "new"
+        calendar_defaults = _calendar_form_defaults(selected_calendar)
+        with st.form(f"upsert_calendar_{form_key}"):
             name = st.text_input(
                 "Calendar name",
                 selected_calendar.get("name", "Weekday calendar"),
+                key=f"calendar_name_{form_key}",
                 help=(
                     "Human-readable calendar name. New calendar ids are generated "
                     "from this name and the project id."
@@ -2391,6 +2549,7 @@ def _render_calendar_forms(
             calendar_timezone = st.text_input(
                 "Calendar timezone",
                 selected_calendar.get("timezone", controls["timezone"]),
+                key=f"calendar_timezone_{form_key}",
                 help=(
                     "IANA timezone for this calendar's local working windows, "
                     "such as UTC or Europe/Paris."
@@ -2399,29 +2558,35 @@ def _render_calendar_forms(
             weekdays = st.multiselect(
                 "Weekdays",
                 [0, 1, 2, 3, 4, 5, 6],
-                default=[0, 1, 2, 3, 4],
+                default=calendar_defaults["weekdays"],
+                key=f"calendar_weekdays_{form_key}",
+                format_func=lambda value: _WEEKDAY_LABELS[value],
                 help="Local weekdays where this recurring working window applies.",
             )
             start_time = st.time_input(
                 "Window start",
-                dt.time(9, 0),
+                calendar_defaults["start_time"],
+                key=f"calendar_start_time_{form_key}",
                 help="Local start time for the recurring working window.",
             )
             end_time = st.time_input(
                 "Window end",
-                dt.time(17, 0),
+                calendar_defaults["end_time"],
+                key=f"calendar_end_time_{form_key}",
                 help="Local end time for the recurring working window.",
             )
             capacity = st.number_input(
                 "Capacity hours",
                 0.0,
                 24.0,
-                8.0,
+                calendar_defaults["capacity_hours"],
+                key=f"calendar_capacity_{form_key}",
                 help="Available working capacity during each selected window.",
             )
             active = st.checkbox(
                 "Active",
                 selected_calendar.get("active", True),
+                key=f"calendar_active_{form_key}",
                 help="Inactive calendars cannot provide active resource capacity.",
             )
             upsert = st.form_submit_button("Save calendar")
@@ -2515,6 +2680,49 @@ def _render_calendar_forms(
             )
 
 
+def _calendar_form_defaults(calendar: dict[str, Any]) -> dict[str, Any]:
+    windows = sorted(
+        calendar.get("weekly_windows") or [],
+        key=lambda window: (
+            str(window.get("start_local_time", window.get("starts_at_local", ""))),
+            str(window.get("end_local_time", window.get("ends_at_local", ""))),
+            float(window.get("capacity_hours") or 0),
+            int(window.get("weekday", 0)),
+        ),
+    )
+    if not windows:
+        return {
+            "weekdays": [0, 1, 2, 3, 4],
+            "start_time": dt.time(9, 0),
+            "end_time": dt.time(17, 0),
+            "capacity_hours": 8.0,
+        }
+    first = windows[0]
+    start_value = str(first.get("start_local_time") or first.get("starts_at_local") or "09:00")
+    end_value = str(first.get("end_local_time") or first.get("ends_at_local") or "17:00")
+    capacity = float(first.get("capacity_hours") or 8.0)
+    weekdays = [
+        int(window.get("weekday", 0))
+        for window in windows
+        if str(window.get("start_local_time") or window.get("starts_at_local") or "") == start_value
+        and str(window.get("end_local_time") or window.get("ends_at_local") or "") == end_value
+        and float(window.get("capacity_hours") or 0) == capacity
+    ]
+    return {
+        "weekdays": sorted(set(weekdays)) or [0, 1, 2, 3, 4],
+        "start_time": _parse_local_time(start_value, dt.time(9, 0)),
+        "end_time": _parse_local_time(end_value, dt.time(17, 0)),
+        "capacity_hours": capacity,
+    }
+
+
+def _parse_local_time(value: str, default: dt.time) -> dt.time:
+    try:
+        return dt.time.fromisoformat(value)
+    except ValueError:
+        return default
+
+
 def _render_resource_forms(
     service,
     controls: dict[str, Any],
@@ -2550,6 +2758,19 @@ def _render_resource_forms(
                     "from this name and the project id."
                 ),
             )
+            resource_type_options = ["internal", "external"]
+            selected_resource_type = selected_resource.get("resource_type", "internal")
+            resource_type = st.selectbox(
+                "Resource type",
+                resource_type_options,
+                index=(
+                    resource_type_options.index(selected_resource_type)
+                    if selected_resource_type in resource_type_options
+                    else 0
+                ),
+                key=f"resource_type_{form_key}",
+                help="Internal resources are team members; external resources are stakeholders.",
+            )
             role_ids = st.multiselect(
                 "Role ids",
                 catalog["role_ids"],
@@ -2573,7 +2794,10 @@ def _render_resource_forms(
                 calendar_options,
                 index=calendar_index,
                 key=f"resource_calendar_{form_key}",
-                help="Defined calendar controlling this resource's working hours.",
+                help=(
+                    "Defined calendar controlling this resource's working hours. "
+                    "External resources can be left blank to use weekdays 09:00-17:00."
+                ),
             )
             resource_timezone = calendars_by_id.get(calendar_id, {}).get(
                 "timezone",
@@ -2635,6 +2859,12 @@ def _render_resource_forms(
                 "res",
                 name,
             )
+            resolved_calendar_id = calendar_id
+            if resource_type == "external" and not resolved_calendar_id:
+                resolved_calendar_id = _ensure_default_external_calendar(
+                    service,
+                    controls,
+                )
             _apply_command(
                 service,
                 {
@@ -2642,8 +2872,9 @@ def _render_resource_forms(
                     "project_id": controls["project_id"],
                     "resource_id": resource_id,
                     "name": name,
+                    "resource_type": resource_type,
                     "role_ids": role_ids,
-                    "calendar_id": calendar_id,
+                    "calendar_id": resolved_calendar_id,
                     "available_from_at": combine_datetime(
                         available_date,
                         available_time,
@@ -2690,6 +2921,33 @@ def _render_resource_forms(
             calendars_by_id,
             catalog,
         )
+
+
+def _ensure_default_external_calendar(service, controls: dict[str, Any]) -> str:
+    calendar_id = scoped_id(
+        controls["project_id"],
+        "cal",
+        f"external-default-{controls['timezone']}",
+    )
+    _apply_command(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": controls["project_id"],
+            "calendar_id": calendar_id,
+            "name": f"External default ({controls['timezone']})",
+            "timezone": controls["timezone"],
+            "weekly_windows": _weekly_windows(
+                [0, 1, 2, 3, 4],
+                dt.time(9, 0),
+                dt.time(17, 0),
+                8.0,
+            ),
+            "active": True,
+        },
+        rerun=False,
+    )
+    return calendar_id
 
 
 def _render_resource_holiday_forms(
@@ -3168,10 +3426,25 @@ def _render_slack_run_section(
                     "to let the runner use its default."
                 ),
             )
-        job = _slack_active_service_run(service, project_id) or _slack_run_job(project_id)
+        service_job = _slack_active_service_run(service, project_id)
+        local_job = _slack_run_job(project_id)
+        orphaned_service_job = _slack_service_run_is_orphaned(
+            service_job,
+            local_job,
+        )
+        job = service_job or local_job
         _render_slack_job_status(job, controls["timezone"])
-        active = _slack_job_is_active(job)
-        cols = st.columns(2)
+        if orphaned_service_job and service_job:
+            st.warning(
+                "The last Slack run is marked active in the database, but this "
+                "app process has no worker for it. It was likely interrupted. "
+                "Start a new run to mark the old one failed and continue."
+            )
+        active = (
+            _slack_job_is_active(local_job)
+            or (_slack_job_is_active(service_job) and not orphaned_service_job)
+        )
+        cols = st.columns(3)
         if cols[0].button(
             "Run once",
             key=f"slack_run_once_{project_id}",
@@ -3186,24 +3459,56 @@ def _render_slack_run_section(
             if error:
                 _set_slack_notice(project_id, "error", error)
             else:
-                started = _start_slack_run_job(
-                    service=service,
-                    db_path=db_path,
-                    project_id=project_id,
-                    token=token or "",
-                    model=selected_model or None,
-                )
-                if started:
-                    _set_slack_notice(project_id, "success", "Started Slack run.")
+                recovered = True
+                if orphaned_service_job and service_job:
+                    recovered = _recover_orphaned_slack_run(
+                        service,
+                        project_id,
+                        service_job,
+                    )
+                if not recovered:
+                    _set_slack_notice(
+                        project_id,
+                        "error",
+                        "Could not clear the interrupted Slack run.",
+                    )
+                else:
+                    started = _start_slack_run_job(
+                        service=service,
+                        db_path=db_path,
+                        project_id=project_id,
+                        token=token or "",
+                        model=selected_model or None,
+                    )
+                    if started:
+                        _set_slack_notice(project_id, "success", "Started Slack run.")
+                    else:
+                        _set_slack_notice(
+                            project_id,
+                            "error",
+                            "A Slack run is already active or could not be started.",
+                        )
+            st.rerun()
+        if cols[1].button("Refresh status", key=f"slack_refresh_run_{project_id}"):
+            st.rerun()
+        if orphaned_service_job and service_job:
+            if cols[2].button(
+                "Clear interrupted run",
+                key=f"slack_clear_orphaned_run_{project_id}",
+            ):
+                if _recover_orphaned_slack_run(service, project_id, service_job):
+                    _set_slack_notice(
+                        project_id,
+                        "success",
+                        "Marked the interrupted Slack run failed.",
+                    )
                 else:
                     _set_slack_notice(
                         project_id,
                         "error",
-                        "A Slack run is already active or could not be started.",
+                        "Could not clear the interrupted Slack run.",
                     )
-            st.rerun()
-        if cols[1].button("Refresh status", key=f"slack_refresh_run_{project_id}"):
-            st.rerun()
+                st.rerun()
 
 
 def _render_slack_draft_section(
@@ -3228,13 +3533,40 @@ def _render_slack_draft_section(
             column_config={
                 "send": st.column_config.CheckboxColumn("Send"),
                 "outbox_id": st.column_config.TextColumn("Outbox id", disabled=True),
+                "target_type": st.column_config.TextColumn("Target type", disabled=True),
+                "target": st.column_config.TextColumn("Target", disabled=True),
                 "resource": st.column_config.TextColumn("Resource", disabled=True),
                 "slack_user_id": st.column_config.TextColumn("Slack id", disabled=True),
+                "slack_channel_id": st.column_config.TextColumn(
+                    "Channel id",
+                    disabled=True,
+                ),
                 "status": st.column_config.TextColumn("Status", disabled=True),
+                "block_count": st.column_config.NumberColumn(
+                    "Blocks",
+                    disabled=True,
+                ),
                 "body": st.column_config.TextColumn("Message"),
             },
-            disabled=["outbox_id", "resource", "slack_user_id", "status"],
+            disabled=[
+                "outbox_id",
+                "target_type",
+                "target",
+                "resource",
+                "slack_user_id",
+                "slack_channel_id",
+                "status",
+                "block_count",
+            ],
         )
+        block_previews = [
+            {"outbox_id": row.get("outbox_id"), "blocks": row.get("blocks") or []}
+            for row in drafts
+            if row.get("blocks")
+        ]
+        if block_previews:
+            with st.expander("Block Kit payloads"):
+                st.json(block_previews)
         st.json(_slack_draft_json(edited_rows))
         cols = st.columns(3)
         if cols[0].button("Save draft edits", key=f"slack_save_drafts_{project_id}"):
@@ -3318,35 +3650,62 @@ def _render_slack_history_section(
 
 def _render_schedule(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
     _ensure_catalog(service, controls, context)
-    _ensure_graph_context(service, controls, context)
-    _ensure_resource_schedule(service, controls, context)
+    _ensure_graph_context(
+        service,
+        controls,
+        context,
+        resource_schedule_backend="mcts",
+    )
+    _ensure_resource_schedule(
+        service,
+        controls,
+        context,
+        resource_schedule_backend="mcts",
+    )
     _ensure_blockers(service, controls, context)
     graph = context.get("graph") or {}
     full_graph = context.get("full_graph") or graph
     schedule = context.get("resource_schedule") or {}
-    resources = (context.get("catalog") or {}).get("resources", [])
-    symbol_options = [
-        node.get("process_symbol")
-        for node in full_graph.get("nodes", [])
-        if node.get("process_symbol")
+    catalog = context.get("catalog") or {}
+    resources = catalog.get("resources", [])
+    roles = catalog.get("roles", [])
+    pinned_resource_usage = _pinned_resource_usage(full_graph)
+    milestones = [
+        milestone
+        for milestone in catalog.get("milestones", [])
+        if milestone.get("active", True)
     ]
-    terminal_key = "terminal_process_symbols"
-    current_terminals = [
-        symbol
-        for symbol in st.session_state.get(terminal_key, [])
-        if symbol in symbol_options
+    milestone_by_id = {
+        milestone["milestone_id"]: milestone
+        for milestone in milestones
+        if milestone.get("milestone_id")
+    }
+    schedule_milestone_key = "schedule_milestone_ids"
+    st.session_state[schedule_milestone_key] = [
+        milestone_id
+        for milestone_id in st.session_state.get(schedule_milestone_key, [])
+        if milestone_id in milestone_by_id
     ]
-    if st.session_state.get(terminal_key) != current_terminals:
-        st.session_state[terminal_key] = current_terminals
-    terminal_symbols = st.multiselect(
-        "Completion targets",
-        symbol_options,
-        key=terminal_key,
+    selected_milestone_ids = st.multiselect(
+        "Milestones",
+        list(milestone_by_id),
+        key=schedule_milestone_key,
+        format_func=lambda value: (
+            milestone_by_id[value].get("name") or value
+        ),
         help=(
-            "Leave empty to plan to all terminal nodes. Select symbols to plan "
-            "their ancestor subgraph."
+            "Leave empty to plan the whole project. Select milestones to plan "
+            "the union of their process scopes."
         ),
     )
+    terminal_symbols = sorted(
+        {
+            symbol
+            for milestone_id in selected_milestone_ids
+            for symbol in milestone_by_id[milestone_id].get("process_symbols", [])
+        }
+    )
+    st.session_state["terminal_process_symbols"] = terminal_symbols
     st.download_button(
         "Export schedule debug JSON",
         data=json.dumps(
@@ -3399,15 +3758,20 @@ def _render_schedule(service, controls: dict[str, Any], context: dict[str, Any])
         resource_rows,
         graph,
         context.get("blockers") or {},
+        schedule=schedule,
+        catalog=catalog,
     )
     _render_priority_expanders(
         service,
         controls,
+        graph,
         enriched_resource_rows,
         "resource_id",
         selected_resource_ids,
         id_label="Resource",
         resources=resources,
+        roles=roles,
+        pinned_resource_usage=pinned_resource_usage,
     )
     st.subheader("Role priorities")
     role_rows = role_priority_rows(
@@ -3432,27 +3796,35 @@ def _render_schedule(service, controls: dict[str, Any], context: dict[str, Any])
         role_rows,
         graph,
         context.get("blockers") or {},
+        schedule=schedule,
+        catalog=catalog,
     )
     _render_priority_expanders(
         service,
         controls,
+        graph,
         enriched_role_rows,
         "role_id",
         selected_role_ids,
         id_label="Role",
         resources=resources,
+        roles=roles,
+        pinned_resource_usage=pinned_resource_usage,
     )
 
 
 def _render_priority_expanders(
     service,
     controls: dict[str, Any],
+    graph: dict[str, Any],
     rows: list[dict[str, Any]],
     id_field: str,
     selected_ids: list[str] | tuple[str, ...],
     *,
     id_label: str,
     resources: list[dict[str, Any]] | None = None,
+    roles: list[dict[str, Any]] | None = None,
+    pinned_resource_usage: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
     sections = _priority_expander_sections(
         rows,
@@ -3471,8 +3843,11 @@ def _render_priority_expanders(
                     _render_priority_process_entry(
                         service,
                         controls,
+                        graph,
                         row,
                         resources or [],
+                        roles or [],
+                        pinned_resource_usage or {},
                     )
 
 
@@ -3548,10 +3923,29 @@ def _priority_rows(
         visible_rows.append(
             {
                 "priority": row.get("priority"),
+                "process_id": row.get("process_id"),
                 "process_symbol": row.get("process_symbol"),
                 "process_name": row.get("process_name"),
-                "hours_until_ls": row.get("hours_until_ls"),
+                "process_type": row.get("process_type"),
+                "planned_start_at": row.get("planned_start_at"),
+                "planned_finish_at": row.get("planned_finish_at"),
+                "schedule_window_starts_at": row.get("schedule_window_starts_at"),
+                "schedule_window_ends_at": row.get("schedule_window_ends_at"),
+                "hours_until_planned_start": row.get("hours_until_planned_start"),
+                "hours_until_planned_finish": row.get("hours_until_planned_finish"),
+                "schedule_buffer_hours": row.get("schedule_buffer_hours"),
+                "max_makespan_sensitivity_hours": row.get(
+                    "max_makespan_sensitivity_hours"
+                ),
+                "sensitivity_label": row.get("sensitivity_label"),
                 "effort_hours": row.get("effort_hours"),
+                "active_pin": row.get("active_pin"),
+                "pin_id": row.get("pin_id"),
+                "pin_status": row.get("pin_status"),
+                "pin_started_at": row.get("pin_started_at"),
+                "pin_forecast_finish_at": row.get("pin_forecast_finish_at"),
+                "pin_verified_done_at": row.get("pin_verified_done_at"),
+                "pin_overdue": row.get("pin_overdue"),
                 "status": row.get("status"),
                 "computed_status": row.get("computed_status"),
                 "started_at": row.get("started_at"),
@@ -3560,7 +3954,10 @@ def _priority_rows(
                 "blockers": row.get("blockers") or [],
                 "blocking_count": row.get("blocking_count") or 0,
                 "role_ids": row.get("role_ids"),
+                "planned_assignments": row.get("planned_assignments") or [],
                 "dependencies": row.get("dependencies") or [],
+                "predecessors": row.get("predecessors") or [],
+                "successors": row.get("successors") or [],
                 "duration_business_days": row.get("duration_business_days"),
                 "earliest_start_at": row.get("earliest_start_at"),
                 "start_at_earliest": row.get("start_at_earliest"),
@@ -3569,7 +3966,6 @@ def _priority_rows(
                 ),
                 "role_requirements": row.get("role_requirements") or [],
                 "required_roles": row.get("required_roles") or {},
-                "staked_resource_ids": row.get("staked_resource_ids") or [],
                 "assumption_note": row.get("assumption_note"),
                 id_field: row.get(id_field),
             }
@@ -3581,6 +3977,9 @@ def _enrich_priority_rows(
     rows: list[dict[str, Any]],
     graph: dict[str, Any],
     blockers: dict[str, Any],
+    *,
+    schedule: dict[str, Any] | None = None,
+    catalog: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     nodes_by_symbol = {
         node.get("process_symbol"): node
@@ -3594,11 +3993,18 @@ def _enrich_priority_rows(
         process_symbol = blocker.get("process_symbol") or blocker.get("process_id")
         if process_symbol:
             blockers_by_symbol.setdefault(process_symbol, []).append(blocker)
+    planned_assignments_by_process = _planned_assignments_by_process(
+        schedule or {},
+        catalog or {},
+    )
 
     enriched = []
     for row in rows:
         process_symbol = row.get("process_symbol")
         node = nodes_by_symbol.get(process_symbol, {})
+        process_id = row.get("process_id") or node.get("process_id")
+        planned_assignments = planned_assignments_by_process.get(str(process_id), [])
+        tension_reasons = _assignment_tension_reasons(node, planned_assignments)
         process_blockers = blockers_by_symbol.get(process_symbol, [])
         blocker_summary = node.get("blocker_summary") or {}
         blocking_count = (
@@ -3610,11 +4016,49 @@ def _enrich_priority_rows(
                 **row,
                 "status": node.get("status"),
                 "computed_status": node.get("computed_status"),
-                "started_at": node.get("started_at"),
-                "finished_at": node.get("finished_at"),
+                "process_type": node.get("process_type"),
+                "process_id": process_id,
+                "planned_start_at": _first_present(
+                    row.get("planned_start_at"),
+                    (node.get("resource_aware") or {}).get("starts_at"),
+                    (node.get("dependency_only") or {}).get("es_at"),
+                ),
+                "planned_finish_at": _first_present(
+                    row.get("planned_finish_at"),
+                    (node.get("resource_aware") or {}).get("ends_at"),
+                    (node.get("dependency_only") or {}).get("ef_at"),
+                ),
+                "schedule_window_starts_at": _first_present(
+                    row.get("schedule_window_starts_at"),
+                    (node.get("resource_aware") or {}).get(
+                        "schedule_window_starts_at"
+                    ),
+                    (node.get("dependency_only") or {}).get(
+                        "schedule_window_starts_at"
+                    ),
+                    (node.get("resource_aware") or {}).get("es_at"),
+                    (node.get("dependency_only") or {}).get("es_at"),
+                ),
+                "schedule_window_ends_at": _first_present(
+                    row.get("schedule_window_ends_at"),
+                    (node.get("resource_aware") or {}).get("schedule_window_ends_at"),
+                    (node.get("dependency_only") or {}).get("schedule_window_ends_at"),
+                    (node.get("resource_aware") or {}).get("lf_at"),
+                    (node.get("dependency_only") or {}).get("lf_at"),
+                ),
+                "started_at": _first_present(
+                    row.get("pin_started_at"),
+                    _row_pin_started_at(node),
+                ),
+                "finished_at": _first_present(
+                    node.get("finished_at"),
+                    row.get("finished_at"),
+                ),
                 "description": node.get("description"),
                 "duration_business_days": node.get("duration_business_days"),
                 "dependencies": node.get("dependencies") or [],
+                "predecessors": node.get("predecessors") or [],
+                "successors": node.get("successors") or [],
                 "earliest_start_at": node.get("earliest_start_at"),
                 "start_at_earliest": node.get("start_at_earliest"),
                 "delay_after_dependencies_business_days": node.get(
@@ -3622,8 +4066,12 @@ def _enrich_priority_rows(
                 ),
                 "role_requirements": node.get("role_requirements") or [],
                 "required_roles": node.get("required_roles") or {},
-                "staked_resource_ids": node.get("staked_resource_ids") or [],
                 "assumption_note": node.get("assumption_note"),
+                "planned_assignments": planned_assignments,
+                "assignment_state": (
+                    "assignment_tension" if tension_reasons else "assignment_aligned"
+                ),
+                "assignment_tension_reasons": tension_reasons,
                 "blockers": process_blockers,
                 "blocking_count": blocking_count,
             }
@@ -3641,44 +4089,545 @@ def _priority_process_header(row: dict[str, Any]) -> str:
 def _render_priority_process_entry(
     service,
     controls: dict[str, Any],
+    graph: dict[str, Any],
     row: dict[str, Any],
     resources: list[dict[str, Any]],
+    roles: list[dict[str, Any]],
+    pinned_resource_usage: dict[str, list[dict[str, Any]]],
 ) -> None:
-    st.markdown(_priority_process_markdown(row, controls["timezone"]))
+    st.markdown(
+        _priority_process_markdown(
+            row,
+            controls["timezone"],
+            role_labels=_role_labels(roles),
+            resource_labels=_resource_labels(resources),
+        )
+    )
     _render_block_status(row)
-    _render_done_criteria(row)
-    _render_staked_resources_control(service, controls, row, resources)
-    _render_priority_status_controls(service, controls, row)
+    _render_assignment_tension(row)
+    _render_process_topology_and_role_controls(
+        service,
+        controls,
+        graph,
+        row,
+        roles,
+    )
+    _render_process_role_pins_control(
+        service,
+        controls,
+        row,
+        resources,
+        roles,
+        pinned_resource_usage,
+    )
 
 
-def _priority_process_markdown(row: dict[str, Any], timezone_name: str) -> str:
+def _priority_process_markdown(
+    row: dict[str, Any],
+    timezone_name: str,
+    *,
+    role_labels: dict[str, str] | None = None,
+    resource_labels: dict[str, str] | None = None,
+) -> str:
+    role_labels = role_labels or {}
+    resource_labels = resource_labels or {}
+    requirement = _single_role_requirement(row)
+    status = row.get("computed_status") or row.get("status") or "unknown"
     details = [
-        f"- Start window: {_format_start_window(row.get('hours_until_ls'))}",
-        f"- Effort: {_format_priority_hours(row.get('effort_hours'), 'hour')}",
+        f"- Type: {_ui_process_type_label(row.get('process_type'))}",
+        f"- Mode: {_process_mode(row)}",
+        f"- Status: `{status}`",
+        f"- Role requirement: {_process_role_requirement_label(requirement, role_labels)}",
+        f"- Effort hours: {_process_effort_hours(row, requirement)}",
+        f"- Definition: {row.get('description') or 'needs confirmation'}",
+        f"- Parents: {_braced_symbols(row.get('predecessors'))}",
+        f"- Children: {_braced_symbols(row.get('successors'))}",
     ]
-    status = row.get("computed_status") or row.get("status")
-    if status:
-        details.append(f"- Status: `{status}`")
-    role_ids = row.get("role_ids")
-    if role_ids:
-        role_text = (
-            role_ids
-            if isinstance(role_ids, str)
-            else ", ".join(f"`{role_id}`" for role_id in role_ids)
+    if _process_mode(row) == "pinned":
+        details.extend(
+            _priority_pinned_lines(
+                row,
+                timezone_name,
+                resource_labels=resource_labels,
+            )
         )
-        details.append(f"- Roles: {role_text}")
-    if row.get("staked_resource_ids"):
-        details.append(
-            "- Staked resources: "
-            + ", ".join(f"`{resource_id}`" for resource_id in row["staked_resource_ids"])
+    else:
+        details.extend(
+            [
+                f"- Assigned to: {_format_planned_resource(row)}",
+                (
+                    "- Planned start: "
+                    f"{_markdown_datetime(row.get('planned_start_at'), timezone_name)}"
+                ),
+                (
+                    "- Planned finish: "
+                    f"{_markdown_datetime(row.get('planned_finish_at'), timezone_name)}"
+                ),
+                f"- {_format_schedule_window_line(row)}",
+            ]
         )
-    if row.get("started_at"):
-        started_at = _markdown_datetime(row.get("started_at"), timezone_name)
-        details.append(f"- Started: {started_at}")
-    if row.get("finished_at"):
-        finished_at = _markdown_datetime(row.get("finished_at"), timezone_name)
-        details.append(f"- Done: {finished_at}")
     return "\n".join(details)
+
+
+def _ui_process_type_label(value: Any) -> str:
+    process_type = str(value or "standard")
+    return "normal" if process_type == "standard" else process_type
+
+
+def _single_role_requirement(row: dict[str, Any]) -> dict[str, Any] | None:
+    for requirement in row.get("role_requirements") or []:
+        if isinstance(requirement, dict):
+            return requirement
+    return None
+
+
+def _process_mode(row: dict[str, Any]) -> str:
+    if _process_pin_records(row):
+        return "pinned"
+    if row.get("active_pin") or row.get("pin_started_at"):
+        return "pinned"
+    return "planned"
+
+
+def _process_pin_records(row: dict[str, Any]) -> list[dict[str, Any]]:
+    pins = []
+    for requirement in row.get("role_requirements") or []:
+        if not isinstance(requirement, dict):
+            continue
+        role_id = requirement.get("role_id")
+        for pin in requirement.get("pins", []) or []:
+            if isinstance(pin, dict):
+                pins.append({**pin, "role_id": pin.get("role_id") or role_id})
+    if not pins and (row.get("active_pin") or row.get("pin_started_at")):
+        pins.append(
+            {
+                "resource_id": row.get("resource_id"),
+                "pinned_at": row.get("pin_started_at"),
+                "forecast_finish_at": row.get("pin_forecast_finish_at"),
+                "verified_done_at": row.get("pin_verified_done_at"),
+                "status": row.get("pin_status") or "pinned_started",
+            }
+        )
+    return pins
+
+
+def _process_role_requirement_label(
+    requirement: dict[str, Any] | None,
+    role_labels: dict[str, str],
+) -> str:
+    if requirement is None:
+        return "-"
+    role_id = str(requirement.get("role_id") or "")
+    role_label = role_labels.get(role_id, f"`{role_id}`" if role_id else "-")
+    requirement_id = str(requirement.get("requirement_id") or "")
+    if requirement_id:
+        return f"{role_label} | `{requirement_id}`"
+    return role_label
+
+
+def _process_effort_hours(
+    row: dict[str, Any],
+    requirement: dict[str, Any] | None,
+) -> str:
+    if requirement is not None:
+        return _format_priority_hours(requirement.get("effort_hours"), "hour")
+    return _format_priority_hours(row.get("effort_hours"), "hour")
+
+
+def _braced_symbols(value: Any) -> str:
+    if not value:
+        return "{}"
+    if isinstance(value, str):
+        symbols = [value]
+    elif isinstance(value, (list, tuple, set)):
+        symbols = [str(item) for item in value if item]
+    else:
+        symbols = [str(value)]
+    unique = sorted(dict.fromkeys(symbols))
+    return "{" + ", ".join(unique) + "}" if unique else "{}"
+
+
+def _priority_pinned_lines(
+    row: dict[str, Any],
+    timezone_name: str,
+    *,
+    resource_labels: dict[str, str],
+) -> list[str]:
+    pins = _process_pin_records(row)
+    resource_ids = [
+        str(pin.get("resource_id"))
+        for pin in pins
+        if pin.get("resource_id")
+    ]
+    pinned_starts = [
+        parsed
+        for parsed in (_optional_datetime(pin.get("pinned_at")) for pin in pins)
+        if parsed is not None
+    ]
+    verified_finishes = [
+        parsed
+        for parsed in (
+            _optional_datetime(
+                pin.get("verified_finished_at")
+                or pin.get("verified_done_at")
+                or pin.get("ends_at")
+            )
+            for pin in pins
+        )
+        if parsed is not None
+    ]
+    forecast_finishes = [
+        parsed
+        for parsed in (
+            _optional_datetime(pin.get("forecast_finish_at")) for pin in pins
+        )
+        if parsed is not None
+    ]
+    resource_text = ", ".join(
+        resource_labels.get(resource_id, f"`{resource_id}`")
+        for resource_id in sorted(dict.fromkeys(resource_ids))
+    )
+    lines = [
+        f"- Pinned to: {resource_text or '-'}",
+        (
+            "- Pinned started: "
+            f"{_markdown_datetime(min(pinned_starts) if pinned_starts else None, timezone_name)}"
+        ),
+    ]
+    has_unverified = any(
+        not (
+            pin.get("verified_finished_at")
+            or pin.get("verified_done_at")
+            or pin.get("ends_at")
+        )
+        for pin in pins
+    )
+    if has_unverified or not verified_finishes:
+        lines.append(
+            "- Forecasted finish: "
+            f"{_markdown_datetime(max(forecast_finishes) if forecast_finishes else None, timezone_name)}"
+        )
+    else:
+        lines.append(
+            "- Verified finish: "
+            f"{_markdown_datetime(max(verified_finishes), timezone_name)}"
+        )
+    return lines
+
+
+def _format_priority_pin_summary(row: dict[str, Any], timezone_name: str) -> str:
+    pin_started_at = _first_present(row.get("pin_started_at"), _row_pin_started_at(row))
+    if not pin_started_at:
+        planned_start = _markdown_datetime(row.get("planned_start_at"), timezone_name)
+        return f"not pinned; planned start is {planned_start} or later"
+    status = row.get("pin_status") or "pinned_started"
+    parts = [
+        f"`{status}`",
+        f"pinned {_markdown_datetime(pin_started_at, timezone_name)}",
+    ]
+    if row.get("pin_forecast_finish_at"):
+        parts.append(
+            "forecast finish "
+            f"{_markdown_datetime(row.get('pin_forecast_finish_at'), timezone_name)}"
+        )
+    if row.get("pin_verified_done_at"):
+        parts.append(
+            "verified done "
+            f"{_markdown_datetime(row.get('pin_verified_done_at'), timezone_name)}"
+        )
+    if row.get("pin_overdue"):
+        parts.append("forecast overdue")
+    return "; ".join(parts)
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _row_pin_started_at(row: dict[str, Any]) -> Any:
+    pin_started_at = row.get("pin_started_at")
+    if pin_started_at:
+        return pin_started_at
+    starts = []
+    for requirement in row.get("role_requirements") or []:
+        if not isinstance(requirement, dict):
+            continue
+        for pin in requirement.get("pins") or []:
+            if isinstance(pin, dict) and pin.get("pinned_at"):
+                starts.append(str(pin["pinned_at"]))
+    return min(starts) if starts else None
+
+
+def _planned_assignments_by_process(
+    schedule: dict[str, Any],
+    catalog: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    resource_labels = {
+        str(resource.get("resource_id")): _named_entity_label(
+            resource.get("resource_id"),
+            resource.get("name"),
+        )
+        for resource in catalog.get("resources", []) or []
+        if resource.get("resource_id")
+    }
+    role_labels = {
+        str(role.get("role_id")): _named_entity_label(
+            role.get("role_id"),
+            role.get("name"),
+        )
+        for role in catalog.get("roles", []) or []
+        if role.get("role_id")
+    }
+    assignments: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = {}
+    for slice_data in schedule.get("allocation_slices", []) or []:
+        process_id = slice_data.get("process_id")
+        resource_id = slice_data.get("resource_id")
+        role_id = slice_data.get("role_id")
+        if not process_id or not resource_id or not role_id:
+            continue
+        requirement_id = str(slice_data.get("requirement_id") or "")
+        process_assignments = assignments.setdefault(str(process_id), {})
+        key = (str(requirement_id), str(resource_id), str(role_id))
+        assignment = process_assignments.setdefault(
+            key,
+            {
+                "requirement_id": requirement_id or None,
+                "resource_id": str(resource_id),
+                "role_id": str(role_id),
+                "resource_label": resource_labels.get(
+                    str(resource_id),
+                    f"`{resource_id}`",
+                ),
+                "role_label": role_labels.get(str(role_id), f"`{role_id}`"),
+                "effort_hours": 0.0,
+            },
+        )
+        assignment["effort_hours"] += float(slice_data.get("effort_hours") or 0)
+    return {
+        process_id: sorted(
+            process_assignments.values(),
+            key=lambda item: (
+                str(item.get("role_id") or ""),
+                str(item.get("resource_id") or ""),
+                str(item.get("requirement_id") or ""),
+            ),
+        )
+        for process_id, process_assignments in assignments.items()
+    }
+
+
+def _format_planned_resource(row: dict[str, Any]) -> str:
+    assignments = row.get("planned_assignments") or []
+    if not assignments:
+        return "-"
+    return "; ".join(
+        _planned_resource_label(assignment)
+        for assignment in assignments
+    )
+
+
+def _planned_resource_label(assignment: dict[str, Any]) -> str:
+    resource_label = assignment.get("resource_label") or (
+        f"`{assignment.get('resource_id')}`"
+    )
+    role_label = assignment.get("role_label") or f"`{assignment.get('role_id')}`"
+    return f"{resource_label} for {role_label}"
+
+
+def _assignment_tension_reasons(
+    node: dict[str, Any],
+    planned_assignments: list[dict[str, Any]],
+) -> list[str]:
+    if not node:
+        return []
+    planned_by_requirement: dict[str, set[str]] = defaultdict(set)
+    planned_by_role: dict[str, set[str]] = defaultdict(set)
+    for assignment in planned_assignments:
+        resource_id = assignment.get("resource_id")
+        role_id = assignment.get("role_id")
+        if not resource_id or not role_id:
+            continue
+        planned_by_role[str(role_id)].add(str(resource_id))
+        requirement_id = assignment.get("requirement_id")
+        if requirement_id:
+            planned_by_requirement[str(requirement_id)].add(str(resource_id))
+
+    reasons = []
+    process_id = str(node.get("process_id") or "")
+    for index, requirement in enumerate(node.get("role_requirements") or []):
+        role_id = str(requirement.get("role_id") or "")
+        requirement_id = str(
+            requirement.get("requirement_id")
+            or f"{process_id}-requirement-{index + 1}"
+        )
+        preferred_resource_ids = _requirement_preferred_resource_ids(requirement)
+        if not preferred_resource_ids:
+            continue
+        planned_resource_ids = (
+            planned_by_requirement.get(requirement_id)
+            or planned_by_role.get(role_id)
+            or set()
+        )
+        if planned_resource_ids and planned_resource_ids.isdisjoint(
+            preferred_resource_ids,
+        ):
+            reasons.append(
+                f"`{role_id}` is currently or recently pinned to "
+                f"{_markdown_code_list(sorted(preferred_resource_ids))}, "
+                "but planned for "
+                f"{_markdown_code_list(sorted(planned_resource_ids))}."
+            )
+    return reasons
+
+
+def _pinned_resource_usage(graph: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    usage: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for node in graph.get("nodes", []) or []:
+        process_symbol = str(node.get("process_symbol") or node.get("process_id") or "")
+        process_id = str(node.get("process_id") or "")
+        for index, requirement in enumerate(node.get("role_requirements") or []):
+            role_id = str(requirement.get("role_id") or "")
+            requirement_id = str(
+                requirement.get("requirement_id")
+                or f"{process_id}-requirement-{index + 1}"
+            )
+            for pin in _active_requirement_pins(requirement):
+                resource_id = pin.get("resource_id")
+                if not resource_id:
+                    continue
+                usage[str(resource_id)].append(
+                    {
+                        "process_id": process_id,
+                        "process_symbol": process_symbol,
+                        "requirement_id": requirement_id,
+                        "role_id": role_id,
+                        "pin_id": pin.get("pin_id"),
+                    }
+                )
+    return dict(usage)
+
+
+def _requirement_preferred_resource_ids(requirement: dict[str, Any]) -> set[str]:
+    active = {
+        str(resource_id)
+        for resource_id in requirement.get("active_pinned_resource_ids", []) or []
+    }
+    if active:
+        return active
+    recent = {
+        str(resource_id)
+        for resource_id in requirement.get("recent_pinned_resource_ids", []) or []
+    }
+    if recent:
+        return recent
+    return set()
+
+
+def _active_requirement_pins(
+    requirement: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        dict(pin)
+        for pin in requirement.get("pins", []) or []
+        if isinstance(pin, dict) and pin.get("status") == "pinned_started"
+    ]
+
+
+def _named_entity_label(entity_id: Any, name: Any) -> str:
+    if name:
+        return f"{name} (`{entity_id}`)"
+    return f"`{entity_id}`"
+
+
+def _role_labels(roles: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        str(role.get("role_id")): _named_entity_label(role.get("role_id"), role.get("name"))
+        for role in roles
+        if role.get("role_id")
+    }
+
+
+def _resource_labels(resources: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        str(resource.get("resource_id")): _named_entity_label(
+            resource.get("resource_id"),
+            resource.get("name"),
+        )
+        for resource in resources
+        if resource.get("resource_id")
+    }
+
+
+def _format_schedule_window_line(row: dict[str, Any]) -> str:
+    start_buffer_hours = _duration_hours(
+        row.get("schedule_window_starts_at"),
+        row.get("planned_start_at"),
+    )
+    duration_hours = _duration_hours(
+        row.get("planned_start_at"),
+        row.get("planned_finish_at"),
+    )
+    finish_buffer_hours = _duration_hours(
+        row.get("planned_finish_at"),
+        row.get("schedule_window_ends_at"),
+    )
+    return (
+        f"{_format_optional_decimal_days(start_buffer_hours)} pre-buffer | "
+        f"{_format_optional_decimal_days(duration_hours)} duration | "
+        f"{_format_optional_decimal_days(finish_buffer_hours)} post-buffer"
+    )
+
+
+def _format_started_delta(row: dict[str, Any]) -> str:
+    return _format_timing_delta(_row_pin_started_at(row), row.get("planned_start_at"))
+
+
+def _format_finished_delta(row: dict[str, Any]) -> str:
+    return _format_timing_delta(row.get("finished_at"), row.get("planned_finish_at"))
+
+
+def _format_timing_delta(actual_value: Any, planned_value: Any) -> str:
+    actual_at = _optional_datetime(actual_value)
+    planned_at = _optional_datetime(planned_value)
+    if actual_at is None or planned_at is None:
+        return "-"
+    delta_hours = (actual_at - planned_at).total_seconds() / 3600
+    if abs(delta_hours) < 0.0001:
+        return "0 days early"
+    direction = "late" if delta_hours > 0 else "early"
+    return f"{_format_decimal_days(abs(delta_hours))} {direction}"
+
+
+def _format_optional_decimal_days(hours: float | None) -> str:
+    if hours is None:
+        return "-"
+    return _format_decimal_days(hours)
+
+
+def _duration_hours(starts_at: Any, ends_at: Any) -> float | None:
+    start = _optional_datetime(starts_at)
+    end = _optional_datetime(ends_at)
+    if start is None or end is None:
+        return None
+    return (end - start).total_seconds() / 3600
+
+
+def _optional_datetime(value: Any) -> dt.datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, dt.datetime):
+        parsed = value
+    else:
+        try:
+            parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return parsed.replace(tzinfo=dt.UTC)
+    return parsed
 
 
 def _render_block_status(row: dict[str, Any]) -> None:
@@ -3707,69 +4656,347 @@ def _render_block_status(row: dict[str, Any]) -> None:
             st.markdown(line)
 
 
+def _render_assignment_tension(row: dict[str, Any]) -> None:
+    reasons = row.get("assignment_tension_reasons") or []
+    tensioned = bool(reasons) or row.get("assignment_state") == "assignment_tension"
+    color = "#d97706" if tensioned else "#16a34a"
+    label = "Assignment tension" if tensioned else "Assignments aligned"
+    st.markdown(
+        (
+            f"<span style='display:inline-block;width:0.72rem;height:0.72rem;"
+            f"border-radius:999px;background:{color};vertical-align:middle;"
+            f"margin-right:0.35rem;'></span><strong>{label}</strong>"
+        ),
+        unsafe_allow_html=True,
+    )
+    for reason in reasons:
+        st.markdown(f"- {reason}")
+
+
 def _render_done_criteria(row: dict[str, Any]) -> None:
     st.markdown("**Done criteria**")
     description = row.get("description")
     st.write(description or "No done criteria recorded.")
 
 
-def _render_staked_resources_control(
+def _render_process_role_pins_control(
     service,
     controls: dict[str, Any],
     row: dict[str, Any],
     resources: list[dict[str, Any]],
+    roles: list[dict[str, Any]],
+    pinned_resource_usage: dict[str, list[dict[str, Any]]],
 ) -> None:
     process_symbol = row.get("process_symbol")
     if not process_symbol or not resources:
         return
-    resource_options = [
-        str(resource["resource_id"])
+    role_requirements = list(row.get("role_requirements") or [])
+    if not role_requirements:
+        return
+    resources_by_id = {
+        str(resource["resource_id"]): resource
         for resource in resources
         if resource.get("resource_id") and resource.get("active", True)
-    ]
-    current = [
-        resource_id
-        for resource_id in row.get("staked_resource_ids", [])
-        if resource_id in resource_options
-    ]
+    }
+    role_labels = {
+        str(role.get("role_id")): _named_entity_label(role.get("role_id"), role.get("name"))
+        for role in roles
+        if role.get("role_id")
+    }
     row_scope = f"{row.get('role_id')}_{row.get('resource_id')}"
-    key = f"schedule_staked_resources_{process_symbol}_{row.get('priority')}_{row_scope}"
-    selected = st.multiselect(
-        "Staked resources",
-        resource_options,
-        default=current,
-        key=key,
-        help=(
-            "Pin this process to specific resources before resource scheduling "
-            "fills role capacity."
-        ),
-    )
-    if st.button(
-        "Save staked resources",
-        key=f"schedule_save_staked_{process_symbol}_{row.get('priority')}_{row_scope}",
-    ):
-        _apply_command(
-            service,
-            {
-                "action": "upsert_process_revision",
-                "project_id": controls["project_id"],
-                "process_symbol": process_symbol,
-                "name": row.get("process_name") or process_symbol,
-                "description": row.get("description") or "",
-                "effective_at": controls["as_of"],
-                "duration_business_days": int(row.get("duration_business_days") or 0),
-                "dependencies": list(row.get("dependencies") or []),
-                "earliest_start_at": row.get("earliest_start_at"),
-                "start_at_earliest": bool(row.get("start_at_earliest")),
-                "delay_after_dependencies_business_days": int(
-                    row.get("delay_after_dependencies_business_days") or 0,
-                ),
-                "required_roles": row.get("required_roles") or {},
-                "role_requirements": row.get("role_requirements") or [],
-                "staked_resource_ids": selected,
-                "assumption_note": row.get("assumption_note"),
-            },
+    st.markdown("**Process-role pins**")
+    selections = []
+    for index, requirement in enumerate(role_requirements):
+        role_id = str(requirement.get("role_id") or "")
+        if not role_id:
+            continue
+        requirement_id = str(
+            requirement.get("requirement_id")
+            or f"{row.get('process_id')}-requirement-{index + 1}"
         )
+        pins = [
+            dict(pin)
+            for pin in requirement.get("pins", []) or []
+            if isinstance(pin, dict)
+        ]
+        current_pin = _current_requirement_pin(pins)
+        current_resource_id = str(current_pin.get("resource_id") or "")
+        pin_key = {
+            "process_symbol": str(process_symbol),
+            "requirement_id": requirement_id,
+            "role_id": role_id,
+        }
+        resource_options = [
+            resource_id
+            for resource_id, resource in resources_by_id.items()
+            if role_id in {str(value) for value in resource.get("role_ids", [])}
+        ]
+        resource_options = sorted(resource_options)
+        options = ["", *resource_options]
+        if current_resource_id and current_resource_id not in options:
+            options.append(current_resource_id)
+        role_column, resource_column = st.columns([2, 3])
+        with role_column:
+            st.markdown(role_labels.get(role_id, f"`{role_id}`"))
+            st.caption(
+                "Effort estimate "
+                f"{_format_priority_hours(requirement.get('effort_hours'), 'hour')}"
+            )
+        with resource_column:
+            selected = st.selectbox(
+                "Pinned resource",
+                options,
+                index=(
+                    options.index(current_resource_id)
+                    if current_resource_id in options
+                    else 0
+                ),
+                key=(
+                    "schedule_pinned_process_role_"
+                    f"{process_symbol}_{requirement_id}_{row.get('priority')}_{row_scope}"
+                ),
+                format_func=lambda resource_id, pin_key=pin_key: (
+                    _pin_resource_option_label(
+                        resource_id,
+                        resources_by_id,
+                        pinned_resource_usage,
+                        pin_key,
+                    )
+                ),
+                label_visibility="visible",
+                help=(
+                    "Pin this process-role to one resource. A forecast finish is "
+                    "required because pinned process-roles are scheduled from the "
+                    "resource's forecast, not effort hours."
+                ),
+            )
+        default_forecast = _default_pin_forecast_at(
+            current_pin,
+            row,
+            controls["timezone"],
+        )
+        forecast_col, done_col = st.columns([3, 2])
+        with forecast_col:
+            forecast_date = st.date_input(
+                "Forecast finish date",
+                value=default_forecast.date(),
+                key=(
+                    "schedule_pin_forecast_date_"
+                    f"{process_symbol}_{requirement_id}_{row.get('priority')}_{row_scope}"
+                ),
+                disabled=not selected,
+            )
+            forecast_time = st.time_input(
+                "Forecast finish time",
+                value=default_forecast.time().replace(microsecond=0),
+                key=(
+                    "schedule_pin_forecast_time_"
+                    f"{process_symbol}_{requirement_id}_{row.get('priority')}_{row_scope}"
+                ),
+                disabled=not selected,
+            )
+        with done_col:
+            verified_done = st.checkbox(
+                "Pin verified done",
+                value=current_pin.get("status") == "pinned_finished",
+                key=(
+                    "schedule_pin_done_"
+                    f"{process_symbol}_{requirement_id}_{row.get('priority')}_{row_scope}"
+                ),
+                disabled=not selected,
+                help=(
+                    "A process can be marked done only after its process-roles "
+                    "have verified done pins."
+                ),
+            )
+        _render_requirement_pin_history(
+            requirement,
+            resources_by_id,
+            controls["timezone"],
+        )
+        selections.append(
+            {
+                "requirement_id": requirement_id,
+                "role_id": role_id,
+                "selected_resource_id": selected or "",
+                "current_pin": current_pin,
+                "forecast_finish_at": combine_datetime(
+                    forecast_date,
+                    forecast_time,
+                    controls["timezone"],
+                ),
+                "verified_done": verified_done,
+            }
+        )
+    if st.button(
+        "Save process-role pins",
+        key=f"schedule_save_pins_{process_symbol}_{row.get('priority')}_{row_scope}",
+    ):
+        edit_at = _current_ui_datetime(controls["timezone"])
+        commands = _process_role_pin_commands(
+            controls["project_id"],
+            process_symbol,
+            selections,
+            edit_at,
+        )
+        if commands:
+            _apply_batch(service, commands)
+        else:
+            st.info("No process-role pin changes to save.")
+
+
+def _current_requirement_pin(pins: list[dict[str, Any]]) -> dict[str, Any]:
+    active = [pin for pin in pins if pin.get("status") == "pinned_started"]
+    if active:
+        return sorted(active, key=lambda item: str(item.get("pinned_at") or ""))[-1]
+    done = [pin for pin in pins if pin.get("status") == "pinned_finished"]
+    if done:
+        return sorted(done, key=lambda item: str(item.get("verified_done_at") or ""))[-1]
+    return {}
+
+
+def _default_pin_forecast_at(
+    pin: dict[str, Any],
+    row: dict[str, Any],
+    timezone_name: str,
+) -> dt.datetime:
+    fallback = _current_ui_datetime(timezone_name)
+    for value in (
+        pin.get("forecast_finish_at"),
+        row.get("planned_finish_at"),
+        row.get("schedule_window_ends_at"),
+    ):
+        parsed = _optional_datetime(value)
+        if parsed is not None:
+            return parsed.astimezone(ZoneInfo(validate_timezone(timezone_name)))
+    return fallback
+
+
+def _pin_resource_option_label(
+    resource_id: str,
+    resources_by_id: dict[str, dict[str, Any]],
+    pinned_resource_usage: dict[str, list[dict[str, Any]]],
+    pin_key: dict[str, str],
+) -> str:
+    if not resource_id:
+        return "Not pinned"
+    label = _named_entity_label(
+        resource_id,
+        resources_by_id.get(resource_id, {}).get("name"),
+    )
+    if _resource_pinned_to_other_process_role(
+        resource_id,
+        pin_key,
+        pinned_resource_usage,
+    ):
+        return f"{label} (pinned elsewhere)"
+    return label
+
+
+def _render_requirement_pin_history(
+    requirement: dict[str, Any],
+    resources_by_id: dict[str, dict[str, Any]],
+    timezone_name: str,
+) -> None:
+    pins = [
+        pin
+        for pin in requirement.get("pins", []) or []
+        if isinstance(pin, dict)
+    ]
+    if not pins:
+        return
+    with st.expander("Pin history", expanded=False):
+        for pin in sorted(
+            pins,
+            key=lambda item: str(item.get("pinned_at") or item.get("starts_at") or ""),
+            reverse=True,
+        ):
+            resource_id = str(pin.get("resource_id") or "")
+            resource_label = _named_entity_label(
+                resource_id,
+                resources_by_id.get(resource_id, {}).get("name"),
+            )
+            pinned_at = _markdown_datetime(
+                pin.get("pinned_at") or pin.get("starts_at"),
+                timezone_name,
+            )
+            forecast = _markdown_datetime(pin.get("forecast_finish_at"), timezone_name)
+            verified = _markdown_datetime(pin.get("verified_done_at"), timezone_name)
+            status = pin.get("status") or "-"
+            st.markdown(
+                f"- {resource_label}: `{status}` | pinned {pinned_at} | "
+                f"forecast {forecast} | verified {verified}"
+            )
+            note = pin.get("note")
+            if note:
+                st.caption(str(note))
+
+
+def _process_role_pin_commands(
+    project_id: str,
+    process_symbol: str,
+    selections: list[dict[str, Any]],
+    edit_at: dt.datetime,
+) -> list[dict[str, Any]]:
+    commands = []
+    for selection in selections:
+        selected_resource_id = str(selection.get("selected_resource_id") or "")
+        current_pin = selection.get("current_pin") or {}
+        current_pin_id = str(current_pin.get("pin_id") or "")
+        if not selected_resource_id:
+            if current_pin_id:
+                commands.append(
+                    {
+                        "action": "delete_process_role_pin",
+                        "project_id": project_id,
+                        "pin_id": current_pin_id,
+                    }
+                )
+            continue
+        forecast_finish_at = selection.get("forecast_finish_at")
+        if forecast_finish_at is None:
+            commands.append(
+                {
+                    "action": "delete_process_role_pin",
+                    "project_id": project_id,
+                    "pin_id": current_pin_id,
+                }
+            )
+            continue
+        status = "pinned_finished" if selection.get("verified_done") else "pinned_started"
+        command = {
+            "action": "upsert_process_role_pin",
+            "project_id": project_id,
+            "process_symbol": process_symbol,
+            "requirement_id": selection["requirement_id"],
+            "role_id": selection["role_id"],
+            "resource_id": selected_resource_id,
+            "pinned_at": current_pin.get("pinned_at") or edit_at,
+            "forecast_finish_at": forecast_finish_at,
+            "status": status,
+            "verified_done_at": edit_at if status == "pinned_finished" else None,
+            "updated_at": edit_at,
+            "note": "Pinned from the schedule priority view.",
+        }
+        if current_pin_id:
+            command["pin_id"] = current_pin_id
+        commands.append(command)
+    return commands
+
+def _resource_pinned_to_other_process_role(
+    resource_id: str,
+    pin_key: dict[str, str],
+    pinned_resource_usage: dict[str, list[dict[str, Any]]],
+) -> bool:
+    for item in pinned_resource_usage.get(resource_id, []):
+        if (
+            str(item.get("process_symbol")) == pin_key["process_symbol"]
+            and str(item.get("requirement_id")) == pin_key["requirement_id"]
+            and str(item.get("role_id")) == pin_key["role_id"]
+        ):
+            continue
+        return True
+    return False
 
 
 def _render_priority_status_controls(
@@ -3780,65 +5007,40 @@ def _render_priority_status_controls(
     process_symbol = row.get("process_symbol")
     if not process_symbol:
         return
-    status = row.get("status")
-    already_started = bool(row.get("started_at")) or status in {
-        "in_progress",
-        "paused",
-        "done",
-    }
-    already_done = status == "done" or bool(row.get("finished_at"))
+    pinned = _row_has_pin_history(row)
+    computed_status = str(row.get("computed_status") or "").strip().lower()
+    already_done = computed_status == "finished" or bool(row.get("finished_at"))
+    can_mark_done = _row_all_role_requirements_pinned_finished(row)
     col1, col2 = st.columns(2)
-    started_clicked = col1.checkbox(
-        "Started",
-        value=already_started,
-        disabled=already_done,
+    col1.checkbox(
+        "Pinned",
+        value=pinned,
+        disabled=True,
         key=(
-            f"schedule_started_{process_symbol}_{row.get('priority')}_"
+            f"schedule_pinned_{process_symbol}_{row.get('priority')}_"
             f"{row.get('role_id')}_{row.get('resource_id')}"
         ),
         help=(
-            "Mark this process started using the current datetime, or clear the "
-            "start if it was marked accidentally."
+            "A process is treated as started when at least one process-role is "
+            "pinned to a resource. Edit pins above instead of editing this field."
         ),
     )
     done_clicked = col2.checkbox(
         "Done",
         value=already_done,
+        disabled=not already_done and not can_mark_done,
         key=(
             f"schedule_done_{process_symbol}_{row.get('priority')}_"
             f"{row.get('role_id')}_{row.get('resource_id')}"
         ),
         help=(
-            "Mark this process done using the current datetime, or reopen it if "
-            "it was marked accidentally."
+            "A process can be marked done only after every process-role has a "
+            "verified done pin."
         ),
     )
-    if started_clicked and not already_started:
-        edit_at = _current_ui_datetime(controls["timezone"])
-        _apply_command(
-            service,
-            {
-                "action": "set_process_status",
-                "project_id": controls["project_id"],
-                "process_symbol": process_symbol,
-                "status": "in_progress",
-                "edit_at": edit_at,
-                "started_at": edit_at,
-                "note": "Marked started from the schedule priority view.",
-            },
-        )
-    if not started_clicked and already_started and not already_done:
-        edit_at = _current_ui_datetime(controls["timezone"])
-        _apply_command(
-            service,
-            {
-                "action": "set_process_status",
-                "project_id": controls["project_id"],
-                "process_symbol": process_symbol,
-                "status": "planned",
-                "edit_at": edit_at,
-                "note": "Cleared started state from the schedule priority view.",
-            },
+    if not already_done and not can_mark_done:
+        st.caption(
+            "Verify each process-role pin before marking this process done."
         )
     if done_clicked and not already_done:
         edit_at = _current_ui_datetime(controls["timezone"])
@@ -3850,8 +5052,6 @@ def _render_priority_status_controls(
                 "process_symbol": process_symbol,
                 "status": "done",
                 "edit_at": edit_at,
-                "started_at": row.get("started_at") or edit_at,
-                "finished_at": edit_at,
                 "note": "Marked done from the schedule priority view.",
             },
         )
@@ -3863,12 +5063,37 @@ def _render_priority_status_controls(
                 "action": "set_process_status",
                 "project_id": controls["project_id"],
                 "process_symbol": process_symbol,
-                "status": "in_progress",
+                "status": "paused",
                 "edit_at": edit_at,
-                "started_at": row.get("started_at") or edit_at,
                 "note": "Reopened from the schedule priority view.",
             },
         )
+
+
+def _row_has_pin_history(row: dict[str, Any]) -> bool:
+    return _row_pin_started_at(row) is not None
+
+
+def _row_all_role_requirements_pinned_finished(row: dict[str, Any]) -> bool:
+    requirements = [
+        requirement
+        for requirement in row.get("role_requirements", []) or []
+        if isinstance(requirement, dict)
+    ]
+    if not requirements:
+        return False
+    for requirement in requirements:
+        pins = [
+            pin
+            for pin in requirement.get("pins", []) or []
+            if isinstance(pin, dict)
+        ]
+        if not any(
+            pin.get("status") == "pinned_finished" and pin.get("verified_done_at")
+            for pin in pins
+        ):
+            return False
+    return True
 
 
 def _current_ui_datetime(timezone_name: str) -> dt.datetime:
@@ -3881,14 +5106,14 @@ def _format_start_window(value: Any) -> str:
         return "-"
     hours = float(value)
     if abs(hours) < 0.0001:
-        return "latest start is now"
+        return "planned start is now"
     days = _format_decimal_days(abs(hours))
     if hours < 0:
         return f"overdue by {days}"
-    return f"latest start in {days}"
+    return f"planned start in {days}"
 
 
-def _format_time_until_ls(value: Any) -> str:
+def _format_time_until_planned_start(value: Any) -> str:
     return _format_start_window(value)
 
 
@@ -3972,20 +5197,27 @@ def _render_gantt_chart(
     rows = [
         row
         for row in rows
-        if row.get("es_at") is not None and row.get("lf_at") is not None
+        if row.get("window_starts_at") is not None
+        and row.get("window_ends_at") is not None
+        and row.get("planned_start_at") is not None
+        and row.get("planned_finish_at") is not None
     ]
     if not rows:
         return
     fig_height = max(3, len(rows) * 0.42)
     fig, ax = plt.subplots(figsize=(12, fig_height))
+    row_y_by_symbol = {
+        str(row["symbol"]): index
+        for index, row in enumerate(rows)
+        if row.get("symbol")
+    }
     for index, row in enumerate(rows):
-        color = "#dc2626" if row["critical"] else "#2563eb"
-        finish_color = "#dc2626" if row["critical"] else "#d97706"
-        y = len(rows) - index - 1
+        color = gantt_bar_color(row, controls_now)
+        y = index
         _barh_datetime(
             ax,
-            row["es_at"],
-            row["lf_at"],
+            row["window_starts_at"],
+            row["window_ends_at"],
             y - 0.30,
             0.60,
             facecolor=color,
@@ -3995,41 +5227,163 @@ def _render_gantt_chart(
         )
         _barh_datetime(
             ax,
-            row["es_at"],
-            row["ls_at"],
+            row["planned_start_at"],
+            row["planned_finish_at"],
             y - 0.30,
             0.60,
             facecolor=color,
             edgecolor="none",
-            alpha=0.42,
-        )
-        _barh_datetime(
-            ax,
-            row["ef_at"],
-            row["lf_at"],
-            y - 0.30,
-            0.60,
-            facecolor=finish_color,
-            edgecolor="none",
-            alpha=0.32,
+            alpha=0.55,
         )
         ax.plot(
-            [mdates.date2num(row["es_at"]), mdates.date2num(row["lf_at"])],
+            [
+                mdates.date2num(row["planned_start_at"]),
+                mdates.date2num(row["planned_finish_at"]),
+            ],
             [y, y],
             color=color,
             linewidth=1.0,
             alpha=0.9,
         )
+        for marker in row.get("pin_markers") or []:
+            _plot_gantt_pin_marker(ax, marker, y)
+    _plot_gantt_dependency_connectors(ax, graph, rows, row_y_by_symbol)
     if controls_now is not None:
         ax.axvline(mdates.date2num(controls_now), color="#111827", linewidth=1.2)
+    ax.legend(
+        handles=[
+            mpatches.Patch(
+                facecolor=item["color"],
+                edgecolor=item["color"],
+                label=item["label"],
+                alpha=0.55,
+            )
+            for item in gantt_completedness_legend_items()
+        ],
+        title="Process state",
+        loc="upper right",
+        fontsize=8,
+        title_fontsize=8,
+    )
     ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels([row["symbol"] for row in reversed(rows)])
+    ax.set_yticklabels([row["symbol"] for row in rows])
+    ax.invert_yaxis()
     ax.set_xlabel("Time")
     _format_datetime_axis(ax.xaxis, timezone_name)
     ax.grid(axis="x", color="#e5e7eb", linewidth=0.8)
     fig.tight_layout()
     fig.autofmt_xdate(rotation=30, ha="right")
     st.pyplot(fig)
+
+
+def _plot_gantt_dependency_connectors(
+    ax,
+    graph: dict[str, Any],
+    rows: list[dict[str, Any]],
+    row_y_by_symbol: dict[str, int],
+) -> None:
+    row_by_symbol = {
+        str(row["symbol"]): row for row in rows if row.get("symbol") is not None
+    }
+    id_to_symbol = {
+        str(node.get("process_id")): str(node.get("process_symbol"))
+        for node in graph.get("nodes", []) or []
+        if node.get("process_id") and node.get("process_symbol")
+    }
+    for edge in graph.get("edges", []) or []:
+        predecessor = edge.get("predecessor_process_symbol")
+        successor = edge.get("successor_process_symbol")
+        if predecessor is None:
+            predecessor = id_to_symbol.get(str(edge.get("predecessor_process_id")))
+        if successor is None:
+            successor = id_to_symbol.get(str(edge.get("successor_process_id")))
+        predecessor = str(predecessor) if predecessor else ""
+        successor = str(successor) if successor else ""
+        parent = row_by_symbol.get(predecessor)
+        child = row_by_symbol.get(successor)
+        if parent is None or child is None:
+            continue
+        parent_finish = _gantt_connector_parent_finish(parent)
+        child_start = _gantt_connector_child_start(child)
+        if not isinstance(parent_finish, dt.datetime) or not isinstance(
+            child_start,
+            dt.datetime,
+        ):
+            continue
+        parent_y = row_y_by_symbol[predecessor]
+        child_y = row_y_by_symbol[successor]
+        start_x = mdates.date2num(parent_finish)
+        end_x = mdates.date2num(child_start)
+        mid_x = start_x + ((end_x - start_x) / 2)
+        ax.plot(
+            [start_x, mid_x, mid_x, end_x],
+            [parent_y, parent_y, child_y, child_y],
+            color="black",
+            linewidth=1,
+            linestyle="-",
+            zorder=2,
+        )
+        ax.scatter(
+            [start_x, end_x],
+            [parent_y, child_y],
+            s=5,
+            color="black",
+            zorder=3,
+        )
+
+
+def _gantt_connector_parent_finish(row: dict[str, Any]) -> dt.datetime | None:
+    pin_finished = [
+        marker["at"]
+        for marker in row.get("pin_markers") or []
+        if marker.get("kind") == "pin_finish" and isinstance(marker.get("at"), dt.datetime)
+    ]
+    if pin_finished:
+        return max(pin_finished)
+    planned_finish = row.get("planned_finish_at")
+    return planned_finish if isinstance(planned_finish, dt.datetime) else None
+
+
+def _gantt_connector_child_start(row: dict[str, Any]) -> dt.datetime | None:
+    pin_started = [
+        marker["at"]
+        for marker in row.get("pin_markers") or []
+        if marker.get("kind") == "pin_start" and isinstance(marker.get("at"), dt.datetime)
+    ]
+    if pin_started:
+        return min(pin_started)
+    planned_start = row.get("planned_start_at")
+    return planned_start if isinstance(planned_start, dt.datetime) else None
+
+
+def _plot_gantt_pin_marker(ax, marker: dict[str, object], y: float) -> None:
+    at = marker.get("at")
+    if not isinstance(at, dt.datetime):
+        return
+    kind = marker.get("kind")
+    if kind == "pin_start":
+        ax.plot(
+            [mdates.date2num(at)],
+            [y],
+            marker="o",
+            markersize=4,
+            markerfacecolor="none",
+            markeredgecolor="#111827",
+            markeredgewidth=0.9,
+            linestyle="None",
+            zorder=4,
+        )
+    elif kind == "pin_finish":
+        ax.plot(
+            [mdates.date2num(at)],
+            [y],
+            marker="x",
+            markersize=4,
+            color="#111827",
+            markeredgewidth=0.9,
+            linestyle="None",
+            zorder=4,
+        )
 
 
 def _render_heatmap(
@@ -4069,15 +5423,16 @@ def _render_utilization_heatmaps(
     utilization: dict[str, Any],
     schedule: dict[str, Any],
     *,
+    now: dt.datetime | None,
     timezone_name: str,
 ) -> None:
     resource_panel = (
         "Resources",
-        *resource_utilization_heatmap(utilization, schedule),
+        *resource_utilization_heatmap(utilization, schedule, now=now),
     )
     role_panel = (
         "Roles",
-        *role_utilization_heatmap(utilization, schedule),
+        *role_utilization_heatmap(utilization, schedule, now=now),
     )
     panels = [
         panel
@@ -4118,7 +5473,10 @@ def _render_utilization_heatmaps(
 
     span = schedule_time_span(schedule)
     if span is not None:
-        axes_list[-1].set_xlim(mdates.date2num(span[0]), mdates.date2num(span[1]))
+        start_at, end_at = span
+        if now is not None:
+            start_at = max(start_at, now)
+        axes_list[-1].set_xlim(mdates.date2num(start_at), mdates.date2num(end_at))
     _format_datetime_axis(axes_list[-1].xaxis, timezone_name)
     axes_list[-1].set_xlabel("Time")
     fig.autofmt_xdate(rotation=30, ha="right")
@@ -4133,6 +5491,7 @@ def _utilization_colormap():
 
 def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
     _ensure_catalog(service, controls, context)
+    _ensure_graph_context(service, controls, context)
     milestones = [
         milestone
         for milestone in (context.get("catalog") or {}).get("milestones", [])
@@ -4144,19 +5503,33 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         if milestone.get("milestone_id")
     }
     st.selectbox(
-        "Snapshot scope",
+        "Milestone selection",
         ["", *milestone_by_id],
         key="slippage_milestone_id",
         format_func=lambda value: (
-            "Current terminal selection"
+            "Whole project"
             if not value
             else f"{milestone_by_id[value].get('name') or value} ({value})"
         ),
-        help="Choose a milestone to view and commit milestone-specific slippage.",
+        help="Choose a milestone for slippage and sensitivity; empty means whole project.",
     )
     selected_milestone = _selected_slippage_milestone(context)
+    job_key = _slippage_commit_job_key(controls["project_id"])
+    commit_job = _slippage_commit_job(job_key)
+    if commit_job.get("status") == "completed":
+        committed_at = _parse_iso_datetime(
+            (commit_job.get("payload") or {}).get("committed_at"),
+            controls["as_of"],
+        )
+        if committed_at > controls["as_of"]:
+            context["schedule_snapshot_query_as_of"] = committed_at
     _ensure_schedule_snapshots(service, controls, context)
-    terminal_symbols = context.get("terminal_symbols") or []
+    terminal_symbols = (
+        list(selected_milestone.get("process_symbols") or [])
+        if selected_milestone is not None
+        else []
+    )
+    context["terminal_symbols"] = terminal_symbols
     snapshots = (context.get("schedule_snapshots") or {}).get("snapshots", [])
     st.subheader("Committed schedule snapshots")
     if selected_milestone is not None:
@@ -4169,16 +5542,24 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         st.caption(f"Terminal scope: {', '.join(terminal_symbols)}")
     else:
         st.caption("Project-wide terminal scope")
+    if commit_job.get("status") == "running":
+        st.info("Commit and sensitivity computation is running.")
+    elif commit_job.get("status") == "failed":
+        st.error(commit_job.get("message", "Commit failed."))
+    elif commit_job.get("status") == "completed":
+        st.success("Commit and sensitivity computation completed.")
+    job_running = commit_job.get("status") == "running"
     with st.form("commit_project_state"):
         note = st.text_input(
             "Commit note",
             help="Optional note stored with this committed schedule snapshot.",
         )
-        commit = st.form_submit_button("Commit current state")
+        commit = st.form_submit_button("Commit current state", disabled=job_running)
     if commit:
         committed_at = dt.datetime.now(dt.UTC)
-        result = _apply_command(
+        started = _start_slippage_commit_job(
             service,
+            job_key,
             _commit_project_state_payload(
                 controls,
                 terminal_symbols=terminal_symbols,
@@ -4186,10 +5567,8 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
                 committed_at=committed_at,
                 note=note or None,
             ),
-            rerun=False,
         )
-        if result is not None and result.ok:
-            st.session_state["as_of_override"] = committed_at.isoformat()
+        if started:
             st.rerun()
 
     plotted_rows = [
@@ -4227,6 +5606,10 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         use_container_width=True,
         hide_index=True,
     )
+    _render_snapshot_sensitivity(
+        snapshots,
+        graph=context.get("full_graph") or context.get("graph") or {},
+    )
 
     if not snapshots:
         return
@@ -4249,6 +5632,121 @@ def _render_slippage(service, controls: dict[str, Any], context: dict[str, Any])
         )
         st.session_state["as_of_override"] = selected["committed_at"]
         st.rerun()
+
+
+def _slippage_commit_job_key(project_id: str) -> str:
+    return f"slippage_commit:{project_id}"
+
+
+def _slippage_commit_job(job_key: str) -> dict[str, Any]:
+    with _SLIPPAGE_COMMIT_JOBS_LOCK:
+        return dict(_SLIPPAGE_COMMIT_JOBS.get(job_key, {}))
+
+
+def _start_slippage_commit_job(
+    service,
+    job_key: str,
+    payload: dict[str, Any],
+) -> bool:
+    with _SLIPPAGE_COMMIT_JOBS_LOCK:
+        existing = _SLIPPAGE_COMMIT_JOBS.get(job_key)
+        if existing and existing.get("status") == "running":
+            return False
+        _SLIPPAGE_COMMIT_JOBS[job_key] = {
+            "status": "running",
+            "started_at": dt.datetime.now(dt.UTC).isoformat(),
+            "payload": payload,
+        }
+
+    def run() -> None:
+        try:
+            with _SERVICE_ACCESS_LOCK:
+                result = service.handle_command(command_payload_envelope(payload))
+            status = "completed" if getattr(result, "ok", False) else "failed"
+            message = ""
+            if not getattr(result, "ok", False):
+                error = getattr(result, "error", None)
+                message = getattr(error, "message", str(error))
+            update = {
+                "status": status,
+                "finished_at": dt.datetime.now(dt.UTC).isoformat(),
+                "result": result_to_dict(result),
+                "message": message,
+            }
+        except Exception as exc:  # pragma: no cover - background UI guard.
+            update = {
+                "status": "failed",
+                "finished_at": dt.datetime.now(dt.UTC).isoformat(),
+                "message": str(exc),
+            }
+        with _SLIPPAGE_COMMIT_JOBS_LOCK:
+            _SLIPPAGE_COMMIT_JOBS[job_key].update(update)
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
+def _render_snapshot_sensitivity(
+    snapshots: list[dict[str, Any]],
+    *,
+    graph: dict[str, Any],
+) -> None:
+    st.subheader("Sensitivity at commit")
+    if not snapshots:
+        st.caption("Commit current state to compute sensitivity.")
+        return
+    latest = max(
+        snapshots,
+        key=lambda snapshot: str(snapshot.get("committed_at") or ""),
+    )
+    sensitivity_rows = latest.get("role_sensitivity") or []
+    if not sensitivity_rows:
+        st.caption("No sensitivity data was stored for the selected commit.")
+        return
+    process_by_id = {
+        node.get("process_id"): node
+        for node in graph.get("nodes", [])
+        if node.get("process_id")
+    }
+    topo_index = {
+        node.get("process_id"): index
+        for index, node in enumerate(graph.get("nodes", []))
+        if node.get("process_id")
+    }
+    rows = sorted(
+        sensitivity_rows,
+        key=lambda row: (
+            topo_index.get(row.get("process_id"), 10**9),
+            str(row.get("role_id") or ""),
+            str(row.get("requirement_id") or ""),
+        ),
+    )
+    st.markdown(
+        "| Process | Role | Sensitivity |\n"
+        "| --- | --- | ---: |\n"
+        + "\n".join(
+            _sensitivity_table_row(row, process_by_id)
+            for row in rows
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _sensitivity_table_row(
+    row: dict[str, Any],
+    process_by_id: dict[str, dict[str, Any]],
+) -> str:
+    process = process_by_id.get(row.get("process_id"), {})
+    symbol = process.get("process_symbol") or row.get("process_id") or "-"
+    name = process.get("name") or "-"
+    value = row.get("makespan_delta_hours")
+    if value is None:
+        rendered = "**unknown**"
+    else:
+        numeric = float(value)
+        color = "red" if numeric > 0 else "green"
+        rendered = f"<span style='color:{color}; font-weight:700'>{numeric:.3f}</span>"
+    return f"| `{symbol}` {name} | `{row.get('role_id') or '-'}` | {rendered} |"
 
 
 def _render_costs(service, controls: dict[str, Any], context: dict[str, Any]) -> None:
@@ -4962,6 +6460,17 @@ def _slack_job_is_active(job: dict[str, Any] | None) -> bool:
     return bool(job and job.get("status") in {"queued", "running"})
 
 
+def _slack_service_run_is_orphaned(
+    service_job: dict[str, Any] | None,
+    local_job: dict[str, Any] | None,
+) -> bool:
+    if not _slack_job_is_active(service_job):
+        return False
+    if not _slack_job_is_active(local_job):
+        return True
+    return str(service_job.get("run_id") or "") != str(local_job.get("run_id") or "")
+
+
 def _render_slack_job_status(
     job: dict[str, Any] | None,
     timezone_name: str,
@@ -5037,6 +6546,39 @@ def _start_slack_run_job(
     )
     thread.start()
     return True
+
+
+def _recover_orphaned_slack_run(
+    service,
+    project_id: str,
+    job: dict[str, Any],
+) -> bool:
+    run_id = str(job.get("run_id") or "")
+    if not run_id:
+        return False
+    finished_at = dt.datetime.now(dt.UTC)
+    started_at = _parse_iso_datetime(job.get("started_at"), finished_at)
+    if started_at > finished_at:
+        finished_at = started_at
+    result = _optional_service_command(
+        service,
+        {
+            "action": "finish_slack_run",
+            "project_id": project_id,
+            "run_id": run_id,
+            "status": "failed",
+            "finished_at": finished_at,
+            "result_json": {
+                "message": (
+                    "Marked failed by the UI because the active Slack run had "
+                    "no worker in this app process."
+                ),
+                "recovered_orphaned_run": True,
+            },
+            "error_text": "Interrupted Slack run had no active UI worker.",
+        },
+    )
+    return _service_result_ok(result)
 
 
 def _slack_run_worker(
@@ -5209,38 +6751,59 @@ def _slack_draft_rows(
         )
         for resource in resources
     }
-    return [
-        {
-            "send": False,
-            "outbox_id": row.get("outbox_id"),
-            "status": row.get("status"),
-            "resource": resource_labels.get(
-                str(row.get("resource_id")),
-                row.get("resource_id") or "",
-            ),
-            "resource_id": row.get("resource_id"),
-            "slack_user_id": row.get("slack_user_id"),
-            "body": row.get("body") or row.get("text") or "",
-            "run_id": row.get("run_id"),
-            "created_at": row.get("created_at"),
-            "updated_at": row.get("updated_at"),
-            "sent_at": row.get("sent_at"),
-            "failed_at": row.get("failed_at"),
-            "error_text": row.get("error_text"),
-            "slack_channel_id": row.get("slack_channel_id"),
-            "slack_message_ts": row.get("slack_message_ts"),
-        }
-        for row in rows
-    ]
+    output = []
+    for row in rows:
+        target_type = row.get("target_type") or (
+            "channel"
+            if row.get("slack_channel_id") and not row.get("slack_user_id")
+            else "dm"
+        )
+        resource_id = row.get("resource_id")
+        slack_channel_id = row.get("slack_channel_id")
+        resource_label = resource_labels.get(
+            str(resource_id),
+            resource_id or "",
+        )
+        target = (
+            f"Channel {slack_channel_id}"
+            if target_type == "channel"
+            else resource_label
+        )
+        output.append(
+            {
+                "send": False,
+                "outbox_id": row.get("outbox_id"),
+                "target_type": target_type,
+                "target": target,
+                "status": row.get("status"),
+                "resource": resource_label,
+                "resource_id": resource_id,
+                "slack_user_id": row.get("slack_user_id"),
+                "body": row.get("body") or row.get("text") or "",
+                "block_count": len(row.get("blocks") or []),
+                "run_id": row.get("run_id"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "sent_at": row.get("sent_at"),
+                "failed_at": row.get("failed_at"),
+                "error_text": row.get("error_text"),
+                "slack_channel_id": slack_channel_id,
+                "slack_message_ts": row.get("slack_message_ts"),
+            }
+        )
+    return output
 
 
 def _slack_draft_json(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
             "outbox_id": row.get("outbox_id"),
+            "target_type": row.get("target_type"),
             "resource_id": row.get("resource_id"),
             "slack_user_id": row.get("slack_user_id"),
+            "slack_channel_id": row.get("slack_channel_id"),
             "body": row.get("body"),
+            "block_count": row.get("block_count", 0),
             "send": bool(row.get("send")),
         }
         for row in rows
@@ -5342,6 +6905,7 @@ def _send_slack_rows_for_ui(
         pending = [
             {
                 "outbox_id": row.get("outbox_id"),
+                "target_type": row.get("target_type"),
                 "slack_user_id": row.get("slack_user_id"),
                 "slack_channel_id": row.get("slack_channel_id"),
                 "body": row.get("body"),

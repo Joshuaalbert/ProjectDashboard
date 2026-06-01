@@ -1,13 +1,23 @@
 import datetime as dt
+import hashlib
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from projdash.service.commands import CommandEnvelope
-from projdash.service.ladybug_repository import LadybugProjectRepository
+from projdash.service.models import (
+    PMCommunicationEvidenceRecord,
+    PMCommunicationEvidenceType,
+)
 from projdash.service.queries import QueryEnvelope
 from projdash.service.repository import InMemoryProjectRepository
 from projdash.service.service import ProjectService
-from projdash.service.slack_crypto import decrypt_slack_bot_token, encrypt_slack_bot_token
+from projdash.service.slack_crypto import (
+    decrypt_slack_bot_token,
+    encrypt_slack_bot_token,
+)
+from projdash.service.sqlite_repository import SQLiteProjectRepository
 
 UTC = dt.UTC
 
@@ -47,13 +57,6 @@ def _query(service: ProjectService, query: dict[str, Any]):
     result = service.handle_query(QueryEnvelope.model_validate({"query": query}))
     assert result.ok is True, getattr(result, "error", None)
     return result.data
-
-
-def _close(repository: LadybugProjectRepository) -> None:
-    if not repository._conn.is_closed():
-        repository._conn.close()
-    if not repository._db.is_closed():
-        repository._db.close()
 
 
 def _create_project(service: ProjectService, name: str = "Slack Project") -> str:
@@ -165,6 +168,34 @@ def test_slack_config_defaults_to_disabled_and_can_be_upserted():
     )
     assert updated["config"]["continuity_note"] == "Check Ada by tomorrow morning."
     assert updated["config"]["continuity_updated_at"] == _json_iso(15)
+
+    _handle(
+        service,
+        {
+            "action": "update_slack_continuity_note",
+            "project_id": project_id,
+            "continuity_note": None,
+            "updated_at": _iso(16),
+        },
+    )
+    cleared = _query(
+        service,
+        {"action": "query_slack_project_config", "project_id": project_id},
+    )
+    assert cleared["config"]["continuity_note"] is None
+    assert cleared["config"]["continuity_updated_at"] == _json_iso(16)
+
+    with pytest.raises(ValueError, match="4096"):
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "update_slack_continuity_note",
+                    "project_id": project_id,
+                    "continuity_note": "x" * 4097,
+                    "updated_at": _iso(17),
+                }
+            }
+        )
 
 
 def test_slack_encrypted_token_storage_round_trips_without_plaintext():
@@ -373,6 +404,15 @@ def test_slack_cursors_and_outbox_dedupe_and_status_transitions():
                     "resource_id": resource_id,
                     "slack_user_id": "U123",
                     "body": "Please post a status update.",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "*Status update*\nPlease post a status update.",
+                            },
+                        }
+                    ],
                     "content_hash": "sha256:abc",
                     "run_id": "run-1",
                     "created_at": _iso(14),
@@ -392,6 +432,15 @@ def test_slack_cursors_and_outbox_dedupe_and_status_transitions():
                     "resource_id": resource_id,
                     "slack_user_id": "U123",
                     "body": "Please post a status update.",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "*Status update*\nPlease post a status update.",
+                            },
+                        }
+                    ],
                     "content_hash": "sha256:abc",
                     "run_id": "run-1",
                     "created_at": _iso(14),
@@ -403,13 +452,47 @@ def test_slack_cursors_and_outbox_dedupe_and_status_transitions():
     assert replay.entity_ids["matched_outbox_ids"] == [outbox_id]
     assert replay.entity_ids["skipped_outbox_ids"] == [outbox_id]
 
+    channel_create = _handle(
+        service,
+        {
+            "action": "create_slack_outbox_messages",
+            "project_id": project_id,
+            "messages": [
+                {
+                    "target_type": "channel",
+                    "slack_channel_id": "C123",
+                    "body": "Please post a status update.",
+                    "content_hash": "sha256:abc",
+                    "run_id": "run-1",
+                    "created_at": _iso(14),
+                }
+            ],
+        },
+    )
+    channel_outbox_id = channel_create.entity_ids["created_outbox_ids"][0]
+
     pending = _query(
         service,
         {"action": "query_pending_slack_outbox", "project_id": project_id},
     )
-    assert [row["outbox_id"] for row in pending["outbox"]] == [outbox_id]
-    assert pending["outbox"][0]["status"] == "draft"
-    assert pending["outbox"][0]["generated_body"] == "Please post a status update."
+    assert {row["outbox_id"] for row in pending["outbox"]} == {
+        outbox_id,
+        channel_outbox_id,
+    }
+    pending_by_id = {row["outbox_id"]: row for row in pending["outbox"]}
+    assert pending_by_id[channel_outbox_id]["target_type"] == "channel"
+    assert pending_by_id[channel_outbox_id]["slack_channel_id"] == "C123"
+    assert pending_by_id[outbox_id]["status"] == "draft"
+    assert pending_by_id[outbox_id]["generated_body"] == "Please post a status update."
+    assert pending_by_id[outbox_id]["blocks"] == [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*Status update*\nPlease post a status update.",
+            },
+        }
+    ]
 
     _handle(
         service,
@@ -421,15 +504,17 @@ def test_slack_cursors_and_outbox_dedupe_and_status_transitions():
             "updated_at": _iso(14, 10),
         },
     )
-    edited = _query(
+    draft_rows = _query(
         service,
         {
             "action": "query_slack_outbox",
             "project_id": project_id,
             "statuses": ["draft"],
         },
-    )["outbox"][0]
+    )["outbox"]
+    edited = next(row for row in draft_rows if row["outbox_id"] == outbox_id)
     assert edited["body"] == "Edited status prompt."
+    assert edited["blocks"] == []
     assert edited["generated_body"] == "Please post a status update."
     assert edited["edited_at"] == _json_iso(14, 10)
 
@@ -444,14 +529,15 @@ def test_slack_cursors_and_outbox_dedupe_and_status_transitions():
             "run_id": "run-1",
         },
     )
-    assert _query(
+    remaining_drafts = _query(
         service,
         {
             "action": "query_pending_slack_outbox",
             "project_id": project_id,
             "statuses": ["draft"],
         },
-    )["outbox"] == []
+    )["outbox"]
+    assert [row["outbox_id"] for row in remaining_drafts] == [channel_outbox_id]
 
     _handle(
         service,
@@ -521,9 +607,74 @@ def test_slack_cursors_and_outbox_dedupe_and_status_transitions():
     assert config["collection_cursors"][0]["conversation_id"] == "C123"
 
 
-def test_slack_state_round_trips_through_ladybugdb(tmp_path: Path):
-    db_path = tmp_path / "slack.lbug"
-    repository = LadybugProjectRepository(db_path)
+@pytest.mark.parametrize(
+    ("message", "error_match"),
+    [
+        (
+            {
+                "target_type": "dm",
+                "resource_id": "resource-ada",
+                "slack_channel_id": "C123",
+                "body": "Missing user target.",
+                "content_hash": "sha256:missing-user",
+                "created_at": _iso(14),
+            },
+            "slack_user_id is required for dm outbox messages",
+        ),
+        (
+            {
+                "target_type": "dm",
+                "resource_id": "resource-ada",
+                "slack_user_id": "U123",
+                "slack_channel_id": "C123",
+                "body": "Ambiguous target.",
+                "content_hash": "sha256:ambiguous-dm",
+                "created_at": _iso(14),
+            },
+            "slack_channel_id is not accepted for dm outbox messages",
+        ),
+        (
+            {
+                "target_type": "channel",
+                "slack_user_id": "U123",
+                "body": "Missing channel target.",
+                "content_hash": "sha256:missing-channel",
+                "created_at": _iso(14),
+            },
+            "slack_channel_id is required for channel outbox messages",
+        ),
+        (
+            {
+                "target_type": "channel",
+                "slack_channel_id": "C123",
+                "slack_user_id": "U123",
+                "body": "Ambiguous target.",
+                "content_hash": "sha256:ambiguous-channel",
+                "created_at": _iso(14),
+            },
+            "slack_user_id is not accepted for channel outbox messages",
+        ),
+    ],
+)
+def test_slack_outbox_message_targets_are_exact_dm_or_channel_forms(
+    message: dict[str, Any],
+    error_match: str,
+):
+    with pytest.raises(ValueError, match=error_match):
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "create_slack_outbox_messages",
+                    "project_id": "project-slack",
+                    "messages": [message],
+                }
+            }
+        )
+
+
+def test_slack_state_round_trips_through_sqlite(tmp_path: Path):
+    db_path = tmp_path / "slack.sqlite"
+    repository = SQLiteProjectRepository(db_path)
     service = ProjectService(repository)
     project_id = _create_project(service)
     resource_id = _create_resource(service, project_id)
@@ -628,8 +779,8 @@ def test_slack_state_round_trips_through_ladybugdb(tmp_path: Path):
         },
     )
 
-    _close(repository)
-    reopened = LadybugProjectRepository(db_path)
+    repository.close()
+    reopened = SQLiteProjectRepository(db_path)
     try:
         reopened_service = ProjectService(reopened)
         config = _query(
@@ -660,9 +811,524 @@ def test_slack_state_round_trips_through_ladybugdb(tmp_path: Path):
             {"action": "query_pending_slack_outbox", "project_id": project_id},
         )["outbox"]
         assert [row["outbox_id"] for row in outbox] == [outbox_id]
-        assert outbox[0]["content_hash"] == "sha256:abc"
+        assert outbox[0]["content_hash"] == (
+            "sha256:"
+            + hashlib.sha256(b"Edited durable status update.").hexdigest()
+        )
         assert outbox[0]["body"] == "Edited durable status update."
         assert outbox[0]["generated_body"] == "Generated status request."
         assert outbox[0]["edited_at"] == _json_iso(14, 3)
     finally:
-        _close(reopened)
+        reopened.close()
+
+
+def test_pm_communication_protocol_tracks_assignment_review_evidence():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    resource_id = _create_resource(service, project_id)
+    _handle(
+        service,
+        {
+            "action": "set_resource_slack_user",
+            "project_id": project_id,
+            "resource_id": resource_id,
+            "slack_user_id": "U123",
+            "display_name": "Ada",
+            "updated_at": _iso(14),
+        },
+    )
+
+    protocol = _query(
+        service,
+        {
+            "action": "query_pm_communication_protocol",
+            "project_id": project_id,
+            "as_of": _iso(20),
+            "now": _iso(20),
+            "resource_schedule_backend": "greedy",
+        },
+    )
+
+    resource_row = protocol["resource_processes"][0]
+    obligation = protocol["obligations"][0]
+    assert resource_row["resource_id"] == resource_id
+    assert resource_row["assignment_count"] == 0
+    assert resource_row["message_artifact"]["artifact_kind"] == (
+        "resource_assignment_list"
+    )
+    assert resource_row["message_artifact"]["rendered_by"] == (
+        "query_pm_communication_protocol"
+    )
+    assert "no current or upcoming process work" in resource_row["message_markdown"]
+    assert resource_row["message_blocks"][0]["type"] == "header"
+    assert obligation["evidence_type"] == "resource_assignment_review"
+    assert obligation["due"] is True
+    assert obligation["message_artifact"]["content_hash"] == (
+        resource_row["assignment_content_hash"]
+    )
+
+    outbox_ids = _handle(
+        service,
+        {
+            "action": "create_slack_outbox_messages",
+            "project_id": project_id,
+            "messages": [
+                {
+                    "resource_id": resource_id,
+                    "slack_user_id": "U123",
+                    "body": "You currently have no assigned processes.",
+                    "content_hash": "sha256:test-assignment-review",
+                    "created_at": _iso(20),
+                    "pm_evidence_claims": [
+                        {
+                            "evidence_type": "resource_assignment_review",
+                            "resource_id": resource_id,
+                            "obligation_id": obligation["obligation_id"],
+                            "content_hash": obligation["content_hash"],
+                        }
+                    ],
+                }
+            ],
+        },
+    ).entity_ids["created_outbox_ids"]
+    outbox_id = outbox_ids[0]
+
+    failed = service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "record_pm_communication_evidence",
+                    "project_id": project_id,
+                    "evidence_type": "resource_assignment_review",
+                    "resource_id": resource_id,
+                    "outbox_id": outbox_id,
+                    "obligation_id": obligation["obligation_id"],
+                    "content_hash": obligation["content_hash"],
+                    "communicated_at": _iso(20),
+                }
+            }
+        )
+    )
+    assert failed.ok is False
+    assert failed.error.code == "pm_evidence_requires_sent_outbox"
+
+    _handle(
+        service,
+        {
+            "action": "mark_slack_outbox_sent",
+            "project_id": project_id,
+            "outbox_id": outbox_id,
+            "sent_at": _iso(20),
+            "slack_channel_id": "D123",
+            "slack_message_ts": "1715600000.000200",
+        },
+    )
+    wrong_claim = service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "record_pm_communication_evidence",
+                    "project_id": project_id,
+                    "evidence_type": "message_receipt_ack",
+                    "outbox_id": outbox_id,
+                    "communicated_at": _iso(20),
+                }
+            }
+        )
+    )
+    assert wrong_claim.ok is False
+    assert wrong_claim.error.code == "pm_evidence_claim_not_on_outbox"
+
+    _handle(
+        service,
+        {
+            "action": "record_pm_communication_evidence",
+            "project_id": project_id,
+            "evidence_type": "resource_assignment_review",
+            "resource_id": resource_id,
+            "outbox_id": outbox_id,
+            "obligation_id": obligation["obligation_id"],
+            "content_hash": obligation["content_hash"],
+            "communicated_at": _iso(20),
+        },
+    )
+
+    refreshed = _query(
+        service,
+        {
+            "action": "query_pm_communication_protocol",
+            "project_id": project_id,
+            "as_of": _iso(20),
+            "now": _iso(21),
+            "resource_schedule_backend": "greedy",
+        },
+    )
+    assert refreshed["obligations"][0]["due"] is False
+    assert refreshed["evidence"][0]["outbox_id"] == outbox_id
+
+
+def test_pm_evidence_requires_real_sent_slack_outbox_and_recurring_outbox_rows():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    resource_id = _create_resource(service, project_id)
+    _handle(
+        service,
+        {
+            "action": "set_resource_slack_user",
+            "project_id": project_id,
+            "resource_id": resource_id,
+            "slack_user_id": "U123",
+            "display_name": "Ada",
+            "updated_at": _iso(14),
+        },
+    )
+    protocol = _query(
+        service,
+        {
+            "action": "query_pm_communication_protocol",
+            "project_id": project_id,
+            "as_of": _iso(20),
+            "now": _iso(20),
+            "resource_schedule_backend": "greedy",
+        },
+    )
+    obligation = protocol["obligations"][0]
+    created = _handle(
+        service,
+        {
+            "action": "create_slack_outbox_messages",
+            "project_id": project_id,
+            "messages": [
+                {
+                    "resource_id": resource_id,
+                    "slack_user_id": "U123",
+                    "body": "Please review your assignment list.",
+                    "content_hash": "sha256:repeat",
+                    "status": "sent",
+                    "created_at": _iso(20),
+                    "pm_evidence_claims": [
+                        {
+                            "evidence_type": "resource_assignment_review",
+                            "resource_id": resource_id,
+                            "obligation_id": obligation["obligation_id"],
+                            "content_hash": obligation["content_hash"],
+                        }
+                    ],
+                }
+            ],
+        },
+    ).entity_ids["created_outbox_ids"][0]
+    draft = _query(
+        service,
+        {
+            "action": "query_slack_outbox",
+            "project_id": project_id,
+            "statuses": ["draft"],
+        },
+    )["outbox"][0]
+    assert draft["outbox_id"] == created
+    assert draft["status"] == "draft"
+
+    not_sent = service.handle_command(
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "record_pm_communication_evidence",
+                    "project_id": project_id,
+                    "evidence_type": "resource_assignment_review",
+                    "resource_id": resource_id,
+                    "outbox_id": created,
+                    "obligation_id": obligation["obligation_id"],
+                    "content_hash": obligation["content_hash"],
+                    "communicated_at": _iso(20),
+                }
+            }
+        )
+    )
+    assert not_sent.ok is False
+    assert not_sent.error.code == "pm_evidence_requires_sent_outbox"
+
+    _handle(
+        service,
+        {
+            "action": "mark_slack_outbox_sent",
+            "project_id": project_id,
+            "outbox_id": created,
+            "sent_at": _iso(20),
+            "slack_channel_id": "D123",
+            "slack_message_ts": "1715600000.000500",
+        },
+    )
+    repeated = _handle(
+        service,
+        {
+            "action": "create_slack_outbox_messages",
+            "project_id": project_id,
+            "messages": [
+                {
+                    "resource_id": resource_id,
+                    "slack_user_id": "U123",
+                    "body": "Please review your assignment list.",
+                    "content_hash": "sha256:repeat",
+                    "created_at": _iso(21),
+                    "pm_evidence_claims": [
+                        {
+                            "evidence_type": "resource_assignment_review",
+                            "resource_id": resource_id,
+                            "obligation_id": obligation["obligation_id"],
+                            "content_hash": obligation["content_hash"],
+                        }
+                    ],
+                }
+            ],
+        },
+    ).entity_ids
+    assert repeated["matched_outbox_ids"] == []
+    assert repeated["skipped_outbox_ids"] == []
+    assert repeated["created_outbox_ids"] != [created]
+
+
+def test_pm_communication_protocol_requires_process_update_evidence_pair():
+    repo = InMemoryProjectRepository()
+    service = ProjectService(repo)
+    project_id = _create_project(service)
+    resource_id = _create_resource(service, project_id)
+    role_id = repo.role_ids_by_project[project_id][0]
+    _handle(
+        service,
+        {
+            "action": "set_resource_slack_user",
+            "project_id": project_id,
+            "resource_id": resource_id,
+            "slack_user_id": "U123",
+            "display_name": "Ada",
+            "updated_at": _iso(20),
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-a",
+            "name": "Task A",
+            "description": "Acceptance checklist is complete.",
+            "effective_at": _iso(20),
+            "earliest_start_at": _iso(22),
+            "role_requirements": [
+                {
+                    "role_id": role_id,
+                    "effort_hours": 8,
+                }
+            ],
+        },
+    )
+
+    protocol = _query(
+        service,
+        {
+            "action": "query_pm_communication_protocol",
+            "project_id": project_id,
+            "as_of": _iso(21),
+            "now": _iso(21),
+            "resource_schedule_backend": "greedy",
+        },
+    )
+    obligation = next(
+        item
+        for item in protocol["obligations"]
+        if item["evidence_type"] == "process_pre_start_3_day"
+    )
+    process_symbol = obligation["process_symbol"]
+    process_hash = obligation["content_hash"]
+    resource_row = protocol["resource_processes"][0]
+    process_row = resource_row["assigned_processes"][0]
+    assert process_row["message_artifact"]["artifact_kind"] == "process_full_update"
+    assert process_row["message_artifact"]["rendered_by"] == (
+        "query_pm_communication_protocol"
+    )
+    assert "Task A" in process_row["message_blocks"][0]["text"]["text"]
+    assert "Acceptance checklist is complete." in process_row["message_markdown"]
+    assert obligation["message_artifact"]["content_hash"] == process_hash
+
+    pre_start_only_id = _handle(
+        service,
+        {
+            "action": "create_slack_outbox_messages",
+            "project_id": project_id,
+            "messages": [
+                {
+                    "resource_id": resource_id,
+                    "slack_user_id": "U123",
+                    "body": "Task A starts soon.",
+                    "content_hash": "sha256:body-pre-start-only",
+                    "created_at": _iso(21),
+                    "pm_evidence_claims": [
+                        {
+                            "evidence_type": "process_pre_start_3_day",
+                            "resource_id": resource_id,
+                            "process_id": "process-a",
+                            "process_symbol": process_symbol,
+                            "obligation_id": obligation["obligation_id"],
+                            "content_hash": process_hash,
+                        }
+                    ],
+                }
+            ],
+        },
+    ).entity_ids["created_outbox_ids"][0]
+    _handle(
+        service,
+        {
+            "action": "mark_slack_outbox_sent",
+            "project_id": project_id,
+            "outbox_id": pre_start_only_id,
+            "sent_at": _iso(21),
+            "slack_channel_id": "D123",
+            "slack_message_ts": "1715600000.000300",
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "record_pm_communication_evidence",
+            "project_id": project_id,
+            "evidence_type": "process_pre_start_3_day",
+            "resource_id": resource_id,
+            "process_id": "process-a",
+            "process_symbol": process_symbol,
+            "outbox_id": pre_start_only_id,
+            "obligation_id": obligation["obligation_id"],
+            "content_hash": process_hash,
+            "communicated_at": _iso(21),
+        },
+    )
+
+    still_due = _query(
+        service,
+        {
+            "action": "query_pm_communication_protocol",
+            "project_id": project_id,
+            "as_of": _iso(21),
+            "now": _iso(21),
+            "resource_schedule_backend": "greedy",
+        },
+    )
+    refreshed_obligation = next(
+        item
+        for item in still_due["obligations"]
+        if item["obligation_id"] == obligation["obligation_id"]
+    )
+    assert refreshed_obligation["due"] is True
+
+    full_update_id = _handle(
+        service,
+        {
+            "action": "create_slack_outbox_messages",
+            "project_id": project_id,
+            "messages": [
+                {
+                    "resource_id": resource_id,
+                    "slack_user_id": "U123",
+                    "body": "Task A starts soon with the full details.",
+                    "content_hash": "sha256:body-pre-start-full",
+                    "created_at": _iso(21, 10),
+                    "pm_evidence_claims": [
+                        {
+                            "evidence_type": "process_pre_start_3_day",
+                            "resource_id": resource_id,
+                            "process_id": "process-a",
+                            "process_symbol": process_symbol,
+                            "obligation_id": obligation["obligation_id"],
+                            "content_hash": process_hash,
+                        },
+                        {
+                            "evidence_type": "process_full_update",
+                            "resource_id": resource_id,
+                            "process_id": "process-a",
+                            "process_symbol": process_symbol,
+                            "obligation_id": obligation["obligation_id"],
+                            "content_hash": process_hash,
+                        },
+                    ],
+                }
+            ],
+        },
+    ).entity_ids["created_outbox_ids"][0]
+    _handle(
+        service,
+        {
+            "action": "mark_slack_outbox_sent",
+            "project_id": project_id,
+            "outbox_id": full_update_id,
+            "sent_at": _iso(21, 10),
+            "slack_channel_id": "D123",
+            "slack_message_ts": "1715600000.000400",
+        },
+    )
+    for evidence_type in ("process_pre_start_3_day", "process_full_update"):
+        _handle(
+            service,
+            {
+                "action": "record_pm_communication_evidence",
+                "project_id": project_id,
+                "evidence_type": evidence_type,
+                "resource_id": resource_id,
+                "process_id": "process-a",
+                "process_symbol": process_symbol,
+                "outbox_id": full_update_id,
+                "obligation_id": obligation["obligation_id"],
+                "content_hash": process_hash,
+                "communicated_at": _iso(21, 10),
+            },
+        )
+
+    satisfied = _query(
+        service,
+        {
+            "action": "query_pm_communication_protocol",
+            "project_id": project_id,
+            "as_of": _iso(21),
+            "now": _iso(21, 11),
+            "resource_schedule_backend": "greedy",
+        },
+    )
+    satisfied_obligation = next(
+        item
+        for item in satisfied["obligations"]
+        if item["obligation_id"] == obligation["obligation_id"]
+    )
+    assert satisfied_obligation["due"] is False
+
+    repo.record_pm_communication_evidence(
+        PMCommunicationEvidenceRecord(
+            evidence_id="evidence-stale-hash",
+            project_id=project_id,
+            evidence_type=PMCommunicationEvidenceType.PROCESS_FULL_UPDATE,
+            resource_id=resource_id,
+            slack_user_id="U123",
+            process_id="process-a",
+            process_symbol=process_symbol,
+            obligation_id=obligation["obligation_id"],
+            outbox_id=full_update_id,
+            content_hash="sha256:stale",
+            communicated_at=_at(21, 11),
+            created_at=_at(21, 11),
+        )
+    )
+    still_satisfied = _query(
+        service,
+        {
+            "action": "query_pm_communication_protocol",
+            "project_id": project_id,
+            "as_of": _iso(21),
+            "now": _iso(21, 12),
+            "resource_schedule_backend": "greedy",
+        },
+    )
+    still_satisfied_obligation = next(
+        item
+        for item in still_satisfied["obligations"]
+        if item["obligation_id"] == obligation["obligation_id"]
+    )
+    assert still_satisfied_obligation["due"] is False

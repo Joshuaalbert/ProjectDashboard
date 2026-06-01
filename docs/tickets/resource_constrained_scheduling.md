@@ -21,7 +21,8 @@ defined by role effort hours and resource capacity, not target-date facts.
 ## Scheduling Requirements
 
 - `start_at` roots the project.
-- `started_at` pins a process start so `ES == LS == started_at`.
+- Process-role pins anchor actual process starts and forecast or verify
+  process-role finishes.
 - `earliest_start_at` remains a not-before constraint.
 - Calendar windows are local to each calendar timezone.
 - Resource holidays use the resource calendar timezone.

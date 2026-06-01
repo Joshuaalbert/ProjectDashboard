@@ -101,9 +101,9 @@ For each source, extract:
 - Blockers and blocker resolutions.
 - Earliest-start constraints.
 - Assumption changes that should be recorded in revision notes.
-- Explicit or inferred resource staking commitments, where named teammates have
-  committed to a process or role capacity would otherwise overstate who can do
-  the work.
+- Explicit or inferred process-role pins and finish forecasts, where named
+  teammates have committed to a process-role or role capacity would otherwise
+  overstate who can do the work.
 - Milestone definitions or changes: named subsets of process symbols whose
   completion/slippage should be tracked independently from the whole project.
 
@@ -135,20 +135,51 @@ management state, not as a historical summary. Read `continuity_note.json`,
 mapping files, and the current timestamp before deciding whether to draft
 messages. Even when no new Slack messages were collected, use the continuity
 expectations and current time to decide whether a check-in is now due.
+Before deciding messages, directly answer each of the 18 PM checklist points and
+store those answers in the structured continuity note. Use those answers as the
+rationale for draft/no-message decisions so a reviewer can see why the decision
+was made.
 
 Every Slack run must write a fresh continuity note through
-`update_slack_continuity_note`. The note should be concise but operational:
-expected replies, expected status changes, expected timescales, who owns each
-expectation, whether follow-up should be DM or channel-visible, and what the next
-run should verify. Keep teammate messages short and focused; prefer frequent
-small follow-ups over broad status dumps.
+`update_slack_continuity_note`. The note must be structured JSON. It must
+contain exactly one theory-of-mind entry per mapped teammate, one team-level
+theory-of-mind entry, exactly one assessment entry for each PM checklist point
+1 through 18, and next-run focus items. The teammate entries should capture what
+they have been told, what they likely know, what they likely do not know, what
+they may be confused about, what they have been asked to do, and when the next
+response or action is expected. The team entry should capture shared
+understanding, shared unknowns, context requests from channels, alignment needs,
+and team-level expected actions. Keep teammate messages short and focused;
+prefer frequent small follow-ups over broad status dumps.
+
+Every teammate theory-of-mind entry, the team theory-of-mind entry, and every
+PM checklist assessment must include evidence recency: the last evidence
+timestamp, a brief note describing that evidence, whether the evidence is stale,
+when it becomes stale without an update, and how to refresh it. When evidence is
+stale, route the refresh through a direct DM for teammate-specific facts or the
+team-wide project channel for shared context, coordination, and alignment facts.
+Use the precomputed `pm_assessment_inputs` evidence recency hints when available,
+but update the continuity note with the judgment you actually used.
 
 For teammate DMs, focus on what changed for that resource or their roles,
 current blockers by priority, work that should be active now, upcoming work, and
 definitions of done for in-progress items. Ask whether anything is blocked,
 resolved, uncaptured, incorrectly assigned, or estimated poorly. For channel
 messages, use visibility deliberately: cross-resource coordination, repeated DM
-non-response, milestone risk, critical-path uncertainty, or team-wide decisions.
+non-response, milestone risk, schedule-sensitive uncertainty, or team-wide
+decisions.
+Assume teammates do not have access to ProjDash, the dashboard, graph views, or
+scheduling calculations. Translate internal findings into plain project context:
+the task, what you currently understand, why it matters, the relevant date or
+time window, and the specific confirmation, correction, estimate, blocker update,
+or next action you need. Do not mention graph/node, ES/EF, LS/LF, slack,
+schedule buffer, sensitivity, critical path, schedule snapshots,
+resource-aware schedules, process ids, role ids, blocker ids, or similar
+internal terms in teammate-facing messages. Use planned start, planned finish,
+schedule window, schedule buffer, and makespan sensitivity only in internal
+assessments when needed. When setting expectations, include the done definition
+when known, define any known blocker in plain words, and periodically verify
+started status for work that should already be underway.
 
 Return the exact JSON shape the runner requested. Include no-message decisions
 for mapped teammates who do not need a message, and always include the
@@ -162,7 +193,8 @@ materially different risk. Collapse a subgraph when its nodes are too fine to
 manage separately and the replacement can conserve role effort meaningfully.
 
 Use dependencies only for real precedence constraints. Do not encode priority,
-preference, due dates, or blocked state as dependencies.
+preference, or due dates as dependencies. Blockers are represented only through
+their resolver processes and blocker references.
 
 Use whole-number role effort hours as the scheduling input. Do not invent
 process due dates, project due dates, horizons, or unallocated work concepts.
@@ -193,11 +225,19 @@ Use aliases when people refer to the same process by different names. Preserve
 old symbols as aliases after renames when a note or conversation may still use
 the old label.
 
-Stake resources to a process when evidence says named teammates have committed
-or when a role assignment hides scarce expertise. Staked resources are a hard
-resource-aware scheduling constraint before cup filling. When multiple resources
-are staked to one process, make sure the communication plan reflects the
-coordination cost and shared done definition.
+Record resource focus as process-role pins when evidence says a named teammate
+is working on a process-role and has given a forecasted finish. Started state is
+derived from the pin's `pinned_at`; the forecast finish is used directly during
+planning. Use `upsert_process_role_pin` to create or correct a pin and
+`delete_process_role_pin` to remove an incorrect pin. Do not use process status
+edits as the source of truth for starts.
+
+A pin is not proof of done. Done requires explicit resource verification, which
+sets the process-role to `pinned_finished` with `verified_done_at`. When done is
+confirmed for a process, marking the process done derives the finished time from
+verified pins when present and still respects unfinished-parent guards. When
+multiple resources are pinned on one process, make sure the communication plan
+reflects the coordination cost and shared done definition.
 
 ## Slippage and Calibration
 
@@ -233,12 +273,12 @@ also asked to reconcile notes.
 
 Report:
 
-- P0 work: processes past `LF`.
-- P1 work: processes past `LS`.
-- P2 work: processes inside the `ES` to `LS` work window.
-- P3 watchlist: upcoming processes before `ES`.
+- P0 work: processes past planned finish.
+- P1 work: processes past planned start.
+- P2 work: processes starting within the near planning window.
+- P3 watchlist: later upcoming processes.
 - Current blockers, blocker owners if known, and the next unblock action.
-- Critical path processes and inferred durations.
+- Makespan-sensitive processes, inferred durations, and estimate uncertainty.
 - Active milestone slippage and the likely reason for movement.
 - Role-prioritized and resource-prioritized work.
 - Resource or role utilization pressure.
@@ -248,13 +288,13 @@ Report:
 
 For active project management, explicitly check:
 
-- Work that should already be started or done, especially items past `LS` or
-  `LF`.
-- Critical-path items starting soon, starting today, or estimated with weak
+- Work that should already be started or done, especially items past planned
+  start or planned finish.
+- Makespan-sensitive items starting soon, starting today, or estimated with weak
   confidence.
-- Critical-path work involving multiple roles or resources.
-- High-slack work that may reveal missing dependencies or false slack.
-- Whether each teammate has a clear current/staked assignment and whether their
+- Makespan-sensitive work involving multiple roles or resources.
+- High-buffer work that may reveal missing dependencies or false flexibility.
+- Whether each teammate has a clear current/focused assignment and whether their
   actual work is fully represented in the graph.
 - New blockers, resolved blockers, holidays, calendar exceptions, recurring
   capacity changes, and definitions of done that need team buy-in.
@@ -280,8 +320,9 @@ Validate after each logical batch:
   new, materially revised, or uncertain.
 - Resource calendars recur and holidays are in the calendar timezone.
 - Blockers are represented as blockers, not as schedule delays.
-- Started processes have pinned starts.
-- Done processes have finished timestamps.
+- Started processes have process-role pin evidence.
+- Done processes have explicit done evidence and finished timestamps derived
+  from verified pins when present.
 
 Commit with `commit_project_state` only after the current reconciled state is
 intentional. Use the commit note to cite reconciled source filenames and the

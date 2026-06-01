@@ -95,83 +95,6 @@ def test_upsert_process_revision_respects_process_symbol_identity():
     assert graph["nodes"][0]["description"] == "Updated definition of design completion"
 
 
-def test_staked_resource_ids_pin_resource_schedule_allocation():
-    service = ProjectService(InMemoryProjectRepository())
-    project_id = _create_project(service)
-    role_id = _handle(
-        service,
-        {
-            "action": "create_role",
-            "project_id": project_id,
-            "role_id": "role-engineer",
-            "name": "Engineer",
-        },
-    )["role_id"]
-    calendar_id = _handle(
-        service,
-        {
-            "action": "upsert_resource_calendar",
-            "project_id": project_id,
-            "calendar_id": "calendar-utc",
-            "name": "UTC Weekdays",
-            "timezone": "UTC",
-            "weekly_windows": _weekday_windows(),
-        },
-    )["calendar_id"]
-    for resource_id, name in (
-        ("resource-ada", "Ada"),
-        ("resource-grace", "Grace"),
-    ):
-        _handle(
-            service,
-            {
-                "action": "upsert_resource",
-                "project_id": project_id,
-                "resource_id": resource_id,
-                "name": name,
-                "role_ids": [role_id],
-                "calendar_id": calendar_id,
-                "available_from_at": _iso(13, 9),
-                "cost_rate": "100",
-                "cost_unit": "hour",
-            },
-        )
-    _handle(
-        service,
-        {
-            "action": "upsert_process_revision",
-            "project_id": project_id,
-            "process_id": "process-build",
-            "name": "Build",
-            "effective_at": _iso(13, 9),
-            "duration_business_days": 1,
-            "role_requirements": [
-                {
-                    "requirement_id": "req-build",
-                    "role_id": role_id,
-                    "effort_hours": 8,
-                }
-            ],
-            "staked_resource_ids": ["resource-grace"],
-        },
-    )
-
-    schedule = _query(
-        service,
-        {
-            "action": "query_resource_schedule",
-            "project_id": project_id,
-            "as_of": _iso(13, 9),
-            "now": _iso(13, 9),
-            "include_allocation_slices": True,
-        },
-    )
-
-    assert {
-        slice_["resource_id"] for slice_ in schedule["allocation_slices"]
-    } == {"resource-grace"}
-
-
 def test_upsert_process_revision_auto_generates_unique_symbol_from_name():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)
@@ -618,15 +541,17 @@ def test_process_graph_dependency_only_contract_includes_cpm_status_and_blockers
         "started_at",
         "finished_at",
         "computed_status",
+        "required_roles",
+        "role_requirements",
         "blocker_summary",
         "dependency_only",
         "resource_aware",
         "work_now_window",
         "late_risk_window",
     }
-    assert build["status"] == "planned"
+    assert build["status"] == "waiting"
     assert build["description"] == ""
-    assert build["computed_status"] == "blocked"
+    assert build["computed_status"] == "waiting"
     assert build["blocker_summary"] == {
         "unresolved_count": 1,
         "blocking_count": 1,
@@ -701,6 +626,10 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
         "ready_at",
         "starts_at",
         "ends_at",
+        "schedule_window_starts_at",
+        "schedule_window_ends_at",
+        "schedule_buffer_hours",
+        "schedule_elapsed_hours",
         "es_at",
         "ef_at",
         "ls_at",
@@ -709,6 +638,9 @@ def test_process_graph_resource_aware_contract_keeps_allocations_out_of_edges():
         "resource_delay_hours",
         "slack_hours",
         "criticality_label",
+        "role_sensitivity",
+        "max_makespan_sensitivity_hours",
+        "sensitivity_label",
         "allocation_state",
         "allocation_diagnostic",
     }
@@ -799,14 +731,14 @@ def test_process_graph_resource_aware_status_uses_role_effort_windows():
     )
     node = next(item for item in graph["nodes"] if item["process_id"] == process_id)
 
-    assert node["dependency_only"]["ls_at"] == _iso(13, 9)
+    assert node["dependency_only"]["ls_at"] == _iso(13, 12)
     assert node["resource_aware"]["ls_at"] == _iso(13, 13)
     assert node["resource_aware"]["lf_at"] == _iso(14, 21)
     assert node["computed_status"] == "ready"
     assert node["late_risk_window"]["active"] is False
 
 
-def test_blockers_mark_process_without_changing_resource_schedule():
+def test_blockers_add_resolver_dependency_without_special_resource_exclusion():
     service = ProjectService(InMemoryProjectRepository())
     ids = _seed_resource_project(service)
     query = {
@@ -841,9 +773,7 @@ def test_blockers_mark_process_without_changing_resource_schedule():
             "planning_granularity": "hour",
         },
     )
-    baseline_row = next(
-        row for row in baseline["processes"] if row["process_id"] == ids["build_id"]
-    )
+    assert any(row["process_id"] == ids["build_id"] for row in baseline["processes"])
     blocked_row = next(
         row
         for row in blocked_schedule["processes"]
@@ -853,16 +783,28 @@ def test_blockers_mark_process_without_changing_resource_schedule():
         node for node in graph["nodes"] if node["process_id"] == ids["build_id"]
     )
 
+    baseline_row = next(
+        row
+        for row in baseline["processes"]
+        if row["process_id"] == ids["build_id"]
+    )
+
     assert blocked_row["allocation_state"] == "complete"
     assert blocked_row["starts_at"] == baseline_row["starts_at"]
     assert blocked_row["ends_at"] == baseline_row["ends_at"]
-    assert blocked_row["inferred_duration_hours"] == (
-        baseline_row["inferred_duration_hours"]
+    assert blocked_node["blocker_summary"]["blocking_count"] == 1
+    assert blocked_node["resource_aware"]["allocation_state"] == "complete"
+    assert any(
+        node["process_symbol"].startswith("resolve-waiting-on-decision")
+        and node["process_type"] == "blocker"
+        for node in graph["nodes"]
     )
-    assert blocked_node["computed_status"] == "blocked"
-    assert blocked_node["resource_aware"]["inferred_duration_hours"] == (
-        baseline_row["inferred_duration_hours"]
+    resolver_node = next(
+        node
+        for node in graph["nodes"]
+        if node["process_symbol"].startswith("resolve-waiting-on-decision")
     )
+    assert resolver_node["description"].startswith("Resolve blocker: Waiting on decision")
 
 
 def test_resource_schedule_without_public_horizon_extends_to_required_work():
@@ -915,7 +857,7 @@ def test_resource_schedule_without_public_horizon_extends_to_required_work():
             "role_ids": [design_id, lead_id],
             "calendar_id": calendar_id,
             "available_from_at": "2026-05-14T13:42:00+00:00",
-            "cost_rate": "0",
+            "cost_rate": "100",
             "cost_unit": "hour",
             "cost_currency": "USD",
         },
@@ -930,8 +872,7 @@ def test_resource_schedule_without_public_horizon_extends_to_required_work():
             "effective_at": "2026-05-14T13:42:00+00:00",
             "duration_business_days": 1,
             "role_requirements": [
-                {"role_id": design_id, "effort_hours": 2},
-                {"role_id": lead_id, "effort_hours": 1},
+                {"role_id": design_id, "effort_hours": 3},
             ],
         },
     )["process_id"]
@@ -946,8 +887,7 @@ def test_resource_schedule_without_public_horizon_extends_to_required_work():
             "duration_business_days": 1,
             "dependencies": [first_id],
             "role_requirements": [
-                {"role_id": design_id, "effort_hours": 30},
-                {"role_id": lead_id, "effort_hours": 10},
+                {"role_id": design_id, "effort_hours": 40},
             ],
         },
     )["process_id"]
@@ -975,7 +915,7 @@ def test_resource_schedule_without_public_horizon_extends_to_required_work():
 
     rows = {row["process_id"]: row for row in schedule["processes"]}
     assert rows[second_id]["allocation_state"] == "complete"
-    assert rows[second_id]["starts_at"] > rows[first_id]["ends_at"]
+    assert rows[second_id]["starts_at"] >= rows[first_id]["ends_at"]
     assert rows[second_id]["ends_at"] is not None
     assert rows[second_id]["inferred_duration_hours"] == 40
     second_node = next(
@@ -983,6 +923,53 @@ def test_resource_schedule_without_public_horizon_extends_to_required_work():
     )
     assert second_node["resource_aware"]["allocation_state"] == "complete"
     assert second_node["resource_aware"]["inferred_duration_hours"] == 40
+
+    utilization = _query(
+        service,
+        {
+            "action": "query_utilization",
+            "project_id": project_id,
+            "as_of": "2026-05-14T15:06:00+00:00",
+            "now": "2026-05-14T15:06:00+00:00",
+            "planning_granularity": "hour",
+        },
+    )
+    costs = _query(
+        service,
+        {
+            "action": "query_costs",
+            "project_id": project_id,
+            "as_of": "2026-05-14T15:06:00+00:00",
+            "now": "2026-05-14T15:06:00+00:00",
+            "currency": "USD",
+            "group_by": ["time"],
+        },
+    )
+    committed = _handle(
+        service,
+        {
+            "action": "commit_project_state",
+            "project_id": project_id,
+            "committed_at": "2026-05-14T15:06:00+00:00",
+            "terminal_process_symbols": ["2nd-step"],
+        },
+    )
+    snapshots = _query(
+        service,
+        {
+            "action": "query_schedule_snapshots",
+            "project_id": project_id,
+            "as_of": "2026-05-14T15:07:00+00:00",
+            "terminal_process_symbols": ["2nd-step"],
+        },
+    )
+
+    assert utilization["time_series"]
+    assert utilization["time_series"][-1]["ends_at"] >= rows[second_id]["ends_at"]
+    assert costs["time_series"]
+    assert Decimal(costs["total_cost"]) > 0
+    assert costs["time_series"][-1]["ends_at"] >= rows[second_id]["ends_at"]
+    assert committed["schedule_snapshot_id"] == snapshots["snapshots"][0]["snapshot_id"]
 
 
 def test_resource_schedule_capacity_and_utilization_contracts():
@@ -1034,6 +1021,13 @@ def test_resource_schedule_capacity_and_utilization_contracts():
         "resource_ls_at",
         "resource_lf_at",
         "resource_slack_hours",
+        "schedule_window_starts_at",
+        "schedule_window_ends_at",
+        "schedule_buffer_hours",
+        "schedule_elapsed_hours",
+        "role_sensitivity",
+        "max_makespan_sensitivity_hours",
+        "sensitivity_label",
         "inferred_duration_hours",
         "resource_delay_hours",
         "allocation_state",
@@ -1102,10 +1096,12 @@ def test_resource_schedule_capacity_and_utilization_contracts():
         "time_series",
         "overallocated_buckets",
     }
-    assert utilization["by_resource"][0]["resource_id"] == (
-        ids["engineer_resource_id"]
-    )
-    assert utilization["by_role"][0]["role_id"] == ids["engineer_id"]
+    utilization_by_resource = {
+        row["resource_id"]: row for row in utilization["by_resource"]
+    }
+    utilization_by_role = {row["role_id"]: row for row in utilization["by_role"]}
+    assert ids["engineer_resource_id"] in utilization_by_resource
+    assert ids["engineer_id"] in utilization_by_role
     assert utilization["overallocated_buckets"] == []
 
 
@@ -1674,6 +1670,13 @@ def test_cost_queries_cover_filters_grouping_and_totals():
     assert project_costs["total_cost"] == "1500.00"
     assert project_costs["by_resource"] == [
         {
+            "resource_id": "res_josh",
+            "cost_unit": "hour",
+            "allocated_hours": 1,
+            "currency": "USD",
+            "cost_amount": "0.00",
+        },
+        {
             "resource_id": ids["engineer_resource_id"],
             "cost_unit": "hour",
             "allocated_hours": 12,
@@ -2077,10 +2080,10 @@ def test_cost_time_series_uses_requested_cross_product_dimensions():
     assert len(bucket_keys) == len(set(bucket_keys))
     assert {
         bucket["resource_id"] for bucket in resource_process_costs["time_series"]
-    } == {ids["engineer_resource_id"]}
+    } == {"res_josh", ids["engineer_resource_id"]}
     assert {
         bucket["process_id"] for bucket in resource_process_costs["time_series"]
-    } == {ids["design_id"], ids["build_id"]}
+    } == {ids["design_id"], ids["build_id"], ids["brand_id"]}
     assert {
         bucket["role_id"] for bucket in resource_process_costs["time_series"]
     } == {None}
@@ -2106,6 +2109,12 @@ def test_cost_time_series_uses_requested_cross_product_dimensions():
             "allocated_hours": 12,
             "currency": "USD",
             "cost_amount": "1500.00",
+        },
+        {
+            "role_id": "role_res_josh",
+            "allocated_hours": 1,
+            "currency": "USD",
+            "cost_amount": "0.00",
         }
     ]
     assert role_time_costs["time_series"]
@@ -2113,9 +2122,10 @@ def test_cost_time_series_uses_requested_cross_product_dimensions():
         _assert_cost_bucket_shape(bucket)
         assert bucket["resource_id"] is None
         assert bucket["process_id"] is None
-        assert bucket["role_id"] == ids["engineer_id"]
+        assert bucket["role_id"] in {ids["engineer_id"], "role_res_josh"}
     assert {bucket["role_id"] for bucket in role_time_costs["time_series"]} == {
-        ids["engineer_id"]
+        ids["engineer_id"],
+        "role_res_josh",
     }
     _assert_cost_buckets_sum_to_total(role_time_costs)
 
@@ -2134,9 +2144,23 @@ def test_cost_time_series_uses_requested_cross_product_dimensions():
     assert full_cross_product_costs["time_series"]
     for bucket in full_cross_product_costs["time_series"]:
         _assert_cost_bucket_shape(bucket)
-        assert bucket["resource_id"] == ids["engineer_resource_id"]
-        assert bucket["process_id"] in {ids["design_id"], ids["build_id"]}
-        assert bucket["role_id"] == ids["engineer_id"]
+        assert (
+            bucket["resource_id"],
+            bucket["process_id"],
+            bucket["role_id"],
+        ) in {
+            (
+                ids["engineer_resource_id"],
+                ids["design_id"],
+                ids["engineer_id"],
+            ),
+            (
+                ids["engineer_resource_id"],
+                ids["build_id"],
+                ids["engineer_id"],
+            ),
+            ("res_josh", ids["brand_id"], "role_res_josh"),
+        }
     full_bucket_keys = [
         (
             bucket["resource_id"],
@@ -2447,7 +2471,7 @@ def test_target_history_query_is_removed_from_resource_contract():
         )
 
 
-def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
+def test_completedness_uses_ready_state_with_timezone_aware_as_of():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)
     process_id = _handle(
@@ -2488,11 +2512,11 @@ def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
     work_node = next(
         node for node in work_now["nodes"] if node["process_id"] == process_id
     )
-    assert work_node["computed_status"] == "work_now"
+    assert work_node["computed_status"] == "ready"
     assert work_node["work_now_window"] == {
         "starts_at": work_node["dependency_only"]["es_at"],
         "ends_at": work_node["dependency_only"]["ls_at"],
-        "active": True,
+        "active": False,
     }
     assert work_node["late_risk_window"]["active"] is False
 
@@ -2509,11 +2533,11 @@ def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
     late_node = next(
         node for node in late_risk["nodes"] if node["process_id"] == process_id
     )
-    assert late_node["computed_status"] == "late_risk"
+    assert late_node["computed_status"] == "ready"
     assert late_node["late_risk_window"] == {
         "starts_at": late_node["dependency_only"]["ls_at"],
         "ends_at": late_node["dependency_only"]["lf_at"],
-        "active": True,
+        "active": False,
     }
 
     boundary = _at(13, 9, NYC).isoformat()
@@ -2537,7 +2561,7 @@ def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
     assert zero_slack_node["dependency_only"]["es_at"] == (
         zero_slack_node["dependency_only"]["ls_at"]
     )
-    assert zero_slack_node["computed_status"] == "late_risk"
+    assert zero_slack_node["computed_status"] == "ready"
     assert zero_slack_node["work_now_window"] == {
         "starts_at": zero_slack_node["dependency_only"]["es_at"],
         "ends_at": zero_slack_node["dependency_only"]["ls_at"],
@@ -2546,7 +2570,7 @@ def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
     assert zero_slack_node["late_risk_window"] == {
         "starts_at": zero_slack_node["dependency_only"]["ls_at"],
         "ends_at": zero_slack_node["dependency_only"]["lf_at"],
-        "active": True,
+        "active": False,
     }
 
     zero_slack_after_boundary = _query(
@@ -2564,5 +2588,5 @@ def test_work_now_and_late_risk_use_es_ls_with_timezone_aware_as_of():
         for node in zero_slack_after_boundary["nodes"]
         if node["process_id"] == zero_slack_id
     )
-    assert after_boundary_node["computed_status"] == "late_risk"
-    assert after_boundary_node["late_risk_window"]["active"] is True
+    assert after_boundary_node["computed_status"] == "ready"
+    assert after_boundary_node["late_risk_window"]["active"] is False

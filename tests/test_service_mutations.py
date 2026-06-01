@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from projdash.service.commands import BatchCommandEnvelope, CommandEnvelope
+from projdash.service.models import ComputedStatus
 from projdash.service.queries import QueryEnvelope
 from projdash.service.repository import InMemoryProjectRepository
 from projdash.service.service import ProjectService
@@ -19,6 +20,38 @@ def _at(day: int, hour: int = 9) -> dt.datetime:
 
 def _iso(day: int, hour: int = 9) -> str:
     return _at(day, hour).isoformat()
+
+
+def _expected_role_requirement(
+    requirement_id: str,
+    *,
+    effort_hours: int,
+    role_id: str = "role-engineer",
+    required_resource_count: int = 1,
+) -> dict[str, object]:
+    return {
+        "requirement_id": requirement_id,
+        "role_id": role_id,
+        "effort_hours": effort_hours,
+        "pin_status": "planned",
+        "active_pinned_resource_ids": [],
+        "recent_pinned_resource_ids": [],
+        "pins": [],
+        "required_resource_count": required_resource_count,
+        "allocation_policy": "split_allowed",
+        "min_allocation_hours_per_day": None,
+        "max_allocation_hours_per_day": None,
+    }
+
+
+def _expected_default_josh_requirement(process_id: str) -> dict[str, object]:
+    return {
+        **_expected_role_requirement(
+            f"{process_id}-role_res_josh",
+            effort_hours=1,
+        ),
+        "role_id": "role_res_josh",
+    }
 
 
 def _weekday_windows() -> list[dict[str, object]]:
@@ -135,12 +168,173 @@ def _seed_linear_graph(service: ProjectService) -> tuple[str, str, str, str]:
     return project_id, design_id, build_id, ship_id
 
 
+def _add_verified_pin_for_process(
+    service: ProjectService,
+    *,
+    project_id: str,
+    process_id: str,
+    requirement_id: str,
+    pinned_at: str,
+    verified_at: str,
+) -> None:
+    role_id = f"role-{requirement_id}"
+    calendar_id = f"calendar-{requirement_id}"
+    resource_id = f"resource-{requirement_id}"
+    for command in (
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": role_id,
+            "name": f"Engineer {requirement_id}",
+        },
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": calendar_id,
+            "name": f"Default {requirement_id}",
+            "timezone": "UTC",
+            "weekly_windows": _weekday_windows(),
+        },
+        {
+            "action": "upsert_resource",
+            "project_id": project_id,
+            "resource_id": resource_id,
+            "name": f"Ada {requirement_id}",
+            "role_ids": [role_id],
+            "calendar_id": calendar_id,
+            "available_from_at": _iso(13),
+            "cost_rate": "100",
+            "cost_unit": "hour",
+        },
+    ):
+        result = _handle(service, command)
+        assert result.ok is True
+    result = _handle(
+        service,
+        {
+            "action": "batch_update_process_graph",
+            "project_id": project_id,
+            "edit_at": pinned_at,
+            "operations": [
+                {
+                    "action": "add_role_requirement",
+                    "process_id": process_id,
+                    "requirement": {
+                        "requirement_id": requirement_id,
+                        "role_id": role_id,
+                        "effort_hours": 1,
+                    },
+                }
+            ],
+        },
+    )
+    assert result.ok is True
+    result = _handle(
+        service,
+        {
+            "action": "upsert_process_role_pin",
+            "project_id": project_id,
+            "pin_id": f"pin-{requirement_id}",
+            "process_id": process_id,
+            "requirement_id": requirement_id,
+            "role_id": role_id,
+            "resource_id": resource_id,
+            "pinned_at": pinned_at,
+            "forecast_finish_at": verified_at,
+            "status": "pinned_finished",
+            "verified_done_at": verified_at,
+            "updated_at": verified_at,
+        },
+    )
+    assert result.ok is True
+
+
+def _add_started_pin_for_process(
+    service: ProjectService,
+    *,
+    project_id: str,
+    process_id: str,
+    requirement_id: str,
+    pinned_at: str,
+    forecast_at: str,
+) -> None:
+    role_id = f"role-{requirement_id}"
+    calendar_id = f"calendar-{requirement_id}"
+    resource_id = f"resource-{requirement_id}"
+    for command in (
+        {
+            "action": "create_role",
+            "project_id": project_id,
+            "role_id": role_id,
+            "name": f"Engineer {requirement_id}",
+        },
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": calendar_id,
+            "name": f"Default {requirement_id}",
+            "timezone": "UTC",
+            "weekly_windows": _weekday_windows(),
+        },
+        {
+            "action": "upsert_resource",
+            "project_id": project_id,
+            "resource_id": resource_id,
+            "name": f"Ada {requirement_id}",
+            "role_ids": [role_id],
+            "calendar_id": calendar_id,
+            "available_from_at": _iso(13),
+            "cost_rate": "100",
+            "cost_unit": "hour",
+        },
+    ):
+        result = _handle(service, command)
+        assert result.ok is True
+    result = _handle(
+        service,
+        {
+            "action": "batch_update_process_graph",
+            "project_id": project_id,
+            "edit_at": pinned_at,
+            "operations": [
+                {
+                    "action": "add_role_requirement",
+                    "process_id": process_id,
+                    "requirement": {
+                        "requirement_id": requirement_id,
+                        "role_id": role_id,
+                        "effort_hours": 1,
+                    },
+                }
+            ],
+        },
+    )
+    assert result.ok is True
+    result = _handle(
+        service,
+        {
+            "action": "upsert_process_role_pin",
+            "project_id": project_id,
+            "pin_id": f"pin-{requirement_id}",
+            "process_id": process_id,
+            "requirement_id": requirement_id,
+            "role_id": role_id,
+            "resource_id": resource_id,
+            "pinned_at": pinned_at,
+            "forecast_finish_at": forecast_at,
+            "updated_at": pinned_at,
+        },
+    )
+    assert result.ok is True
+
+
 def _process_graph(
     service: ProjectService,
     project_id: str,
     *,
     day: int,
     hour: int = 10,
+    include_resource_fields: bool = False,
 ) -> dict[str, object]:
     return _query(
         service,
@@ -149,6 +343,7 @@ def _process_graph(
             "project_id": project_id,
             "as_of": _iso(day, hour),
             "now": _iso(day, hour),
+            "include_resource_fields": include_resource_fields,
         },
     ).data
 
@@ -194,6 +389,16 @@ class NonTransactionalRepository:
     ):
         self.create_project_calls += 1
         raise AssertionError("create_project should not be called")
+
+
+class ReplaceCountingRepository(InMemoryProjectRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.replace_call_count = 0
+
+    def replace_with(self, other):
+        self.replace_call_count += 1
+        return super().replace_with(other)
 
 
 def test_first_time_command_without_transactional_staging_fails_without_write():
@@ -315,6 +520,62 @@ def test_failed_mixed_batch_rolls_back_staged_success_without_reporting_ids():
     assert standalone.entity_ids["project_id"] in repository.projects
 
 
+def test_successful_batch_commits_with_one_repository_replacement():
+    repository = ReplaceCountingRepository()
+    service = ProjectService(repository)
+
+    results = _handle_batch(
+        service,
+        [
+            {
+                "action": "create_project",
+                "project_id": "project-batch-one",
+                "name": "Batch One",
+                "start_at": _iso(13),
+            },
+            {
+                "action": "create_project",
+                "project_id": "project-batch-two",
+                "name": "Batch Two",
+                "start_at": _iso(13),
+            },
+        ],
+    )
+
+    assert [result.ok for result in results] == [True, True]
+    assert repository.replace_call_count == 1
+    assert set(repository.projects) == {"project-batch-one", "project-batch-two"}
+
+
+def test_failed_batch_commits_with_zero_repository_replacements():
+    repository = ReplaceCountingRepository()
+    service = ProjectService(repository)
+
+    results = _handle_batch(
+        service,
+        [
+            {
+                "action": "create_project",
+                "project_id": "project-rolled-back",
+                "name": "Rolled Back",
+                "start_at": _iso(13),
+            },
+            {
+                "action": "create_role",
+                "project_id": "missing-project",
+                "name": "Engineer",
+            },
+        ],
+    )
+
+    assert [result.error.code for result in results] == [
+        "batch_rolled_back",
+        "project_not_found",
+    ]
+    assert repository.replace_call_count == 0
+    assert repository.projects == {}
+
+
 def test_failed_first_time_upsert_process_revision_is_atomic_and_replayable():
     repository = InMemoryProjectRepository()
     service = ProjectService(repository)
@@ -415,7 +676,15 @@ def test_target_datetime_commands_queries_and_fields_are_not_part_of_contract():
 
 def test_process_lifecycle_status_transitions_and_finished_at_semantics():
     service = ProjectService(InMemoryProjectRepository())
-    project_id, _, process_id, _ = _seed_linear_graph(service)
+    project_id, process_id, _, _ = _seed_linear_graph(service)
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=process_id,
+        requirement_id="req-lifecycle",
+        pinned_at=_iso(15, 12),
+        verified_at=_iso(15, 16),
+    )
 
     done = _handle(
         service,
@@ -451,7 +720,6 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
             "process_id": process_id,
             "status": "done",
             "edit_at": _iso(16, 12),
-            "finished_at": _iso(15, 15),
         },
     )
     explicit_done_graph = _query(
@@ -493,28 +761,6 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
     reopened_node = next(
         node for node in reopened_graph["nodes"] if node["process_id"] == process_id
     )
-    non_done_finished_at = _handle(
-        service,
-        {
-            "action": "set_process_status",
-            "project_id": project_id,
-            "process_id": process_id,
-            "status": "in_progress",
-            "edit_at": _iso(17, 11),
-            "finished_at": _iso(17, 10),
-        },
-    )
-    cancel_non_done_finished_at = _handle(
-        service,
-        {
-            "action": "set_process_status",
-            "project_id": project_id,
-            "process_id": process_id,
-            "status": "canceled",
-            "edit_at": _iso(17, 12),
-            "finished_at": _iso(17, 10),
-        },
-    )
     final_done = _handle(
         service,
         {
@@ -523,7 +769,6 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
             "process_id": process_id,
             "status": "done",
             "edit_at": _iso(17, 14),
-            "finished_at": _iso(17, 13),
         },
     )
     canceled_done = _handle(
@@ -552,29 +797,25 @@ def test_process_lifecycle_status_transitions_and_finished_at_semantics():
     assert explicit_done.entity_ids["lifecycle_event_id"]
     assert reopened.entity_ids["lifecycle_event_id"]
     assert final_done.entity_ids["lifecycle_event_id"]
-    assert canceled_done.entity_ids["lifecycle_event_id"]
-    assert inferred_done_node["status"] == "done"
+    assert canceled_done.ok is False
+    assert canceled_done.error.code == "process_state_not_stored"
+    assert inferred_done_node["status"] == "finished"
     assert inferred_done_node["finished_at"] == _iso(15, 16)
-    assert explicit_done_node["status"] == "done"
-    assert explicit_done_node["finished_at"] == _iso(15, 15)
-    assert reopened_node["status"] == "in_progress"
-    assert reopened_node["finished_at"] is None
-    assert non_done_finished_at.ok is False
-    assert non_done_finished_at.error.code == "validation_error"
-    assert cancel_non_done_finished_at.ok is False
-    assert cancel_non_done_finished_at.error.code == "validation_error"
-    assert node["status"] == "canceled"
-    assert node["finished_at"] == _iso(17, 13)
+    assert explicit_done_node["status"] == "finished"
+    assert explicit_done_node["finished_at"] == _iso(15, 16)
+    assert reopened_node["status"] == "finished"
+    assert reopened_node["computed_status"] == "finished"
+    assert reopened_node["finished_at"] == _iso(15, 16)
+    assert node["status"] == "finished"
+    assert node["finished_at"] == _iso(15, 16)
     assert "ends_at" not in node
     assert node["resource_aware"]["ends_at"] is not None
     assert node["finished_at"] == node["resource_aware"]["ends_at"]
 
 
-def test_started_process_anchors_dependency_schedule_windows():
+def test_started_status_requires_started_process_role_pin():
     service = ProjectService(InMemoryProjectRepository())
     project_id, _design_id, build_id, _ship_id = _seed_linear_graph(service)
-    started_at = _iso(14, 11)
-
     started = _handle(
         service,
         {
@@ -583,7 +824,6 @@ def test_started_process_anchors_dependency_schedule_windows():
             "process_id": build_id,
             "status": "in_progress",
             "edit_at": _iso(14, 12),
-            "started_at": started_at,
         },
     )
     graph = _query(
@@ -597,12 +837,409 @@ def test_started_process_anchors_dependency_schedule_windows():
     ).data
     node = next(node for node in graph["nodes"] if node["process_id"] == build_id)
 
-    assert started.ok is True
-    assert node["status"] == "in_progress"
-    assert node["started_at"] == started_at
-    assert node["dependency_only"]["es_at"] == started_at
-    assert node["dependency_only"]["ls_at"] == started_at
-    assert node["dependency_only"]["slack_hours"] == 0
+    assert started.ok is False
+    assert started.error.code == "started_requires_process_role_pin"
+    assert node["status"] == "waiting"
+    assert node["started_at"] is None
+
+
+def test_completedness_allowed_states_are_exact():
+    assert {status.value for status in ComputedStatus} == {
+        "waiting",
+        "early_start",
+        "ready",
+        "started",
+        "due",
+        "finished",
+    }
+
+
+def test_completedness_ready_and_pin_time_derivations():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    parent_id = _create_process(service, project_id, name="Finished Parent")
+    child_id = _create_process(
+        service,
+        project_id,
+        name="Ready Child",
+        dependencies=[parent_id],
+    )
+    started_id = _create_process(service, project_id, name="Pinned Started")
+    finished_id = _create_process(service, project_id, name="Pinned Finished")
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=parent_id,
+        requirement_id="req-parent",
+        pinned_at=_iso(14, 9),
+        verified_at=_iso(14, 10),
+    )
+    _add_started_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=started_id,
+        requirement_id="req-start",
+        pinned_at=_iso(16, 8),
+        forecast_at=_iso(16, 16),
+    )
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=finished_id,
+        requirement_id="req-finish",
+        pinned_at=_iso(15, 8),
+        verified_at=_iso(15, 11),
+    )
+
+    nodes = {
+        node["process_id"]: node
+        for node in _process_graph(service, project_id, day=16, hour=17)["nodes"]
+    }
+
+    assert nodes[child_id]["computed_status"] == "ready"
+    assert nodes[child_id]["started_at"] is None
+    assert nodes[started_id]["computed_status"] == "started"
+    assert nodes[started_id]["started_at"] == _iso(16, 8)
+    assert nodes[finished_id]["computed_status"] == "finished"
+    assert nodes[finished_id]["started_at"] == _iso(15, 8)
+    assert nodes[finished_id]["finished_at"] == _iso(15, 11)
+
+
+def test_delete_process_removes_successor_dependencies_and_process_facts():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, design_id, build_id, ship_id = _seed_linear_graph(service)
+
+    deleted = _handle(
+        service,
+        {
+            "action": "delete_process",
+            "project_id": project_id,
+            "process_id": build_id,
+            "edit_at": _iso(14, 12),
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(14, 13),
+            "now": _iso(14, 13),
+            "include_resource_fields": True,
+        },
+    ).data
+
+    assert deleted.ok is True
+    assert deleted.entity_ids["process_id"] == build_id
+    assert deleted.entity_ids["removed_dependency_count"] == 2
+    assert build_id not in _node_ids(graph)
+    assert _edge_pairs(graph) == set()
+    assert service._repository.revisions_by_process.get(build_id) is None
+    assert all(
+        build_id not in revision.dependencies
+        for revisions in service._repository.revisions_by_process.values()
+        for revision in revisions
+    )
+    assert design_id in _node_ids(graph)
+    assert ship_id in _node_ids(graph)
+
+
+def test_delete_blocked_process_deletes_orphan_blocker_and_resolver_process():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    process_id = _create_process(service, project_id, name="Build")
+    blocker = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": process_id,
+            "blocker_id": "blocker-vendor-access",
+            "summary": "Vendor access",
+            "created_at": _iso(14, 9),
+        },
+    )
+    resolver_process_id = blocker.entity_ids["resolver_process_id"]
+
+    deleted = _handle(
+        service,
+        {
+            "action": "delete_process",
+            "project_id": project_id,
+            "process_id": process_id,
+            "edit_at": _iso(14, 12),
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(14, 13),
+            "now": _iso(14, 13),
+            "include_resource_fields": True,
+        },
+    ).data
+    blockers = _query(
+        service,
+        {
+            "action": "query_blockers",
+            "project_id": project_id,
+            "as_of": _iso(14, 13),
+            "include_resolved": True,
+        },
+    ).data
+
+    assert deleted.ok is True
+    assert deleted.entity_ids["deleted_blocker_ids"] == ["blocker-vendor-access"]
+    assert resolver_process_id in deleted.entity_ids["deleted_process_ids"]
+    assert process_id not in _node_ids(graph)
+    assert resolver_process_id not in _node_ids(graph)
+    assert blockers["blockers"] == []
+    assert blockers["blocked_process_ids"] == []
+
+
+def test_process_without_role_requirements_gets_default_josh_process_role():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    process_id = _create_process(service, project_id, name="Clarify ownership")
+
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(14, 13),
+            "now": _iso(14, 13),
+            "include_resource_fields": True,
+        },
+    ).data
+    node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
+
+    assert service._repository.roles["role_res_josh"]["name"] == "Josh"
+    assert node["role_requirements"] == [
+        _expected_default_josh_requirement(process_id)
+    ]
+
+
+def test_process_with_multiple_role_requirements_is_rejected_without_write():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    for role_id, name in (("role-ops", "Ops"), ("role-eng", "Engineering")):
+        assert _handle(
+            service,
+            {
+                "action": "create_role",
+                "project_id": project_id,
+                "role_id": role_id,
+                "name": name,
+            },
+        ).ok
+
+    result = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-multi-role",
+            "name": "Multi role work",
+            "effective_at": _iso(13),
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-ops",
+                    "role_id": "role-ops",
+                    "effort_hours": 2,
+                },
+                {
+                    "requirement_id": "req-eng",
+                    "role_id": "role-eng",
+                    "effort_hours": 6,
+                },
+            ],
+        },
+    )
+
+    assert result.ok is False
+    assert result.error.code == "process_role_requirement_count_invalid"
+    assert "process-multi-role" not in service._repository.processes
+
+
+def test_orphan_blocker_resolver_process_is_rejected_at_commit():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+
+    result = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "resolve-orphan",
+            "process_type": "blocker",
+            "name": "Resolve orphan",
+            "description": "Resolve blocker: orphan",
+            "effective_at": _iso(14, 9),
+            "duration_business_days": 0,
+        },
+    )
+
+    assert result.ok is False
+    assert result.error.code == "orphaned_blocker_resolver_process"
+
+
+def test_blocker_resolver_dependency_cannot_be_shared_with_another_process():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    first_id = _create_process(service, project_id, name="First blocked")
+    second_id = _create_process(service, project_id, name="Second blocked")
+    blocker = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": first_id,
+            "blocker_id": "blocker-shared-vendor",
+            "summary": "Shared vendor access",
+            "created_at": _iso(14, 9),
+        },
+    )
+    resolver_process_id = blocker.entity_ids["resolver_process_id"]
+    shared = _handle(
+        service,
+        {
+            "action": "batch_update_process_graph",
+            "project_id": project_id,
+            "edit_at": _iso(14, 10),
+            "operations": [
+                {
+                    "action": "add_dependency",
+                    "predecessor_process_id": resolver_process_id,
+                    "successor_process_id": second_id,
+                }
+            ],
+        },
+    )
+
+    deleted = _handle(
+        service,
+        {
+            "action": "delete_process",
+            "project_id": project_id,
+            "process_id": first_id,
+            "edit_at": _iso(14, 12),
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(14, 13),
+            "now": _iso(14, 13),
+            "include_resource_fields": True,
+        },
+    ).data
+    blockers = _query(
+        service,
+        {
+            "action": "query_blockers",
+            "project_id": project_id,
+            "as_of": _iso(14, 13),
+        },
+    ).data
+
+    assert deleted.ok is True
+    assert shared.ok is False
+    assert shared.error.code == "validation_error"
+    assert shared.error.validation_errors[0].type == (
+        "blocker_resolver_dependency_shared"
+    )
+    assert deleted.entity_ids["deleted_blocker_ids"] == ["blocker-shared-vendor"]
+    assert resolver_process_id in deleted.entity_ids["deleted_process_ids"]
+    assert first_id not in _node_ids(graph)
+    assert resolver_process_id not in _node_ids(graph)
+    assert (resolver_process_id, second_id) not in _edge_pairs(graph)
+    assert blockers["blockers"] == []
+    assert blockers["blocked_process_ids"] == []
+
+
+def test_backdated_revision_rejects_future_effective_dependency_cycle():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    core_id = _create_process(service, project_id, name="Core")
+    data_id = _create_process(
+        service,
+        project_id,
+        name="Data",
+        dependencies=[core_id],
+    )
+    snapshot_id = _create_process(service, project_id, name="Snapshot")
+    _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": core_id,
+            "name": "Core",
+            "effective_at": _iso(16, 9),
+            "duration_business_days": 1,
+            "dependencies": [snapshot_id],
+        },
+    )
+
+    rejected = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": snapshot_id,
+            "name": "Snapshot",
+            "effective_at": _iso(15, 9),
+            "duration_business_days": 1,
+            "dependencies": [data_id],
+        },
+    )
+    graph = _process_graph(service, project_id, day=16, hour=10)
+
+    assert rejected.ok is False
+    assert rejected.error.code == "dependency_cycle"
+    assert rejected.error.details["as_of"] == _iso(16, 9)
+    assert _edge_pairs(graph) == {(snapshot_id, core_id), (core_id, data_id)}
+
+
+def test_backdated_revision_does_not_override_later_effective_revision():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    process_id = _create_process(service, project_id, name="Initial")
+    later = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": process_id,
+            "name": "Later Plan",
+            "effective_at": _iso(16, 9),
+            "duration_business_days": 2,
+        },
+    )
+    backdated = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": process_id,
+            "name": "Earlier Plan",
+            "effective_at": _iso(15, 9),
+            "duration_business_days": 1,
+        },
+    )
+
+    graph = _process_graph(service, project_id, day=16, hour=10)
+    node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
+
+    assert later.ok is True
+    assert backdated.ok is True
+    assert node["name"] == "Later Plan"
 
 
 def test_commit_project_state_records_slippage_points_by_terminal_scope():
@@ -618,7 +1255,7 @@ def test_commit_project_state_records_slippage_points_by_terminal_scope():
             "note": "Initial plan",
         },
     )
-    _handle(
+    lifecycle = _handle(
         service,
         {
             "action": "set_process_status",
@@ -626,7 +1263,6 @@ def test_commit_project_state_records_slippage_points_by_terminal_scope():
             "process_id": build_id,
             "status": "in_progress",
             "edit_at": _iso(14, 12),
-            "started_at": _iso(14, 11),
         },
     )
     second = _handle(
@@ -635,7 +1271,7 @@ def test_commit_project_state_records_slippage_points_by_terminal_scope():
             "action": "commit_project_state",
             "project_id": project_id,
             "committed_at": _iso(14, 12),
-            "note": "Build started late",
+                "note": "Build lifecycle edited",
         },
     )
     terminal = _handle(
@@ -666,16 +1302,18 @@ def test_commit_project_state_records_slippage_points_by_terminal_scope():
         },
     ).data["snapshots"]
 
+    assert lifecycle.ok is False
+    assert lifecycle.error.code == "started_requires_process_role_pin"
     assert first.ok is True
     assert second.ok is True
     assert terminal.ok is True
     assert [row["completion_at"] for row in project_snapshots] == [
-        _iso(13, 9),
-        _iso(14, 11),
+        _iso(13, 15),
+        _iso(14, 15),
     ]
     assert project_snapshots[0]["terminal_process_symbols"] == []
-    assert project_snapshots[1]["note"] == "Build started late"
-    assert build_snapshots[0]["completion_at"] == _iso(14, 11)
+    assert project_snapshots[1]["note"] == "Build lifecycle edited"
+    assert build_snapshots[0]["completion_at"] == _iso(14, 15)
     assert build_snapshots[0]["terminal_process_symbols"] == ["build"]
 
 
@@ -811,8 +1449,34 @@ def test_commit_project_state_extends_horizon_to_sparse_resource_capacity():
 
 def test_done_terminal_snapshot_uses_actual_finished_at():
     service = ProjectService(InMemoryProjectRepository())
-    project_id, _design_id, build_id, _ship_id = _seed_linear_graph(service)
-    _handle(
+    project_id, design_id, build_id, _ship_id = _seed_linear_graph(service)
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=design_id,
+        requirement_id="req-design-done",
+        pinned_at=_iso(14, 11),
+        verified_at=_iso(14, 13),
+    )
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=build_id,
+        requirement_id="req-build-done",
+        pinned_at=_iso(14, 13),
+        verified_at=_iso(14, 14),
+    )
+    design_done = _handle(
+        service,
+        {
+            "action": "set_process_status",
+            "project_id": project_id,
+            "process_id": design_id,
+            "status": "done",
+            "edit_at": _iso(14, 13),
+        },
+    )
+    build_done = _handle(
         service,
         {
             "action": "set_process_status",
@@ -820,7 +1484,6 @@ def test_done_terminal_snapshot_uses_actual_finished_at():
             "process_id": build_id,
             "status": "done",
             "edit_at": _iso(14, 15),
-            "finished_at": _iso(14, 14),
         },
     )
 
@@ -843,6 +1506,8 @@ def test_done_terminal_snapshot_uses_actual_finished_at():
         },
     ).data["snapshots"]
 
+    assert design_done.ok is True
+    assert build_done.ok is True
     assert result.ok is True
     assert snapshots[0]["completion_at"] == _iso(14, 14)
 
@@ -851,7 +1516,7 @@ def test_cancel_unfinished_process_preserves_null_finished_at_without_inference(
     service = ProjectService(InMemoryProjectRepository())
     project_id, _, process_id, _ = _seed_linear_graph(service)
 
-    _handle(
+    started = _handle(
         service,
         {
             "action": "set_process_status",
@@ -882,14 +1547,25 @@ def test_cancel_unfinished_process_preserves_null_finished_at_without_inference(
     ).data
     node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
 
-    assert canceled.entity_ids["lifecycle_event_id"]
-    assert node["status"] == "canceled"
+    assert started.ok is False
+    assert started.error.code == "started_requires_process_role_pin"
+    assert canceled.ok is False
+    assert canceled.error.code == "process_state_not_stored"
+    assert node["status"] == "waiting"
     assert node["finished_at"] is None
 
 
 def test_cancel_done_process_with_same_finished_at_is_accepted_and_preserved():
     service = ProjectService(InMemoryProjectRepository())
-    project_id, _, process_id, _ = _seed_linear_graph(service)
+    project_id, process_id, _, _ = _seed_linear_graph(service)
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=process_id,
+        requirement_id="req-cancel-same",
+        pinned_at=_iso(15, 12),
+        verified_at=_iso(15, 15),
+    )
 
     _handle(
         service,
@@ -899,7 +1575,6 @@ def test_cancel_done_process_with_same_finished_at_is_accepted_and_preserved():
             "process_id": process_id,
             "status": "done",
             "edit_at": _iso(15, 16),
-            "finished_at": _iso(15, 15),
         },
     )
     canceled = _handle(
@@ -910,22 +1585,29 @@ def test_cancel_done_process_with_same_finished_at_is_accepted_and_preserved():
             "process_id": process_id,
             "status": "canceled",
             "edit_at": _iso(16, 9),
-            "finished_at": _iso(15, 15),
         },
     )
     graph = _process_graph(service, project_id, day=16, hour=10)
     node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
 
-    assert canceled.ok is True
-    assert canceled.entity_ids["lifecycle_event_id"]
-    assert node["status"] == "canceled"
+    assert canceled.ok is False
+    assert canceled.error.code == "process_state_not_stored"
+    assert node["status"] == "finished"
     assert node["finished_at"] == _iso(15, 15)
 
 
 def test_cancel_done_process_with_different_finished_at_rejects_without_write():
     repository = InMemoryProjectRepository()
     service = ProjectService(repository)
-    project_id, _, process_id, _ = _seed_linear_graph(service)
+    project_id, process_id, _, _ = _seed_linear_graph(service)
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=process_id,
+        requirement_id="req-cancel-different",
+        pinned_at=_iso(15, 12),
+        verified_at=_iso(15, 15),
+    )
 
     _handle(
         service,
@@ -935,7 +1617,6 @@ def test_cancel_done_process_with_different_finished_at_rejects_without_write():
             "process_id": process_id,
             "status": "done",
             "edit_at": _iso(15, 16),
-            "finished_at": _iso(15, 15),
         },
     )
     before_rejection = _repository_snapshot(repository)
@@ -948,17 +1629,16 @@ def test_cancel_done_process_with_different_finished_at_rejects_without_write():
             "process_id": process_id,
             "status": "canceled",
             "edit_at": _iso(16, 9),
-            "finished_at": _iso(15, 14),
         },
     )
     graph = _process_graph(service, project_id, day=16, hour=10)
     node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
 
     assert rejected.ok is False
-    assert rejected.error.code == "validation_error"
+    assert rejected.error.code == "process_state_not_stored"
     assert rejected.warnings == []
     assert _repository_snapshot(repository) == before_rejection
-    assert node["status"] == "done"
+    assert node["status"] == "finished"
     assert node["finished_at"] == _iso(15, 15)
 
 
@@ -1028,6 +1708,181 @@ def test_blockers_add_resolve_derivation_and_resolved_history_retention():
     assert history["blockers"][0]["is_blocking_as_of"] is False
 
 
+def test_blocker_resolution_exact_role_scopes_cross_project_collision():
+    repository = InMemoryProjectRepository()
+    service = ProjectService(repository)
+    assert _handle(
+        service,
+        {
+            "action": "create_project",
+            "project_id": "project-a",
+            "name": "Project A",
+            "start_at": _iso(13),
+        },
+    ).ok
+    assert _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": "project-a",
+            "role_id": "role_res_scott",
+            "name": "Exact assignment: Other Scott",
+        },
+    ).ok
+    assert _handle(
+        service,
+        {
+            "action": "create_project",
+            "project_id": "project-b",
+            "name": "Project B",
+            "start_at": _iso(13),
+        },
+    ).ok
+    assert _handle(
+        service,
+        {
+            "action": "create_role",
+            "project_id": "project-b",
+            "role_id": "role-general",
+            "name": "General",
+        },
+    ).ok
+    assert _handle(
+        service,
+        {
+            "action": "upsert_resource_calendar",
+            "project_id": "project-b",
+            "calendar_id": "calendar-project-b",
+            "name": "Project B Calendar",
+            "timezone": "UTC",
+            "weekly_windows": _weekday_windows(),
+        },
+    ).ok
+    assert _handle(
+        service,
+        {
+            "action": "upsert_resource",
+            "project_id": "project-b",
+            "resource_id": "res_scott",
+            "name": "Scott",
+            "role_ids": ["role-general"],
+            "calendar_id": "calendar-project-b",
+            "available_from_at": _iso(13),
+            "cost_rate": "100",
+            "cost_unit": "hour",
+        },
+    ).ok
+    process_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": "project-b",
+            "process_id": "process-project-b",
+            "name": "Project B work",
+            "effective_at": _iso(13),
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-project-b",
+                    "role_id": "role-general",
+                    "effort_hours": 1,
+                }
+            ],
+        },
+    ).entity_ids["process_id"]
+    blocker_id = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": "project-b",
+            "process_id": process_id,
+            "blocker_id": "blocker-project-b",
+            "summary": "Need Scott",
+            "resolution_owner_resource_id": "res_scott",
+            "created_at": _iso(14),
+        },
+    ).entity_ids["blocker_id"]
+
+    resolved = _handle(
+        service,
+        {
+            "action": "resolve_blocker",
+            "project_id": "project-b",
+            "blocker_id": blocker_id,
+            "resolved_at": _iso(15),
+            "resolution": "Scott resolved it.",
+        },
+    )
+
+    assert resolved.ok is True
+    assert repository.roles["role_res_scott"]["project_id"] == "project-a"
+    assert repository.roles["role_PB_res_scott"]["project_id"] == "project-b"
+    assert "role_PB_res_scott" in repository.resources["res_scott"]["role_ids"]
+
+
+def test_add_blocker_requires_process_reference():
+    with pytest.raises(ValidationError):
+        CommandEnvelope.model_validate(
+            {
+                "command": {
+                    "action": "add_blocker",
+                    "project_id": "project-missing-reference",
+                    "blocker_id": "blocker-orphan",
+                    "summary": "Orphan blocker",
+                    "created_at": _iso(14, 9),
+                }
+            }
+        )
+
+
+def test_reusing_blocker_id_for_two_processes_is_rejected_without_write():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    build_id = _create_process(service, project_id, name="Build")
+    review_id = _create_process(service, project_id, name="Review")
+
+    first = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": build_id,
+            "blocker_id": "blocker-shared-id",
+            "summary": "Shared blocker id",
+            "created_at": _iso(14, 9),
+        },
+    )
+    second = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": review_id,
+            "blocker_id": "blocker-shared-id",
+            "summary": "Shared blocker id",
+            "created_at": _iso(14, 10),
+        },
+    )
+    blockers = _query(
+        service,
+        {
+            "action": "query_blockers",
+            "project_id": project_id,
+            "as_of": _iso(14, 11),
+        },
+    ).data
+
+    assert first.ok is True
+    assert second.ok is False
+    assert second.error.code == "blocker_process_reference_conflict"
+    assert second.error.details["existing_process_id"] == build_id
+    assert second.error.details["requested_process_id"] == review_id
+    assert blockers["blocked_process_ids"] == [build_id]
+    assert [blocker["blocker_id"] for blocker in blockers["blockers"]] == [
+        "blocker-shared-id"
+    ]
+
+
 def test_reopen_blocker_restores_unresolved_state():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)
@@ -1095,7 +1950,7 @@ def test_reopen_blocker_restores_unresolved_state():
 
 
 @pytest.mark.parametrize("severity", ["warning", "info"])
-def test_non_blocking_blocker_severities_do_not_derive_blocked_state(
+def test_legacy_blocker_severities_are_normalized_to_blockers(
     severity: str,
 ):
     service = ProjectService(InMemoryProjectRepository())
@@ -1126,45 +1981,120 @@ def test_non_blocking_blocker_severities_do_not_derive_blocked_state(
     graph = _process_graph(service, project_id, day=14, hour=12)
     node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
 
-    assert blockers["blocked_process_ids"] == []
-    assert blockers["blockers"][0]["severity"] == severity
+    assert blockers["blocked_process_ids"] == [process_id]
+    assert blockers["blockers"][0]["severity"] == "blocking"
     assert blockers["blockers"][0]["is_resolved_as_of"] is False
-    assert blockers["blockers"][0]["is_blocking_as_of"] is False
-    assert node["computed_status"] != "blocked"
+    assert blockers["blockers"][0]["is_blocking_as_of"] is True
+    assert node["blocker_summary"]["blocking_count"] == 1
 
 
-@pytest.mark.parametrize(
-    ("status", "expected_computed_status"),
-    [("done", "complete"), ("canceled", "canceled")],
-)
-def test_unresolved_blocking_blockers_do_not_block_done_or_canceled_processes(
-    status: str,
-    expected_computed_status: str,
-):
+def test_started_process_becomes_early_start_when_blocker_parent_is_added():
     service = ProjectService(InMemoryProjectRepository())
     project_id = _create_project(service)
-    process_id = _create_process(service, project_id, name=f"{status} Review")
+    process_id = _create_process(service, project_id, name="Started Build")
+    _add_started_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=process_id,
+        requirement_id="req-started-blocker",
+        pinned_at=_iso(14, 9),
+        forecast_at=_iso(14, 15),
+    )
 
-    _handle(
+    before = _process_graph(
+        service,
+        project_id,
+        day=14,
+        hour=10,
+        include_resource_fields=True,
+    )
+    blocker = _handle(
         service,
         {
             "action": "add_blocker",
             "project_id": project_id,
             "process_id": process_id,
-            "blocker_id": f"blocker-{status}",
+            "blocker_id": "blocker-late-approval",
+            "summary": "Late approval",
+            "created_at": _iso(14, 11),
+        },
+    )
+    after = _process_graph(
+        service,
+        project_id,
+        day=14,
+        hour=12,
+        include_resource_fields=True,
+    )
+    before_node = next(
+        node for node in before["nodes"] if node["process_id"] == process_id
+    )
+    after_node = next(
+        node for node in after["nodes"] if node["process_id"] == process_id
+    )
+    resolver_process_id = blocker.entity_ids["resolver_process_id"]
+
+    assert before_node["computed_status"] == "due"
+    assert after_node["computed_status"] == "early_start"
+    assert after_node["started_at"] == _iso(14, 9)
+    assert after_node["finished_at"] is None
+    assert after_node["blocker_summary"]["blocker_ids"] == ["blocker-late-approval"]
+    assert (resolver_process_id, process_id) in _edge_pairs(after)
+
+
+def test_unresolved_blocking_blocker_parent_prevents_done_until_resolved():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    process_id = _create_process(service, project_id, name="Done Review")
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=process_id,
+        requirement_id="req-blocked-done",
+        pinned_at=_iso(14, 9),
+        verified_at=_iso(14, 12),
+    )
+
+    blocker = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": process_id,
+            "blocker_id": "blocker-done",
             "summary": "External approval pending",
             "severity": "blocking",
             "created_at": _iso(14, 9),
         },
     )
-    _handle(
+    rejected = _handle(
         service,
         {
             "action": "set_process_status",
             "project_id": project_id,
             "process_id": process_id,
-            "status": status,
+            "status": "done",
             "edit_at": _iso(14, 10),
+        },
+    )
+    resolved = _handle(
+        service,
+        {
+            "action": "resolve_blocker",
+            "project_id": project_id,
+            "blocker_id": "blocker-done",
+            "resolved_at": _iso(14, 11),
+            "resolution": "Approval received.",
+        },
+    )
+    done = _handle(
+        service,
+        {
+            "action": "set_process_status",
+            "project_id": project_id,
+            "process_id": process_id,
+            "status": "done",
+            "edit_at": _iso(14, 12),
         },
     )
 
@@ -1179,12 +2109,16 @@ def test_unresolved_blocking_blockers_do_not_block_done_or_canceled_processes(
     graph = _process_graph(service, project_id, day=14, hour=12)
     node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
 
+    assert blocker.entity_ids["resolver_process_id"] == resolved.entity_ids[
+        "resolver_process_id"
+    ]
+    assert rejected.ok is False
+    assert rejected.error.code == "unfinished_parent_processes"
+    assert done.ok is True
     assert blockers["blocked_process_ids"] == []
-    assert blockers["blockers"][0]["blocker_id"] == f"blocker-{status}"
-    assert blockers["blockers"][0]["is_resolved_as_of"] is False
-    assert blockers["blockers"][0]["is_blocking_as_of"] is False
-    assert node["status"] == status
-    assert node["computed_status"] == expected_computed_status
+    assert blockers["blockers"] == []
+    assert node["status"] == "finished"
+    assert node["computed_status"] == "finished"
 
 
 def test_blocker_as_of_controls_created_and_resolved_effective_state():
@@ -1281,20 +2215,20 @@ def test_blocker_as_of_controls_created_and_resolved_effective_state():
 
     assert before_created["blockers"] == []
     assert before_created["blocked_process_ids"] == []
-    assert node_before_created["computed_status"] != "blocked"
+    assert node_before_created["blocker_summary"]["blocking_count"] == 0
     assert at_created["blocked_process_ids"] == [process_id]
     assert at_created["blockers"][0]["blocker_id"] == blocker_id
     assert at_created["blockers"][0]["is_resolved_as_of"] is False
     assert at_created["blockers"][0]["is_blocking_as_of"] is True
-    assert node_at_created["computed_status"] == "blocked"
+    assert node_at_created["blocker_summary"]["blocking_count"] == 1
     assert historical_unresolved["blocked_process_ids"] == [process_id]
     assert historical_unresolved["blockers"][0]["blocker_id"] == blocker_id
     assert historical_unresolved["blockers"][0]["is_resolved_as_of"] is False
     assert historical_unresolved["blockers"][0]["is_blocking_as_of"] is True
-    assert node_historical_unresolved["computed_status"] == "blocked"
+    assert node_historical_unresolved["blocker_summary"]["blocking_count"] == 1
     assert at_resolved["blockers"] == []
     assert at_resolved["blocked_process_ids"] == []
-    assert node_at_resolved["computed_status"] != "blocked"
+    assert node_at_resolved["blocker_summary"]["blocking_count"] == 0
     assert after_resolved["blockers"] == []
     assert after_resolved["blocked_process_ids"] == []
 
@@ -1646,7 +2580,7 @@ def test_rename_process_alias_uniqueness_resolution_and_retired_alias_visibility
             "action": "set_process_status",
             "project_id": project_id,
             "process_symbol": "design",
-            "status": "paused",
+            "status": "canceled",
             "edit_at": _iso(15, 10),
         },
     )
@@ -1656,7 +2590,7 @@ def test_rename_process_alias_uniqueness_resolution_and_retired_alias_visibility
             "action": "set_process_status",
             "project_id": project_id,
             "process_symbol": "arch",
-            "status": "paused",
+            "status": "canceled",
             "edit_at": _iso(15, 11),
         },
     )
@@ -1664,7 +2598,9 @@ def test_rename_process_alias_uniqueness_resolution_and_retired_alias_visibility
     assert rename.entity_ids["process_id"] == process_id
     assert collision.ok is False
     assert collision.error.code == "validation_error"
-    assert active_resolution.entity_ids["process_id"] != process_id
+    assert active_resolution.ok is False
+    assert active_resolution.error.code == "process_state_not_stored"
+    assert active_resolution.error.details["entity_id"] != process_id
     assert retired_alias.ok is False
     assert retired_alias.error.code in {"not_found", "ambiguous_process_symbol"}
 
@@ -1960,21 +2896,15 @@ def test_batch_role_requirement_coalescing_noops_replay_and_operation_results():
         "operations",
         1,
     ]
-    assert duplicate_conflict_node["role_requirements"] == []
+    assert duplicate_conflict_node["role_requirements"] == [
+        _expected_default_josh_requirement(process_id)
+    ]
     assert replay.entity_ids == first.entity_ids
     assert first.entity_ids["process_ids"] == [process_id]
     assert first.entity_ids["revision_ids"] == [final_revision_id]
     assert first.entity_ids["requirement_ids"] == ["req-eng"]
     assert after_first_node["role_requirements"] == [
-        {
-            "requirement_id": "req-eng",
-            "role_id": "role-engineer",
-            "effort_hours": 8,
-            "required_resource_count": 1,
-            "allocation_policy": "split_allowed",
-            "min_allocation_hours_per_day": None,
-            "max_allocation_hours_per_day": None,
-        }
+        _expected_role_requirement("req-eng", effort_hours=8)
     ]
     assert replay_node["role_requirements"] == after_first_node["role_requirements"]
     assert [entry["operation_id"] for entry in operation_results] == [
@@ -2115,15 +3045,7 @@ def test_batch_generated_operation_ids_are_stable_on_exact_command_replay():
     assert _repository_snapshot(repository) == snapshot_after_first
     assert _edge_pairs(graph_after_replay) == {(design_id, build_id)}
     assert build_node["role_requirements"] == [
-        {
-            "requirement_id": "req-build-eng-generated-op",
-            "role_id": "role-engineer",
-            "effort_hours": 8,
-            "required_resource_count": 1,
-            "allocation_policy": "split_allowed",
-            "min_allocation_hours_per_day": None,
-            "max_allocation_hours_per_day": None,
-        }
+        _expected_role_requirement("req-build-eng-generated-op", effort_hours=8)
     ]
 
 
@@ -2454,7 +3376,9 @@ def test_batch_reference_validation_precedes_cycle_validation_and_is_atomic():
         "resource",
     ]
     assert reference_error.error.validation_errors[0].loc[-1] == "calendar_id"
-    assert design_node["role_requirements"] == []
+    assert design_node["role_requirements"] == [
+        _expected_default_josh_requirement(design_id)
+    ]
     assert {edge["predecessor_process_id"] for edge in graph["edges"]} == {
         design_id,
         build_id,
@@ -2515,7 +3439,33 @@ def test_replace_process_with_subgraph_default_alias_and_edge_reconnects():
     repository = InMemoryProjectRepository()
     service = ProjectService(repository)
     project_id, design_id, build_id, ship_id = _seed_linear_graph(service)
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=design_id,
+        requirement_id="req-replace-design",
+        pinned_at=_iso(15, 4),
+        verified_at=_iso(15, 6),
+    )
+    _add_verified_pin_for_process(
+        service,
+        project_id=project_id,
+        process_id=build_id,
+        requirement_id="req-replace-build",
+        pinned_at=_iso(15, 6),
+        verified_at=_iso(15, 7),
+    )
 
+    _handle(
+        service,
+        {
+            "action": "set_process_status",
+            "project_id": project_id,
+            "process_id": design_id,
+            "status": "done",
+            "edit_at": _iso(15, 6),
+        },
+    )
     lifecycle = _handle(
         service,
         {
@@ -2524,7 +3474,6 @@ def test_replace_process_with_subgraph_default_alias_and_edge_reconnects():
             "process_id": build_id,
             "status": "done",
             "edit_at": _iso(15, 8),
-            "finished_at": _iso(15, 7),
         },
     )
     result = _handle(
@@ -2572,7 +3521,7 @@ def test_replace_process_with_subgraph_default_alias_and_edge_reconnects():
             "action": "set_process_status",
             "project_id": project_id,
             "process_symbol": "build",
-            "status": "paused",
+            "status": "canceled",
             "edit_at": _iso(15, 11),
         },
     )
@@ -2600,17 +3549,19 @@ def test_replace_process_with_subgraph_default_alias_and_edge_reconnects():
     assert next(node for node in active["nodes"] if node["process_id"] == child_id)[
         "description"
     ] == "Implement backend API surface"
-    assert historical_parent["status"] == "done"
+    assert historical_parent["status"] == "finished"
     assert historical_parent["finished_at"] == _iso(15, 7)
     assert retired_parent_projection["is_active"] is False
     assert retired_parent_projection["retired_at"] == _iso(15, 9)
-    assert retired_parent_projection["status"] == "done"
-    assert retired_parent_projection["finished_at"] == _iso(15, 7)
+    assert "status" not in retired_parent_projection
+    assert "finished_at" not in retired_parent_projection
     assert {
         (edge["predecessor_process_id"], edge["successor_process_id"])
         for edge in active["edges"]
     } == {(design_id, child_id), (child_id, ship_id)}
-    assert alias_update.entity_ids["process_id"] == child_id
+    assert alias_update.ok is False
+    assert alias_update.error.code == "process_state_not_stored"
+    assert alias_update.error.details["entity_id"] == child_id
 
 
 def test_replace_process_with_subgraph_explicit_target_and_disabled_alias():
@@ -2646,7 +3597,7 @@ def test_replace_process_with_subgraph_explicit_target_and_disabled_alias():
             "action": "set_process_status",
             "project_id": project_id,
             "process_symbol": "build",
-            "status": "in_progress",
+            "status": "canceled",
             "edit_at": _iso(15, 10),
         },
     )
@@ -2685,7 +3636,9 @@ def test_replace_process_with_subgraph_explicit_target_and_disabled_alias():
     assert explicit.entity_ids["alias_process_id"] == explicit.entity_ids[
         "process_ids"
     ][0]
-    assert alias_target.entity_ids["process_id"] == explicit.entity_ids[
+    assert alias_target.ok is False
+    assert alias_target.error.code == "process_state_not_stored"
+    assert alias_target.error.details["entity_id"] == explicit.entity_ids[
         "alias_process_id"
     ]
     assert "alias_process_id" not in disabled.entity_ids
@@ -3044,6 +3997,31 @@ def test_collapse_subgraph_soft_retires_unions_edges_and_merges_requirements():
     _handle(
         service,
         {
+            "action": "upsert_resource_calendar",
+            "project_id": project_id,
+            "calendar_id": "calendar-default",
+            "name": "Default",
+            "timezone": "UTC",
+            "weekly_windows": _weekday_windows(),
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "upsert_resource",
+            "project_id": project_id,
+            "resource_id": "resource-ada",
+            "name": "Ada",
+            "role_ids": ["role-engineer"],
+            "calendar_id": "calendar-default",
+            "available_from_at": _iso(13),
+            "cost_rate": "100",
+            "cost_unit": "hour",
+        },
+    )
+    _handle(
+        service,
+        {
             "action": "batch_update_process_graph",
             "project_id": project_id,
             "edit_at": _iso(14, 9),
@@ -3071,6 +4049,23 @@ def test_collapse_subgraph_soft_retires_unions_edges_and_merges_requirements():
             ],
         },
     )
+    _handle(
+        service,
+        {
+            "action": "upsert_process_role_pin",
+            "project_id": project_id,
+            "pin_id": "pin-design-eng",
+            "process_id": design_id,
+            "requirement_id": "req-design-eng",
+            "role_id": "role-engineer",
+            "resource_id": "resource-ada",
+            "pinned_at": _iso(16, 3),
+            "forecast_finish_at": _iso(16, 6),
+            "status": "pinned_finished",
+            "verified_done_at": _iso(16, 6),
+            "updated_at": _iso(16, 7),
+        },
+    )
     design_done = _handle(
         service,
         {
@@ -3079,7 +4074,21 @@ def test_collapse_subgraph_soft_retires_unions_edges_and_merges_requirements():
             "process_id": design_id,
             "status": "done",
             "edit_at": _iso(16, 7),
-            "finished_at": _iso(16, 6),
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "upsert_process_role_pin",
+            "project_id": project_id,
+            "pin_id": "pin-build-eng",
+            "process_id": build_id,
+            "requirement_id": "req-build-eng",
+            "role_id": "role-engineer",
+            "resource_id": "resource-ada",
+            "pinned_at": _iso(16, 8),
+            "forecast_finish_at": _iso(16, 12),
+            "updated_at": _iso(16, 8),
         },
     )
     build_started = _handle(
@@ -3155,28 +4164,24 @@ def test_collapse_subgraph_soft_retires_unions_edges_and_merges_requirements():
     assert replacement_node["process_symbol"] == "implementation"
     assert replacement_node["description"] == "Combined implementation scope"
     assert replacement_node["role_requirements"] == [
-        {
-            "requirement_id": collapse.entity_ids["requirement_ids"][0],
-            "role_id": "role-engineer",
-            "effort_hours": 8,
-            "required_resource_count": 2,
-            "allocation_policy": "split_allowed",
-            "min_allocation_hours_per_day": None,
-            "max_allocation_hours_per_day": None,
-        }
+        _expected_role_requirement(
+            collapse.entity_ids["requirement_ids"][0],
+            effort_hours=8,
+            role_id="role_resource-ada",
+        )
     ]
-    assert historical_nodes[design_id]["status"] == "done"
+    assert historical_nodes[design_id]["status"] == "finished"
     assert historical_nodes[design_id]["finished_at"] == _iso(16, 6)
-    assert historical_nodes[build_id]["status"] == "in_progress"
+    assert historical_nodes[build_id]["status"] == "due"
     assert historical_nodes[build_id]["finished_at"] is None
     assert retired_design_projection["is_active"] is False
     assert retired_design_projection["retired_at"] == _iso(16, 9)
-    assert retired_design_projection["status"] == "done"
-    assert retired_design_projection["finished_at"] == _iso(16, 6)
+    assert "status" not in retired_design_projection
+    assert "finished_at" not in retired_design_projection
     assert retired_build_projection["is_active"] is False
     assert retired_build_projection["retired_at"] == _iso(16, 9)
-    assert retired_build_projection["status"] == "in_progress"
-    assert retired_build_projection["finished_at"] is None
+    assert "status" not in retired_build_projection
+    assert "finished_at" not in retired_build_projection
 
 
 def test_collapse_subgraph_required_resource_count_conflict_requires_replacement():
@@ -3296,15 +4301,6 @@ def test_collapse_subgraph_preserves_total_effort_hours_by_role_when_omitted():
                     "action": "add_role_requirement",
                     "process_id": design_id,
                     "requirement": {
-                        "requirement_id": "req-design-eng",
-                        "role_id": "role-engineer",
-                        "effort_hours": 3,
-                    },
-                },
-                {
-                    "action": "add_role_requirement",
-                    "process_id": design_id,
-                    "requirement": {
                         "requirement_id": "req-design-qa",
                         "role_id": "role-qa",
                         "effort_hours": 2,
@@ -3347,8 +4343,7 @@ def test_collapse_subgraph_preserves_total_effort_hours_by_role_when_omitted():
         requirement["role_id"]: requirement["effort_hours"]
         for requirement in replacement["role_requirements"]
     } == {
-        "role-engineer": 8,
-        "role-qa": 2,
+        "role_res_josh": 7,
     }
 
 
@@ -3694,10 +4689,10 @@ def test_active_and_historical_graph_visibility_after_replace_and_collapse():
     } == {(design_id, implementation_id), (implementation_id, ship_id)}
 
 
-def test_retired_process_blockers_remain_auditable_resolvable_not_active_blocked():
+def test_retiring_process_deletes_childless_blocker_and_resolver_process():
     service = ProjectService(InMemoryProjectRepository())
     project_id, design_id, build_id, ship_id = _seed_linear_graph(service)
-    blocker_id = _handle(
+    blocker = _handle(
         service,
         {
             "action": "add_blocker",
@@ -3708,7 +4703,9 @@ def test_retired_process_blockers_remain_auditable_resolvable_not_active_blocked
             "severity": "blocking",
             "created_at": _iso(14, 9),
         },
-    ).entity_ids["blocker_id"]
+    )
+    blocker_id = blocker.entity_ids["blocker_id"]
+    resolver_process_id = blocker.entity_ids["resolver_process_id"]
     replace = _handle(
         service,
         {
@@ -3745,7 +4742,7 @@ def test_retired_process_blockers_remain_auditable_resolvable_not_active_blocked
             "as_of": _iso(15, 12),
         },
     ).data
-    audit_before_resolution = _query(
+    audit_after_replace = _query(
         service,
         {
             "action": "query_blockers",
@@ -3755,7 +4752,7 @@ def test_retired_process_blockers_remain_auditable_resolvable_not_active_blocked
             "include_resolved": True,
         },
     ).data
-    resolved = _handle(
+    resolve_deleted = _handle(
         service,
         {
             "action": "resolve_blocker",
@@ -3765,7 +4762,7 @@ def test_retired_process_blockers_remain_auditable_resolvable_not_active_blocked
             "resolution": "Retired process blocker closed for audit.",
         },
     )
-    audit_after_resolution = _query(
+    audit_after_resolve_attempt = _query(
         service,
         {
             "action": "query_blockers",
@@ -3778,6 +4775,8 @@ def test_retired_process_blockers_remain_auditable_resolvable_not_active_blocked
 
     api_id, worker_id = replace.entity_ids["process_ids"]
     assert replace.entity_ids["retired_process_ids"] == [build_id]
+    assert replace.entity_ids["deleted_blocker_ids"] == [blocker_id]
+    assert resolver_process_id in replace.entity_ids["deleted_blocker_process_ids"]
     assert {node["process_id"] for node in active_graph["nodes"]} == {
         design_id,
         api_id,
@@ -3791,17 +4790,120 @@ def test_retired_process_blockers_remain_auditable_resolvable_not_active_blocked
         if node["process_id"] in {api_id, worker_id}
     )
     assert build_id not in active_blockers["blocked_process_ids"]
-    assert audit_before_resolution["blocked_process_ids"] == []
-    assert audit_before_resolution["blockers"][0]["blocker_id"] == blocker_id
-    assert audit_before_resolution["blockers"][0]["process_id"] == build_id
-    assert audit_before_resolution["blockers"][0]["is_resolved_as_of"] is False
-    assert audit_before_resolution["blockers"][0]["is_blocking_as_of"] is False
-    assert resolved.entity_ids["blocker_id"] == blocker_id
-    assert audit_after_resolution["blocked_process_ids"] == []
-    assert audit_after_resolution["blockers"][0]["resolved_at"] == _iso(15, 13)
-    assert audit_after_resolution["blockers"][0]["resolution"] == (
-        "Retired process blocker closed for audit."
+    assert audit_after_replace["blocked_process_ids"] == []
+    assert audit_after_replace["blockers"] == []
+    assert resolve_deleted.ok is False
+    assert resolve_deleted.error.code == "blocker_not_found"
+    assert audit_after_resolve_attempt["blocked_process_ids"] == []
+    assert audit_after_resolve_attempt["blockers"] == []
+
+
+def test_active_blocker_resolver_dependency_cannot_be_removed():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    process_id = _create_process(service, project_id, name="Build")
+    blocker = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": process_id,
+            "summary": "Vendor approval",
+            "created_at": _iso(14, 9),
+        },
     )
+    resolver_process_id = blocker.entity_ids["resolver_process_id"]
+
+    removal = _handle(
+        service,
+        {
+            "action": "batch_update_process_graph",
+            "project_id": project_id,
+            "edit_at": _iso(14, 10),
+            "operations": [
+                {
+                    "operation_id": "op-remove-active-blocker",
+                    "action": "remove_dependency",
+                    "predecessor_process_id": resolver_process_id,
+                    "successor_process_id": process_id,
+                }
+            ],
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(14, 11),
+            "now": _iso(14, 11),
+            "include_resource_fields": True,
+        },
+    ).data
+
+    operation = removal.entity_ids["operation_ids"][0]
+    assert operation["status"] == "no_op"
+    assert operation["no_op_reason"] == "blocker_reference_dependency_required"
+    assert (resolver_process_id, process_id) in _edge_pairs(graph)
+
+
+def test_resolved_blocker_resolver_dependency_remains_tied_to_blocker_reference():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id = _create_project(service)
+    process_id = _create_process(service, project_id, name="Build")
+    blocker = _handle(
+        service,
+        {
+            "action": "add_blocker",
+            "project_id": project_id,
+            "process_id": process_id,
+            "summary": "Vendor approval",
+            "created_at": _iso(14, 9),
+        },
+    )
+    resolver_process_id = blocker.entity_ids["resolver_process_id"]
+    _handle(
+        service,
+        {
+            "action": "resolve_blocker",
+            "project_id": project_id,
+            "blocker_id": blocker.entity_ids["blocker_id"],
+            "resolved_at": _iso(14, 10),
+            "resolution": "Vendor approved.",
+        },
+    )
+
+    removal = _handle(
+        service,
+        {
+            "action": "batch_update_process_graph",
+            "project_id": project_id,
+            "edit_at": _iso(14, 11),
+            "operations": [
+                {
+                    "operation_id": "op-remove-resolved-blocker",
+                    "action": "remove_dependency",
+                    "predecessor_process_id": resolver_process_id,
+                    "successor_process_id": process_id,
+                }
+            ],
+        },
+    )
+    graph = _query(
+        service,
+        {
+            "action": "query_process_graph",
+            "project_id": project_id,
+            "as_of": _iso(14, 12),
+            "now": _iso(14, 12),
+            "include_resource_fields": True,
+        },
+    ).data
+
+    operation = removal.entity_ids["operation_ids"][0]
+    assert operation["status"] == "no_op"
+    assert operation["no_op_reason"] == "blocker_reference_dependency_required"
+    assert (resolver_process_id, process_id) in _edge_pairs(graph)
 
 
 def test_batch_dependency_noops_and_edge_id_errors_are_atomic():
@@ -4179,15 +5281,7 @@ def test_replace_process_with_subgraph_exact_command_replay_reuses_result_ids():
         if node["process_id"] == first.entity_ids["alias_process_id"]
     )
     assert api_node["role_requirements"] == [
-        {
-            "requirement_id": "req-api-eng",
-            "role_id": "role-engineer",
-            "effort_hours": 6,
-            "required_resource_count": 1,
-            "allocation_policy": "split_allowed",
-            "min_allocation_hours_per_day": None,
-            "max_allocation_hours_per_day": None,
-        }
+        _expected_role_requirement("req-api-eng", effort_hours=6)
     ]
 
 
@@ -4280,13 +5374,9 @@ def test_collapse_subgraph_exact_command_replay_reuses_result_ids():
         if node["process_id"] == first.entity_ids["process_id"]
     )
     assert replacement_node["role_requirements"] == [
-        {
-            "requirement_id": first.entity_ids["requirement_ids"][0],
-            "role_id": "role-engineer",
-            "effort_hours": 8,
-            "required_resource_count": 1,
-            "allocation_policy": "split_allowed",
-            "min_allocation_hours_per_day": None,
-            "max_allocation_hours_per_day": None,
-        }
+        _expected_role_requirement(
+            first.entity_ids["requirement_ids"][0],
+            effort_hours=8,
+            role_id="role_res_josh",
+        )
     ]

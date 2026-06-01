@@ -9,7 +9,6 @@ jaxlib
 pygraphviz
 graphviz
 pydantic>=2
-real_ladybug
 slack_sdk
 cryptography
 pytest

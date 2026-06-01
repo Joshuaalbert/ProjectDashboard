@@ -15,8 +15,9 @@ service-first package that agents and humans can both use.
 
 ## Durable Model
 
-LadybugDB is the v1 durable store because projects are naturally graph-shaped.
-The primary graph concepts are:
+SQLite is the durable service store. Project facts are persisted as typed JSON
+rows, while scheduling fields remain computed query outputs rather than
+authoritative facts. The primary concepts are:
 
 - `Project`
 - `Process`
@@ -35,19 +36,16 @@ Important relationships:
 - resource can fill role
 - blocker blocks process
 
-Computed scheduling fields are query outputs, not authoritative facts.
-
 All service API and storage moments are timezone-aware datetimes. The API uses
 `*_at` names such as `start_at`, `effective_at`, `as_of`, `now`, lifecycle
 anchors, calendar exceptions, holidays, allocation slices, and schedule
-snapshots. The LadybugDB adapter stores ISO datetime strings so offsets are
-preserved.
+snapshots.
 
 ## API Direction
 
 Agents use typed Python models or JSON envelopes. Commands mutate facts and
-queries compute projections. Batch commands should be transactional once the
-LadybugDB repository is fully wired.
+queries compute projections. Batch commands are staged in memory and committed
+through the repository in a single replacement step.
 
 The first implementation slice includes a complete in-memory repository for
-deterministic tests and a LadybugDB adapter boundary for durable storage.
+deterministic tests and a SQLite adapter for durable storage.

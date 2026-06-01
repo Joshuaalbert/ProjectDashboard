@@ -1,12 +1,16 @@
 import datetime as dt
+import inspect
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import NamedTuple
+from typing import NamedTuple, get_args
 
 import pytest
-from pydantic import ValidationError
+from pydantic import AwareDatetime, BaseModel, ValidationError
 
+from projdash.service import commands as command_models
+from projdash.service import models as service_models
+from projdash.service import queries as query_models
 from projdash.service import results as result_models
 from projdash.service.commands import (
     BatchCommandEnvelope,
@@ -50,6 +54,20 @@ def _query_payload(query: dict[str, object]) -> dict[str, object]:
     return {"query_id": "00000000-0000-4000-8000-000000000201", "query": query}
 
 
+def _annotation_contains(annotation: object, expected: object) -> bool:
+    if annotation is expected:
+        return True
+    return any(_annotation_contains(arg, expected) for arg in get_args(annotation))
+
+
+def _pydantic_models(module) -> list[type[BaseModel]]:
+    return [
+        model
+        for _name, model in inspect.getmembers(module, inspect.isclass)
+        if issubclass(model, BaseModel) and model.__module__ == module.__name__
+    ]
+
+
 def _assert_validation_error_locates(
     payload: dict[str, object],
     *,
@@ -88,6 +106,26 @@ def test_naive_datetime_payload_reports_validation_error():
                 }
             }
         )
+
+
+def test_service_api_datetime_fields_are_aware_and_use_moment_names():
+    allowed_non_suffix_moment_names = {"as_of", "now"}
+    checked_fields: set[str] = set()
+
+    for module in (command_models, query_models, service_models):
+        for model in _pydantic_models(module):
+            for field_name, field in model.model_fields.items():
+                if not _annotation_contains(field.annotation, AwareDatetime):
+                    continue
+                checked_fields.add(f"{model.__name__}.{field_name}")
+                assert field_name.endswith("_at") or (
+                    field_name in allowed_non_suffix_moment_names
+                )
+                assert not _annotation_contains(field.annotation, dt.datetime)
+
+    assert "CreateProject.start_at" in checked_fields
+    assert "QueryProcessGraph.as_of" in checked_fields
+    assert "ProcessRolePinRecord.verified_done_at" in checked_fields
 
 
 def test_invalid_command_payload_reports_validation_error():
@@ -349,7 +387,7 @@ def test_batch_commands_are_applied_in_order():
     assert [result.ok for result in results] == [True, True]
 
 
-def test_unresolved_blocker_derives_blocked_state_until_resolved():
+def test_unresolved_blocker_derives_resolver_parent_until_resolved():
     service = ProjectService(InMemoryProjectRepository())
     project_id = service.handle_command(
         CommandEnvelope(
@@ -404,6 +442,7 @@ def test_unresolved_blocker_derives_blocked_state_until_resolved():
                     "project_id": project_id,
                     "as_of": _at(14, 12).isoformat(),
                     "now": _at(14, 12).isoformat(),
+                    "include_resource_fields": True,
                 }
             }
         )
@@ -411,8 +450,15 @@ def test_unresolved_blocker_derives_blocked_state_until_resolved():
 
     assert blockers["blocked_process_ids"] == [process_id]
     assert blockers["blockers"][0]["summary"] == "Reviewer unavailable"
-    assert graph["nodes"][0]["status"] == "planned"
-    assert graph["nodes"][0]["computed_status"] == "blocked"
+    blocked_node = next(node for node in graph["nodes"] if node["process_id"] == process_id)
+    assert blocked_node["status"] == "waiting"
+    assert blocked_node["computed_status"] == "waiting"
+    assert blocked_node["blocker_summary"]["blocking_count"] == 1
+    assert any(
+        edge["predecessor_process_symbol"].startswith("resolve-reviewer-unavailable")
+        and edge["successor_process_id"] == process_id
+        for edge in graph["edges"]
+    )
 
     service.handle_command(
         CommandEnvelope.model_validate(
@@ -1436,20 +1482,7 @@ def test_error_result_wrappers_use_single_structured_error():
             ),
         ),
         ApiCase(
-            "set_process_status_done_explicit_finished_at",
-            _command_payload(
-                {
-                    "action": "set_process_status",
-                    "project_id": "project-alpha",
-                    "process_id": "process-api",
-                    "status": "done",
-                    "edit_at": _at(13, 17).isoformat(),
-                    "finished_at": _at(13, 16).isoformat(),
-                }
-            ),
-        ),
-        ApiCase(
-            "reopen_done_input_clears_finished_at_in_service",
+            "set_process_status_in_progress_assertion",
             _command_payload(
                 {
                     "action": "set_process_status",
@@ -1457,7 +1490,6 @@ def test_error_result_wrappers_use_single_structured_error():
                     "process_id": "process-api",
                     "status": "in_progress",
                     "edit_at": _at(14).isoformat(),
-                    "finished_at": None,
                 }
             ),
         ),
@@ -2327,7 +2359,6 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                             "name": "Service API",
                             "duration_hours": 16,
                             "earliest_start_at": _at(15).isoformat(),
-                            "status": "planned",
                             "aliases": ["api-v2"],
                             "role_requirements": [
                                 {
@@ -2371,7 +2402,6 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                             "name": "API Implementation",
                             "description": "Implementation detail",
                             "duration_hours": 16,
-                            "finished_at": None,
                         },
                     ],
                     "dependencies": [
@@ -2433,8 +2463,7 @@ def test_batch_operation_result_ids_are_objects_not_strings():
                         "description": "Collapsed delivery scope",
                         "duration_hours": 24,
                         "earliest_start_at": None,
-                        "status": "planned",
-                        "aliases": ["api"],
+                            "aliases": ["api"],
                         "role_requirements": [
                             {
                                 "requirement_id": "req-api-delivery-eng",

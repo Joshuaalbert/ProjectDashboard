@@ -2,6 +2,9 @@ import datetime as dt
 import json
 from types import SimpleNamespace
 
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+
 from projdash.ui.app import (
     _batch_role_requirements_by_symbol,
     _blocker_sections,
@@ -15,11 +18,18 @@ from projdash.ui.app import (
     _load_context,
     _normalize_slack_users,
     _parse_codex_debug_models,
+    _plot_gantt_pin_marker,
     _prepare_context_for_section,
     _priority_expander_sections,
     _priority_markdown,
+    _priority_process_markdown,
+    _process_child_symbols,
+    _process_role_revision_command,
     _process_revision_defaults_signature,
     _project_context_markdown,
+    _recover_orphaned_slack_run,
+    _render_gantt_chart,
+    _render_graph,
     _resource_calendar_rules_markdown,
     _schedule_debug_payload,
     _schedule_snapshot_query_payload,
@@ -27,6 +37,7 @@ from projdash.ui.app import (
     _slack_manifest_payload,
     _slack_mapping_commands,
     _slack_mapping_rows,
+    _slack_service_run_is_orphaned,
 )
 
 
@@ -64,6 +75,159 @@ def test_dependency_set_operations_preserve_internal_selected_edges():
             "successor_process_symbol": "A",
         }
     ]
+
+
+def test_gantt_pin_marker_plot_uses_one_o_per_start_and_one_x_per_finish():
+    fig, ax = plt.subplots()
+    try:
+        for marker in [
+            {"kind": "pin_start", "at": dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC)},
+            {"kind": "pin_start", "at": dt.datetime(2026, 5, 13, 10, tzinfo=dt.UTC)},
+            {"kind": "pin_finish", "at": dt.datetime(2026, 5, 13, 12, tzinfo=dt.UTC)},
+            {"kind": "pin_finish", "at": dt.datetime(2026, 5, 13, 13, tzinfo=dt.UTC)},
+            {"kind": "pin_finish", "at": dt.datetime(2026, 5, 13, 14, tzinfo=dt.UTC)},
+            {"kind": "pin_start", "at": "2026-05-13T15:00:00+00:00"},
+        ]:
+            _plot_gantt_pin_marker(ax, marker, y=0)
+
+        markers = [line.get_marker() for line in ax.lines]
+        assert markers.count("o") == 2
+        assert markers.count("x") == 3
+    finally:
+        plt.close(fig)
+
+
+def test_gantt_chart_renders_parent_rows_above_children(monkeypatch):
+    import projdash.ui.app as app
+
+    captured: dict[str, object] = {}
+
+    def capture_pyplot(fig):
+        captured["fig"] = fig
+
+    monkeypatch.setattr(app.st, "pyplot", capture_pyplot)
+    graph = {
+        "nodes": [
+            {
+                "process_id": "p-child",
+                "process_symbol": "B",
+                "name": "Child",
+                "computed_status": "ready",
+                "started_at": "2026-05-13T12:30:00+00:00",
+                "role_requirements": [
+                    {
+                        "requirement_id": "req-child",
+                        "role_id": "role-child",
+                        "pins": [
+                            {
+                                "pin_id": "pin-child",
+                                "resource_id": "res-child",
+                                "pinned_at": "2026-05-13T12:15:00+00:00",
+                                "forecast_finish_at": "2026-05-13T16:00:00+00:00",
+                                "status": "pinned_started",
+                            }
+                        ],
+                    }
+                ],
+                "resource_aware": {
+                    "starts_at": "2026-05-13T13:00:00+00:00",
+                    "ends_at": "2026-05-13T17:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T13:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T17:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "p-parent",
+                "process_symbol": "A",
+                "name": "Parent",
+                "computed_status": "finished",
+                "finished_at": "2026-05-13T11:00:00+00:00",
+                "role_requirements": [
+                    {
+                        "requirement_id": "req-parent",
+                        "role_id": "role-parent",
+                        "pins": [
+                            {
+                                "pin_id": "pin-parent",
+                                "resource_id": "res-parent",
+                                "pinned_at": "2026-05-13T09:00:00+00:00",
+                                "forecast_finish_at": "2026-05-13T11:30:00+00:00",
+                                "verified_finished_at": "2026-05-13T11:30:00+00:00",
+                                "status": "pinned_finished",
+                            }
+                        ],
+                    }
+                ],
+                "resource_aware": {
+                    "starts_at": "2026-05-13T09:00:00+00:00",
+                    "ends_at": "2026-05-13T12:00:00+00:00",
+                    "schedule_window_starts_at": "2026-05-13T09:00:00+00:00",
+                    "schedule_window_ends_at": "2026-05-13T12:00:00+00:00",
+                },
+            },
+        ],
+        "edges": [
+            {
+                "predecessor_process_id": "p-parent",
+                "successor_process_id": "p-child",
+            }
+        ],
+    }
+
+    _render_gantt_chart(
+        graph,
+        controls_now=None,
+        terminal_symbols=[],
+        timezone_name="UTC",
+    )
+
+    fig = captured["fig"]
+    try:
+        ax = fig.axes[0]
+        assert [tick.get_text() for tick in ax.get_yticklabels()] == ["A", "B"]
+        assert bool(ax.yaxis_inverted()) is True
+        connectors = [line for line in ax.lines if line.get_color() == "black"]
+        assert len(connectors) == 1
+        connector = connectors[0]
+        start_x = mdates.date2num(dt.datetime(2026, 5, 13, 11, 30, tzinfo=dt.UTC))
+        end_x = mdates.date2num(dt.datetime(2026, 5, 13, 12, 15, tzinfo=dt.UTC))
+        mid_x = start_x + ((end_x - start_x) / 2)
+        assert list(connector.get_xdata()) == [start_x, mid_x, mid_x, end_x]
+        assert list(connector.get_ydata()) == [0, 0, 1, 1]
+        assert connector.get_linewidth() == 1
+        assert connector.get_linestyle() == "-"
+        pin_lines = [
+            (line.get_marker(), list(line.get_xdata()), list(line.get_ydata()))
+            for line in ax.lines
+            if line.get_marker() in {"o", "x"}
+        ]
+        assert (
+            "o",
+            [mdates.date2num(dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC))],
+            [0],
+        ) in pin_lines
+        assert (
+            "o",
+            [mdates.date2num(dt.datetime(2026, 5, 13, 12, 15, tzinfo=dt.UTC))],
+            [1],
+        ) in pin_lines
+        assert (
+            "x",
+            [mdates.date2num(dt.datetime(2026, 5, 13, 11, 30, tzinfo=dt.UTC))],
+            [0],
+        ) in pin_lines
+        endpoint_collections = [
+            collection
+            for collection in ax.collections
+            if list(collection.get_sizes()) == [5]
+        ]
+        assert len(endpoint_collections) == 1
+        assert endpoint_collections[0].get_offsets().tolist() == [
+            [start_x, 0.0],
+            [end_x, 1.0],
+        ]
+    finally:
+        plt.close(fig)
 
 
 def test_batch_role_requirements_distribute_aggregate_effort_without_multiplying():
@@ -105,6 +269,193 @@ def test_batch_role_requirements_distribute_aggregate_effort_without_multiplying
         "A": [{"role_id": "role_eng", "effort_hours": 4}],
         "B": [{"role_id": "role_eng", "effort_hours": 7}],
     }
+
+
+def test_priority_process_markdown_matches_pm_context_shape_without_sensitivity():
+    row = {
+        "process_id": "proc-a",
+        "process_symbol": "A",
+        "process_name": "Task A",
+        "process_type": "standard",
+        "computed_status": "ready",
+        "description": "Acceptance checklist is complete.",
+        "predecessors": ["P"],
+        "successors": ["C"],
+        "planned_start_at": "2026-05-13T09:00:00+00:00",
+        "planned_finish_at": "2026-05-13T17:00:00+00:00",
+        "schedule_window_starts_at": "2026-05-13T08:00:00+00:00",
+        "schedule_window_ends_at": "2026-05-14T09:00:00+00:00",
+        "planned_assignments": [
+            {
+                "resource_id": "res-ada",
+                "resource_label": "Ada (`res-ada`)",
+                "role_id": "role_eng",
+                "role_label": "Engineer (`role_eng`)",
+            }
+        ],
+        "role_requirements": [
+            {
+                "requirement_id": "req-a",
+                "role_id": "role_eng",
+                "effort_hours": 8,
+            }
+        ],
+        "max_makespan_sensitivity_hours": 99,
+    }
+
+    markdown = _priority_process_markdown(
+        row,
+        "UTC",
+        role_labels={"role_eng": "Engineer (`role_eng`)"},
+    )
+
+    assert "- Type: normal" in markdown
+    assert "- Mode: planned" in markdown
+    assert "- Status: `ready`" in markdown
+    assert "- Role requirement: Engineer (`role_eng`) | `req-a`" in markdown
+    assert "- Effort hours: 8 hours" in markdown
+    assert "- Definition: Acceptance checklist is complete." in markdown
+    assert "- Parents: `{P}`" in markdown
+    assert "- Children: `{C}`" in markdown
+    assert "- Assigned to: Ada (`res-ada`) for Engineer (`role_eng`)" in markdown
+    assert "- Planned start: 2026-05-13 09:00 UTC" in markdown
+    assert "- Planned finish: 2026-05-13 17:00 UTC" in markdown
+    assert "pre-buffer" in markdown
+    assert "Sensitivity" not in markdown
+
+
+def test_priority_process_markdown_shows_pin_mode_fields():
+    row = {
+        "process_symbol": "A",
+        "process_name": "Task A",
+        "process_type": "blocker",
+        "computed_status": "due",
+        "role_requirements": [
+            {
+                "requirement_id": "req-a",
+                "role_id": "role_eng",
+                "effort_hours": 1,
+                "pins": [
+                    {
+                        "resource_id": "res-ada",
+                        "pinned_at": "2026-05-13T09:00:00+00:00",
+                        "forecast_finish_at": "2026-05-13T12:00:00+00:00",
+                        "status": "pinned_started",
+                    }
+                ],
+            }
+        ],
+    }
+
+    markdown = _priority_process_markdown(
+        row,
+        "UTC",
+        role_labels={"role_eng": "Engineer (`role_eng`)"},
+        resource_labels={"res-ada": "Ada (`res-ada`)"},
+    )
+
+    assert "- Type: blocker" in markdown
+    assert "- Mode: pinned" in markdown
+    assert "- Pinned to: Ada (`res-ada`)" in markdown
+    assert "- Pinned started: 2026-05-13 09:00 UTC" in markdown
+    assert "- Forecasted finish: 2026-05-13 12:00 UTC" in markdown
+
+
+def test_process_role_revision_command_preserves_process_metadata_and_dependencies():
+    graph = {
+        "nodes": [
+            {
+                "process_id": "proc-p",
+                "process_symbol": "P",
+            },
+            {
+                "process_id": "proc-a",
+                "process_symbol": "A",
+            },
+        ],
+        "edges": [
+            {
+                "predecessor_process_symbol": "P",
+                "successor_process_symbol": "A",
+            }
+        ],
+    }
+    row = {
+        "process_id": "proc-a",
+        "process_symbol": "A",
+        "process_name": "Task A",
+        "description": "Done definition.",
+        "process_type": "standard",
+        "duration_business_days": 2,
+        "earliest_start_at": "2026-05-13T09:00:00+00:00",
+        "start_at_earliest": True,
+        "delay_after_dependencies_business_days": 1,
+        "assumption_note": "Keep this note.",
+        "role_requirements": [
+            {
+                "requirement_id": "req-a",
+                "role_id": "role_old",
+                "effort_hours": 3,
+                "allocation_policy": "split_allowed",
+                "required_resource_count": 1,
+            }
+        ],
+    }
+
+    command = _process_role_revision_command(
+        project_id="project-alpha",
+        graph=graph,
+        row=row,
+        role_id="role_new",
+        effort_hours=5,
+        effective_at=dt.datetime(2026, 5, 14, 9, tzinfo=dt.UTC),
+    )
+
+    assert command == {
+        "action": "upsert_process_revision",
+        "project_id": "project-alpha",
+        "process_symbol": "A",
+        "process_type": "standard",
+        "name": "Task A",
+        "description": "Done definition.",
+        "effective_at": dt.datetime(2026, 5, 14, 9, tzinfo=dt.UTC),
+        "duration_business_days": 2,
+        "dependencies": ["proc-p"],
+        "earliest_start_at": "2026-05-13T09:00:00+00:00",
+        "start_at_earliest": True,
+        "delay_after_dependencies_business_days": 1,
+        "role_requirements": [
+            {
+                "requirement_id": "req-a",
+                "role_id": "role_new",
+                "effort_hours": 5,
+                "allocation_policy": "split_allowed",
+                "required_resource_count": 1,
+            }
+        ],
+        "assumption_note": "Keep this note.",
+    }
+
+
+def test_process_child_symbols_returns_sorted_unique_children():
+    graph = {
+        "edges": [
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "B",
+            },
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "B",
+            },
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "C",
+            },
+        ]
+    }
+
+    assert _process_child_symbols(graph, "A") == ["B", "C"]
 
 
 def test_process_revision_defaults_signature_ignores_volatile_as_of_time():
@@ -175,8 +526,8 @@ def test_priority_markdown_filters_and_formats_priority_fields():
                 "priority_rank": 2,
                 "process_symbol": "A",
                 "process_name": "Design",
-                "hours_until_ls": 1,
-                "hours_until_lf": 3,
+                "hours_until_planned_start": 1,
+                "hours_until_planned_finish": 3,
                 "effort_hours": 2,
                 "role_id": "role_eng",
             },
@@ -185,10 +536,30 @@ def test_priority_markdown_filters_and_formats_priority_fields():
                 "priority_rank": 3,
                 "process_symbol": "B",
                 "process_name": "Build",
-                "hours_until_ls": 12,
-                "hours_until_lf": 16,
+                "planned_start_at": dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC),
+                "planned_finish_at": dt.datetime(2026, 5, 14, 9, tzinfo=dt.UTC),
+                "schedule_window_starts_at": dt.datetime(
+                    2026,
+                    5,
+                    13,
+                    3,
+                    tzinfo=dt.UTC,
+                ),
+                "schedule_window_ends_at": dt.datetime(2026, 5, 15, 9, tzinfo=dt.UTC),
+                "hours_until_planned_start": 12,
+                "hours_until_planned_finish": 16,
                 "effort_hours": 4,
                 "role_id": "role_qa",
+                "pin_started_at": dt.datetime(2026, 5, 13, 3, tzinfo=dt.UTC),
+                "finished_at": dt.datetime(2026, 5, 14, 21, tzinfo=dt.UTC),
+                "planned_assignments": [
+                    {
+                        "resource_id": "res_grace",
+                        "role_id": "role_qa",
+                        "resource_label": "Grace (`res_grace`)",
+                        "role_label": "QA (`role_qa`)",
+                    }
+                ],
             },
         ],
         "role_id",
@@ -198,10 +569,43 @@ def test_priority_markdown_filters_and_formats_priority_fields():
 
     assert "### Role `role_qa`" in markdown
     assert "#### P3 | B | Build" in markdown
-    assert "Start window: latest start in 0.5 days" in markdown
+    assert "Start: 2026-05-13 09:00 UTC | Finish: 2026-05-14 09:00 UTC" in markdown
+    assert "0.25 days pre-buffer | 1 day duration | 1 day post-buffer" in markdown
+    assert "Planned resource: Grace (`res_grace`) for QA (`role_qa`)" in markdown
     assert "Effort: 4 hours" in markdown
+    assert "Pin: `pinned_started`; pinned 2026-05-13 03:00 UTC" in markdown
+    assert "Finished: 0.5 days late" in markdown
     assert "role_eng" not in markdown
     assert "`A`" not in markdown
+
+
+def test_priority_markdown_formats_on_time_started_and_finished_as_early():
+    planned_start_at = dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC)
+    planned_finish_at = dt.datetime(2026, 5, 13, 17, tzinfo=dt.UTC)
+
+    markdown = _priority_markdown(
+        [
+            {
+                "priority": "P1",
+                "process_symbol": "A",
+                "process_name": "Design",
+                "planned_start_at": planned_start_at,
+                "planned_finish_at": planned_finish_at,
+                "schedule_window_starts_at": planned_start_at,
+                "schedule_window_ends_at": planned_finish_at,
+                "effort_hours": 2,
+                "role_id": "role_eng",
+                "pin_started_at": planned_start_at,
+                "finished_at": planned_finish_at,
+            },
+        ],
+        "role_id",
+        [],
+        id_label="Role",
+    )
+
+    assert "Pin: `pinned_started`; pinned 2026-05-13 09:00 UTC" in markdown
+    assert "Finished: 0 days early" in markdown
 
 
 def test_priority_expander_sections_group_selected_entities():
@@ -211,7 +615,7 @@ def test_priority_expander_sections_group_selected_entities():
                 "priority": "P1",
                 "process_symbol": "A",
                 "process_name": "Design",
-                "hours_until_ls": -1,
+                "hours_until_planned_start": -1,
                 "effort_hours": 2,
                 "resource_id": "res_ada",
             },
@@ -219,7 +623,7 @@ def test_priority_expander_sections_group_selected_entities():
                 "priority": "P2",
                 "process_symbol": "B",
                 "process_name": "Build",
-                "hours_until_ls": 4,
+                "hours_until_planned_start": 4,
                 "effort_hours": 6,
                 "resource_id": "res_grace",
             },
@@ -234,7 +638,7 @@ def test_priority_expander_sections_group_selected_entities():
     assert len(sections[0]["rows"]) == 1
     assert sections[0]["rows"][0]["priority"] == "P1"
     assert sections[0]["rows"][0]["process_symbol"] == "A"
-    assert sections[0]["rows"][0]["hours_until_ls"] == -1
+    assert sections[0]["rows"][0]["hours_until_planned_start"] == -1
 
 
 def test_blocker_sections_split_unresolved_and_resolved_rows():
@@ -345,7 +749,59 @@ def test_slack_action_passphrase_keys_clear_only_when_leaving_slack_section():
         "slack_action_passphrase_project-b",
     ]
     assert _slack_action_passphrase_keys_to_clear("Slack", "Slack", keys) == []
-    assert _slack_action_passphrase_keys_to_clear("Dashboard", "Resources", keys) == []
+    assert _slack_action_passphrase_keys_to_clear("Project", "Resources", keys) == []
+
+
+class _RecordingCommandService:
+    def __init__(self) -> None:
+        self.commands: list[dict] = []
+
+    def handle_command(self, envelope):
+        payload = envelope.command.model_dump(mode="json")
+        self.commands.append(payload)
+        return SimpleNamespace(ok=True, warnings=[], entity_ids={})
+
+
+def test_slack_orphaned_run_can_be_marked_failed_to_unlock_ui():
+    started_at = dt.datetime(2026, 5, 19, 12, tzinfo=dt.UTC).isoformat()
+    service_job = {
+        "run_id": "run-stuck",
+        "project_id": "project-a",
+        "status": "running",
+        "started_at": started_at,
+    }
+
+    assert _slack_service_run_is_orphaned(service_job, None) is True
+    assert (
+        _slack_service_run_is_orphaned(
+            service_job,
+            {"run_id": "run-stuck", "status": "running"},
+        )
+        is False
+    )
+
+    service = _RecordingCommandService()
+    assert _recover_orphaned_slack_run(service, "project-a", service_job) is True
+
+    assert service.commands == [
+        {
+            "action": "finish_slack_run",
+            "project_id": "project-a",
+            "run_id": "run-stuck",
+            "status": "failed",
+            "finished_at": service.commands[0]["finished_at"],
+            "collected_message_count": 0,
+            "draft_outbox_ids": [],
+            "result_json": {
+                "message": (
+                    "Marked failed by the UI because the active Slack run had "
+                    "no worker in this app process."
+                ),
+                "recovered_orphaned_run": True,
+            },
+            "error_text": "Interrupted Slack run had no active UI worker.",
+        }
+    ]
 
 
 def test_slack_token_crypto_helpers_round_trip_with_service_helper():
@@ -512,7 +968,12 @@ def test_project_context_markdown_summarizes_schedule_and_risks():
                 "summary": {
                     "projected_completion_at": "2026-11-04T10:00:00+00:00",
                     "total_role_effort_hours": 286,
-                    "critical_path": ["run-workshop", "write-paper"],
+                    "top_makespan_sensitivity": [
+                        {
+                            "symbol": "write-paper",
+                            "max_makespan_sensitivity_hours": 2,
+                        }
+                    ],
                     "process_count": 17,
                     "edge_count": 27,
                     "status_counts": {"planned": 12, "done": 5},
@@ -526,11 +987,12 @@ def test_project_context_markdown_summarizes_schedule_and_risks():
                             "symbol": "write-paper",
                             "name": "Write paper",
                             "status": "planned",
-                            "computed_status": "late_risk",
-                            "ls_at": "2026-05-16T09:00:00+00:00",
-                            "ends_at": "2026-05-20T17:00:00+00:00",
-                            "slack_hours": 0,
-                            "critical": True,
+                            "computed_status": "ready",
+                            "planned_start_at": "2026-05-16T09:00:00+00:00",
+                            "planned_finish_at": "2026-05-20T17:00:00+00:00",
+                            "schedule_buffer_hours": 0,
+                            "max_makespan_sensitivity_hours": 2,
+                            "sensitivity_label": "makespan_sensitive",
                             "allocation_state": "allocated",
                         }
                     ]
@@ -545,9 +1007,9 @@ def test_project_context_markdown_summarizes_schedule_and_risks():
                                     "priority": "P1",
                                     "process_symbol": "write-paper",
                                     "process_name": "Write paper",
-                                    "hours_until_ls": -2,
+                                    "hours_until_planned_start": -2,
                                     "effort_hours": 12,
-                                    "computed_status": "late_risk",
+                                    "computed_status": "ready",
                                 }
                             ],
                         }
@@ -561,10 +1023,10 @@ def test_project_context_markdown_summarizes_schedule_and_risks():
                                     "priority": "P2",
                                     "process_symbol": "write-paper",
                                     "process_name": "Write paper",
-                                    "hours_until_ls": 4,
+                                    "hours_until_planned_start": 4,
                                     "effort_hours": 6,
                                     "role_ids": ["role_write"],
-                                    "computed_status": "work_now",
+                                    "computed_status": "started",
                                 }
                             ],
                         }
@@ -604,21 +1066,22 @@ def test_project_context_markdown_summarizes_schedule_and_risks():
     assert "- Projected completion: 2026-11-04 10:00 UTC" in markdown
     assert "- Completion change: 12 hours" in markdown
     assert "- Status counts: done: 5, planned: 12" in markdown
-    assert "- `run-workshop`" in markdown
+    assert "- `write-paper`: 2 hours" in markdown
     assert "## Role Priorities" in markdown
     assert "- **Writing** (`role_write`)" in markdown
     assert (
-        "**P1** `write-paper` - Write paper; start window: overdue by 0.08 days; "
-        "effort: 12 hours; status: late_risk"
+        "**P1** `write-paper` - Write paper; planned start: overdue by 0.08 days; "
+        "effort: 12 hours; status: ready"
     ) in markdown
     assert "## Resource Priorities" in markdown
     assert "- **Ada** (`res_ada`)" in markdown
     assert "roles: `role_write`" in markdown
     assert "## Schedule Watchlist" in markdown
     assert (
-        "- **critical** `write-paper` - Write paper; status: late_risk; "
-        "LS: 2026-05-16 09:00 UTC; ends: 2026-05-20 17:00 UTC; "
-        "slack: 0 hours; allocation: allocated"
+        "- **sensitive** `write-paper` - Write paper; status: ready; "
+        "planned start: 2026-05-16 09:00 UTC; "
+        "planned finish: 2026-05-20 17:00 UTC; "
+        "buffer: 0 hours; sensitivity: 2 hours"
     ) in markdown
     assert "- [warning] `poster-inputs`: Poster inputs needed" in markdown
     assert "## Resource Calendar Rules" in markdown
@@ -661,11 +1124,13 @@ def test_schedule_debug_payload_contains_query_and_schedule_context():
 class _RecordingQueryService:
     def __init__(self) -> None:
         self.actions: list[str] = []
+        self.payloads: list[dict] = []
 
     def handle_query(self, envelope):
         payload = envelope.query.model_dump(mode="json")
         action = payload["action"]
         self.actions.append(action)
+        self.payloads.append(payload)
         return SimpleNamespace(ok=True, warnings=[], data=self._data(action, payload))
 
     def _data(self, action: str, payload: dict) -> dict:
@@ -792,6 +1257,7 @@ def test_lazy_resource_schedule_query_runs_once_per_context():
 
     assert first == second
     assert service.actions == ["query_resource_schedule"]
+    assert service.payloads[-1]["resource_schedule_backend"] == "mcts"
 
 
 def test_context_terminal_symbols_ignore_unvalidated_session_state(monkeypatch):
@@ -849,6 +1315,31 @@ def test_slippage_snapshot_query_can_target_selected_milestone(monkeypatch):
     assert "terminal_process_symbols" not in commit_payload
 
 
+def test_slippage_snapshot_query_can_include_completed_background_commit(monkeypatch):
+    import projdash.ui.app as app
+
+    as_of = dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC)
+    committed_at = dt.datetime(2026, 5, 13, 12, tzinfo=dt.UTC)
+    controls = {
+        "project_id": "project-alpha",
+        "as_of": as_of,
+    }
+    context = {
+        "catalog": {"milestones": []},
+        "schedule_snapshot_query_as_of": committed_at,
+    }
+    monkeypatch.setitem(app.st.session_state, "slippage_milestone_id", "")
+
+    query = _schedule_snapshot_query_payload(controls, context)
+
+    assert query == {
+        "action": "query_schedule_snapshots",
+        "project_id": "project-alpha",
+        "as_of": committed_at,
+        "terminal_process_symbols": [],
+    }
+
+
 def test_schedule_section_loads_schedule_data_without_cost_or_agent_queries():
     service = _RecordingQueryService()
     as_of = dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC)
@@ -873,7 +1364,7 @@ def test_schedule_section_loads_schedule_data_without_cost_or_agent_queries():
     assert "query_agent_context" not in service.actions
 
 
-def test_context_section_loads_agent_context_without_extra_graph_or_cost_queries():
+def test_schedule_section_does_not_request_gantt_sensitivity():
     service = _RecordingQueryService()
     as_of = dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC)
     controls = {
@@ -882,15 +1373,125 @@ def test_context_section_loads_agent_context_without_extra_graph_or_cost_queries
         "now": as_of,
     }
     context = _load_context(service, controls)
-    service.actions.clear()
 
-    _prepare_context_for_section(service, controls, context, "Context")
+    _prepare_context_for_section(service, controls, context, "Schedule")
 
-    assert service.actions == ["query_project_catalog", "query_agent_context"]
-    assert context["graph"] is None
-    assert context["resource_schedule"] is None
-    assert context["costs"] is None
-    assert context["utilization"] is None
+    graph_query = next(
+        payload
+        for payload in service.payloads
+        if payload["action"] == "query_process_graph"
+    )
+    mcts_schedule_query = next(
+        payload
+        for payload in service.payloads
+        if payload["action"] == "query_resource_schedule"
+        and not payload.get("include_resource_sensitivity")
+    )
+    assert graph_query["resource_schedule_backend"] == "mcts"
+    assert mcts_schedule_query["resource_schedule_backend"] == "mcts"
+    assert not [
+        payload
+        for payload in service.payloads
+        if payload["action"] == "query_resource_schedule"
+        and payload.get("include_resource_sensitivity")
+    ]
+
+
+def test_resources_section_uses_mcts_for_schedule_and_utilization():
+    service = _RecordingQueryService()
+    as_of = dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC)
+    controls = {
+        "project_id": "project-alpha",
+        "as_of": as_of,
+        "now": as_of,
+    }
+    context = _load_context(service, controls)
+
+    _prepare_context_for_section(service, controls, context, "Resources")
+
+    schedule_query = next(
+        payload
+        for payload in service.payloads
+        if payload["action"] == "query_resource_schedule"
+    )
+    utilization_query = next(
+        payload
+        for payload in service.payloads
+        if payload["action"] == "query_utilization"
+    )
+    assert schedule_query["resource_schedule_backend"] == "mcts"
+    assert utilization_query["resource_schedule_backend"] == "mcts"
+
+
+def test_removed_context_sections_do_not_prepare_queries():
+    for section in ("Context", "Dashboard", "History", "Topology"):
+        service = _RecordingQueryService()
+        as_of = dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC)
+        controls = {
+            "project_id": "project-alpha",
+            "as_of": as_of,
+            "now": as_of,
+        }
+        context = _load_context(service, controls)
+        service.actions.clear()
+
+        _prepare_context_for_section(service, controls, context, section)
+
+        assert service.actions == []
+        assert context["graph"] is None
+        assert context["resource_schedule"] is None
+        assert context["agent_context"] is None
+        assert context["costs"] is None
+        assert context["utilization"] is None
+
+
+def test_obsolete_sections_removed_from_main_navigation():
+    import projdash.ui.app as app
+
+    assert "Blockers" not in app._MAIN_SECTIONS
+    assert "Dashboard" not in app._MAIN_SECTIONS
+    assert "History" not in app._MAIN_SECTIONS
+    assert "Topology" not in app._MAIN_SECTIONS
+
+
+def test_graph_section_renders_without_edge_table(monkeypatch):
+    import projdash.ui.app as app
+
+    graph = {
+        "nodes": [
+            {
+                "process_id": "proc-a",
+                "process_symbol": "A",
+                "role_requirements": [],
+            }
+        ],
+        "edges": [
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "B",
+            }
+        ],
+    }
+    context = {"graph": graph, "full_graph": graph}
+    controls = {
+        "project_id": "project-alpha",
+        "as_of": dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC),
+        "now": dt.datetime(2026, 5, 13, 9, tzinfo=dt.UTC),
+    }
+    rendered = {"graph": False}
+
+    def graphviz_chart(*args, **kwargs):
+        rendered["graph"] = True
+
+    def dataframe(*args, **kwargs):
+        raise AssertionError("Graph section should not render the edge table")
+
+    monkeypatch.setattr(app.st, "graphviz_chart", graphviz_chart)
+    monkeypatch.setattr(app.st, "dataframe", dataframe)
+
+    _render_graph(_RecordingQueryService(), controls, context)
+
+    assert rendered["graph"] is True
 
 
 def test_costs_section_loads_costs_without_graph_schedule_or_agent_queries():

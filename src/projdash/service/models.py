@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from decimal import Decimal
 from enum import Enum
@@ -31,7 +32,7 @@ class StrictModel(BaseModel):
 
 
 class ProcessStatus(str, Enum):
-    """Explicit project-manager controlled process status."""
+    """Legacy lifecycle assertion accepted by compatibility commands."""
 
     PLANNED = "planned"
     IN_PROGRESS = "in_progress"
@@ -86,13 +87,12 @@ class ScheduleBasis(str, Enum):
 class ComputedStatus(str, Enum):
     """Derived process status values returned by schedule projections."""
 
-    NOT_READY = "not_ready"
+    WAITING = "waiting"
+    EARLY_START = "early_start"
     READY = "ready"
-    WORK_NOW = "work_now"
-    LATE_RISK = "late_risk"
-    BLOCKED = "blocked"
-    COMPLETE = "complete"
-    CANCELED = "canceled"
+    STARTED = "started"
+    DUE = "due"
+    FINISHED = "finished"
 
 
 class AllocationState(str, Enum):
@@ -170,6 +170,19 @@ class SlackRunStatus(str, Enum):
     @property
     def is_active(self) -> bool:
         return self in {SlackRunStatus.QUEUED, SlackRunStatus.RUNNING}
+
+
+class PMCommunicationEvidenceType(str, Enum):
+    """Machine-readable PM communication evidence categories."""
+
+    PROCESS_FULL_UPDATE = "process_full_update"
+    PROCESS_PRE_START_3_DAY = "process_pre_start_3_day"
+    PROCESS_PRE_START_24_HOUR = "process_pre_start_24_hour"
+    PROCESS_OVERDUE_CHECKIN = "process_overdue_checkin"
+    PROCESS_IN_PROGRESS_CHECKIN = "process_in_progress_checkin"
+    RESOURCE_ASSIGNMENT_REVIEW = "resource_assignment_review"
+    MESSAGE_RECEIPT_ACK = "message_receipt_ack"
+    PROJECT_UPDATE_NOTICE = "project_update_notice"
 
 
 class ServiceConfig(StrictModel):
@@ -282,7 +295,7 @@ class ResourceCalendarOverrideCommand(StrictModel):
     """Time-ranged replacement calendar for a resource."""
 
     rule_id: str | None = Field(default=None, min_length=1)
-    calendar_id: str = Field(min_length=1)
+    calendar_id: str | None = Field(default=None, min_length=1)
     starts_at: AwareDatetime
     ends_at: AwareDatetime | None = None
     reason: str | None = None
@@ -294,17 +307,80 @@ class ResourceCalendarOverrideCommand(StrictModel):
         return self
 
 
+class PMEvidenceClaimCommand(StrictModel):
+    """Claim that a Slack message satisfies a PM communication obligation."""
+
+    evidence_type: PMCommunicationEvidenceType
+    resource_id: str | None = Field(default=None, min_length=1)
+    process_id: str | None = Field(default=None, min_length=1)
+    process_symbol: str | None = Field(default=None, min_length=1)
+    obligation_id: str | None = Field(default=None, min_length=1)
+    content_hash: str | None = Field(default=None, min_length=1)
+    evidence_note: str | None = Field(default=None, min_length=1)
+
+
+def _validate_slack_blocks(value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate generic Slack Block Kit payloads without owning Slack's schema."""
+    if len(value) > 50:
+        raise ValueError("Slack messages may contain at most 50 blocks.")
+    for index, block in enumerate(value):
+        block_type = block.get("type")
+        if not isinstance(block_type, str) or not block_type.strip():
+            raise ValueError(f"Slack block {index} must include a non-empty type.")
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Slack blocks must be JSON-serializable.") from exc
+    return value
+
+
 class SlackOutboxMessageCommand(StrictModel):
     """Slack outbox message payload accepted by create commands."""
 
+    target_type: Literal["dm", "channel"] = "dm"
     resource_id: str | None = Field(default=None, min_length=1)
-    slack_user_id: str = Field(min_length=1)
+    slack_user_id: str | None = Field(default=None, min_length=1)
+    slack_channel_id: str | None = Field(default=None, min_length=1)
     body: str = Field(min_length=1)
+    blocks: list[dict[str, Any]] = Field(default_factory=list)
     generated_body: str | None = Field(default=None, min_length=1)
     content_hash: str = Field(min_length=1)
     run_id: str | None = Field(default=None, min_length=1)
     created_at: AwareDatetime
     status: SlackOutboxStatus = SlackOutboxStatus.DRAFT
+    pm_evidence_claims: list[PMEvidenceClaimCommand] = Field(default_factory=list)
+
+    @field_validator("blocks")
+    @classmethod
+    def _validate_blocks(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _validate_slack_blocks(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_target_type(cls, data: object) -> object:
+        if not isinstance(data, dict) or data.get("target_type"):
+            return data
+        if not data.get("slack_user_id") and data.get("slack_channel_id"):
+            return {**data, "target_type": "channel"}
+        return data
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> SlackOutboxMessageCommand:
+        if self.target_type == "dm":
+            if not self.slack_user_id:
+                raise ValueError("slack_user_id is required for dm outbox messages.")
+            if self.slack_channel_id is not None:
+                raise ValueError(
+                    "slack_channel_id is not accepted for dm outbox messages."
+                )
+            return self
+        if not self.slack_channel_id:
+            raise ValueError("slack_channel_id is required for channel outbox messages.")
+        if self.slack_user_id is not None:
+            raise ValueError("slack_user_id is not accepted for channel outbox messages.")
+        if self.resource_id is not None:
+            raise ValueError("resource_id is not accepted for channel outbox messages.")
+        return self
 
 
 class UpsertResourcePayload(StrictModel):
@@ -312,6 +388,7 @@ class UpsertResourcePayload(StrictModel):
 
     resource_id: str | None = Field(default=None, min_length=1)
     name: str = Field(min_length=1)
+    resource_type: Literal["internal", "external"] = "internal"
     role_ids: list[str]
     calendar_id: str = Field(min_length=1)
     available_from_at: AwareDatetime
@@ -474,7 +551,7 @@ class ProcessGraphNode(StrictModel):
     duration_hours: float = Field(ge=0)
     inferred_duration_hours: float | None = None
     earliest_start_at: AwareDatetime | None = None
-    status: ProcessStatus
+    status: str
     started_at: AwareDatetime | None = None
     finished_at: AwareDatetime | None = None
     computed_status: ComputedStatus
@@ -510,8 +587,12 @@ class Blocker(StrictModel):
     created_at: AwareDatetime
     resolved_at: AwareDatetime | None = None
     resolution: str | None = None
+    resolution_owner_resource_id: str | None = None
     is_resolved_as_of: bool | None = None
     is_blocking_as_of: bool | None = None
+    immediate_blocked_processes: list[dict[str, Any]] = Field(default_factory=list)
+    needed_by_role_ids: list[str] = Field(default_factory=list)
+    needed_by_resource_ids: list[str] = Field(default_factory=list)
 
 
 class AllocationSlice(StrictModel):
@@ -554,11 +635,18 @@ class ResourceScheduleRow(StrictModel):
     resource_ls_at: AwareDatetime | None = None
     resource_lf_at: AwareDatetime | None = None
     resource_slack_hours: float | None = None
+    schedule_window_starts_at: AwareDatetime | None = None
+    schedule_window_ends_at: AwareDatetime | None = None
+    schedule_buffer_hours: float | None = None
+    schedule_elapsed_hours: float | None = None
+    role_sensitivity: list[dict[str, object]] = Field(default_factory=list)
+    max_makespan_sensitivity_hours: float | None = None
+    sensitivity_label: str = "unknown"
     inferred_duration_hours: float | None = None
     resource_delay_hours: float = 0
     allocation_state: AllocationState
     allocation_diagnostic: str | None = None
-    status: ProcessStatus
+    status: str
     finished_at: AwareDatetime | None = None
     requirement_ids: list[str] = Field(default_factory=list)
 
@@ -711,9 +799,165 @@ class ProcessRecord(StrictModel):
     process_id: str
     project_id: str
     symbol: str
-    status: ProcessStatus = ProcessStatus.PLANNED
-    started_at: AwareDatetime | None = None
-    finished_at: AwareDatetime | None = None
+    process_type: Literal["standard", "blocker"] = "standard"
+
+
+class ProcessRolePinRecord(StrictModel):
+    """Pinned resource forecast for one process-role requirement."""
+
+    pin_id: str
+    project_id: str
+    process_id: str
+    requirement_id: str | None = None
+    role_id: str
+    resource_id: str
+    pinned_at: AwareDatetime
+    forecast_finish_at: AwareDatetime
+    status: Literal["pinned_started", "pinned_finished"] = "pinned_started"
+    verified_done_at: AwareDatetime | None = None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_pin(self) -> ProcessRolePinRecord:
+        if self.pinned_at > self.updated_at:
+            raise ValueError("pinned_at must be no later than updated_at.")
+        if self.status == "pinned_finished" and self.verified_done_at is None:
+            raise ValueError("pinned_finished requires verified_done_at.")
+        if self.status == "pinned_started" and self.verified_done_at is not None:
+            raise ValueError("pinned_started must not set verified_done_at.")
+        if (
+            self.verified_done_at is not None
+            and self.verified_done_at < self.pinned_at
+        ):
+            raise ValueError("verified_done_at must be at or after pinned_at.")
+        if (
+            self.verified_done_at is not None
+            and self.verified_done_at > self.updated_at
+        ):
+            raise ValueError("verified_done_at must be no later than updated_at.")
+        if self.verified_done_at is not None:
+            self.forecast_finish_at = self.verified_done_at
+        if self.forecast_finish_at < self.pinned_at:
+            raise ValueError("forecast_finish_at must be at or after pinned_at.")
+        if self.created_at > self.updated_at:
+            raise ValueError("created_at must be no later than updated_at.")
+        return self
+
+
+class ProcessEvidenceLineItemRecord(StrictModel):
+    """Persisted PM evidence recency for one process line item."""
+
+    evidence_line_id: str
+    project_id: str
+    process_id: str
+    process_symbol: str
+    line_item: str = Field(min_length=1)
+    last_modified_at: AwareDatetime
+    last_evidence_at: AwareDatetime | None = None
+    evidence_note: str | None = None
+    evidence_source: str | None = None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _validate_timestamps(self) -> ProcessEvidenceLineItemRecord:
+        if self.created_at > self.updated_at:
+            raise ValueError("created_at must be no later than updated_at.")
+        if self.last_evidence_at is not None and self.last_evidence_at > self.updated_at:
+            raise ValueError("last_evidence_at must be no later than updated_at.")
+        return self
+
+    def model_dump(self, *args, **kwargs):
+        data = super().model_dump(*args, **kwargs)
+        if kwargs.get("mode") == "json":
+            for field in (
+                "last_modified_at",
+                "last_evidence_at",
+                "created_at",
+                "updated_at",
+            ):
+                if isinstance(data.get(field), str) and data[field].endswith("Z"):
+                    data[field] = f"{data[field][:-1]}+00:00"
+        return data
+
+
+class ResourceEvidenceLineItemRecord(StrictModel):
+    """Persisted PM evidence recency for one resource line item."""
+
+    evidence_line_id: str
+    project_id: str
+    resource_id: str
+    line_item: str = Field(min_length=1)
+    last_modified_at: AwareDatetime
+    last_evidence_at: AwareDatetime | None = None
+    evidence_note: str | None = None
+    evidence_source: str | None = None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _validate_timestamps(self) -> ResourceEvidenceLineItemRecord:
+        if self.created_at > self.updated_at:
+            raise ValueError("created_at must be no later than updated_at.")
+        if self.last_evidence_at is not None and self.last_evidence_at > self.updated_at:
+            raise ValueError("last_evidence_at must be no later than updated_at.")
+        return self
+
+
+class TeammateWorkPlanForecastRecord(StrictModel):
+    """Legacy SQLite work-plan forecast row migrated into process-role pins."""
+
+    forecast_id: str
+    project_id: str
+    work_plan_id: str
+    process_id: str
+    requirement_id: str | None = None
+    role_id: str
+    forecast_finish_at: AwareDatetime
+    note: str | None = None
+
+
+class TeammateWorkPlanRecord(StrictModel):
+    """Legacy SQLite work-plan row migrated into process-role pins on load."""
+
+    work_plan_id: str
+    project_id: str
+    resource_id: str
+    starts_at: AwareDatetime
+    planning_release_at: AwareDatetime
+    status: Literal["accepted", "advisory", "canceled"] = "accepted"
+    capacity_policy: Literal["opaque"] = "opaque"
+    forecasts: list[TeammateWorkPlanForecastRecord] = Field(default_factory=list)
+    source: str | None = None
+    note: str | None = None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _validate_plan(self) -> TeammateWorkPlanRecord:
+        if self.starts_at > self.updated_at and self.status == "accepted":
+            raise ValueError("accepted work plan starts_at must be no later than updated_at.")
+        if self.planning_release_at <= self.starts_at:
+            raise ValueError("planning_release_at must be after starts_at.")
+        forecast_ids = [forecast.forecast_id for forecast in self.forecasts]
+        if len(forecast_ids) != len(set(forecast_ids)):
+            raise ValueError("forecast_id values must be unique.")
+        if self.status == "accepted" and not self.forecasts:
+            raise ValueError("accepted work plans require at least one forecast.")
+        for forecast in self.forecasts:
+            if forecast.project_id != self.project_id:
+                raise ValueError("forecast project_id must match work plan project_id.")
+            if forecast.work_plan_id != self.work_plan_id:
+                raise ValueError("forecast work_plan_id must match work_plan_id.")
+            if forecast.forecast_finish_at < self.starts_at:
+                raise ValueError("forecast_finish_at must be at or after starts_at.")
+            if forecast.forecast_finish_at > self.planning_release_at:
+                raise ValueError(
+                    "forecast_finish_at must be no later than planning_release_at."
+                )
+        return self
 
 
 class ScheduleSnapshotRecord(StrictModel):
@@ -726,6 +970,7 @@ class ScheduleSnapshotRecord(StrictModel):
     schedule_basis: ScheduleBasis = ScheduleBasis.RESOURCE_AWARE
     completion_at: AwareDatetime | None = None
     converged: bool | None = None
+    role_sensitivity: list[dict[str, Any]] = Field(default_factory=list)
     note: str | None = None
 
     def model_dump(self, *args, **kwargs):
@@ -776,8 +1021,7 @@ class ProcessRevisionRecord(StrictModel):
     start_at_earliest: bool = False
     delay_after_dependencies_business_days: int = Field(default=0, ge=0)
     required_roles: dict[str, float] = Field(default_factory=dict)
-    role_requirements: list[RoleRequirementCommand] = Field(default_factory=list)
-    staked_resource_ids: list[str] = Field(default_factory=list)
+    role_requirements: list[RoleRequirementCommand] = Field(min_length=1, max_length=1)
     assumption_note: str | None = None
 
 
@@ -786,7 +1030,7 @@ class BlockerRecord(StrictModel):
 
     blocker_id: str
     project_id: str
-    process_id: str
+    process_id: str = Field(min_length=1)
     description: str
     opened_at: AwareDatetime
     resolved_at: AwareDatetime | None = None
@@ -795,6 +1039,7 @@ class BlockerRecord(StrictModel):
     severity: BlockerSeverity = BlockerSeverity.BLOCKING
     created_at: AwareDatetime | None = None
     resolution: str | None = None
+    resolution_owner_resource_id: str | None = None
 
 
 class SlackProjectConfigRecord(StrictModel):
@@ -879,9 +1124,11 @@ class SlackOutboxRecord(StrictModel):
     outbox_id: str
     project_id: str
     status: SlackOutboxStatus = SlackOutboxStatus.DRAFT
+    target_type: Literal["dm", "channel"] = "dm"
     resource_id: str | None = None
-    slack_user_id: str
+    slack_user_id: str | None = None
     body: str
+    blocks: list[dict[str, Any]] = Field(default_factory=list)
     generated_body: str | None = None
     content_hash: str
     run_id: str | None = None
@@ -895,6 +1142,61 @@ class SlackOutboxRecord(StrictModel):
     slack_message_ts: str | None = None
     error_text: str | None = None
     skip_reason: str | None = None
+    pm_evidence_claims: list[PMEvidenceClaimCommand] = Field(default_factory=list)
+
+    @field_validator("blocks")
+    @classmethod
+    def _validate_blocks(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _validate_slack_blocks(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_target_type(cls, data: object) -> object:
+        if not isinstance(data, dict) or data.get("target_type"):
+            return data
+        if not data.get("slack_user_id") and data.get("slack_channel_id"):
+            return {**data, "target_type": "channel"}
+        return data
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> SlackOutboxRecord:
+        if self.target_type == "dm":
+            if not self.slack_user_id:
+                raise ValueError("slack_user_id is required for dm outbox rows.")
+            if (
+                self.slack_channel_id is not None
+                and self.status != SlackOutboxStatus.SENT
+            ):
+                raise ValueError("slack_channel_id is not accepted for dm outbox rows.")
+            return self
+        if not self.slack_channel_id:
+            raise ValueError("slack_channel_id is required for channel outbox rows.")
+        if self.slack_user_id is not None:
+            raise ValueError("slack_user_id is not accepted for channel outbox rows.")
+        if self.resource_id is not None:
+            raise ValueError("resource_id is not accepted for channel outbox rows.")
+        return self
+
+
+class PMCommunicationEvidenceRecord(StrictModel):
+    """Persisted proof that a PM communication protocol item was sent."""
+
+    evidence_id: str
+    project_id: str
+    evidence_type: PMCommunicationEvidenceType
+    resource_id: str | None = None
+    teammate_id: str | None = None
+    slack_user_id: str | None = None
+    slack_channel_id: str | None = None
+    process_id: str | None = None
+    process_symbol: str | None = None
+    obligation_id: str | None = None
+    outbox_id: str
+    run_id: str | None = None
+    content_hash: str | None = None
+    communicated_at: AwareDatetime
+    created_at: AwareDatetime
+    evidence_note: str | None = None
 
 
 JsonObject = dict[str, Any]

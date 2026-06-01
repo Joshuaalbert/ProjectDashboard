@@ -9,6 +9,7 @@ from pydantic import (
     AwareDatetime,
     Field,
     NonNegativeFloat,
+    PositiveInt,
     field_validator,
     model_validator,
 )
@@ -17,6 +18,7 @@ from projdash.service.models import (
     BlockerSeverity,
     CalendarWeeklyWindowCommand,
     DependencyType,
+    PMCommunicationEvidenceType,
     ProcessIdentityMixin,
     ProcessStatus,
     RoleConflictPolicy,
@@ -28,21 +30,6 @@ from projdash.service.models import (
     validate_iana_timezone,
     validate_unique_non_empty,
 )
-
-
-def _validate_topology_finished_at(
-    process: SubgraphProcessCommand | CollapseNewProcessCommand,
-    edit_at,
-) -> None:
-    if process.status == ProcessStatus.DONE:
-        if process.finished_at is None:
-            process.finished_at = edit_at
-            return
-        if process.finished_at > edit_at:
-            raise ValueError("finished_at must be no later than edit_at.")
-        return
-    if process.finished_at is not None:
-        raise ValueError("finished_at is only accepted when status is done.")
 
 
 class CommandModel(StrictModel):
@@ -112,6 +99,14 @@ class DeleteProject(CommandModel):
         return self
 
 
+class DeleteProcess(CommandModel, ProcessIdentityMixin):
+    """Delete a process and clean graph facts that reference it."""
+
+    action: Literal["delete_process"] = "delete_process"
+    project_id: str = Field(min_length=1)
+    edit_at: AwareDatetime
+
+
 class UpsertProcessRevision(CommandModel):
     """Create a process if needed and append a planning revision."""
 
@@ -119,6 +114,7 @@ class UpsertProcessRevision(CommandModel):
     project_id: str = Field(min_length=1)
     process_id: str | None = Field(default=None, min_length=1)
     process_symbol: str | None = Field(default=None, min_length=1)
+    process_type: Literal["standard", "blocker"] = "standard"
     name: str = Field(min_length=1)
     description: str = ""
     effective_at: AwareDatetime
@@ -135,7 +131,6 @@ class UpsertProcessRevision(CommandModel):
         default_factory=list,
         exclude_if=lambda value: not value,
     )
-    staked_resource_ids: list[str] = Field(default_factory=list)
     assumption_note: str | None = None
 
     @field_validator("dependencies")
@@ -144,31 +139,15 @@ class UpsertProcessRevision(CommandModel):
         validate_unique_non_empty(value, "dependencies")
         return list(dict.fromkeys(value))
 
-    @field_validator("staked_resource_ids")
-    @classmethod
-    def _deduplicate_staked_resource_ids(cls, value: list[str]) -> list[str]:
-        validate_unique_non_empty(value, "staked_resource_ids")
-        return list(dict.fromkeys(value))
-
 
 class SetProcessStatus(CommandModel, ProcessIdentityMixin):
-    """Set the project-manager controlled status for a process."""
+    """Validate a legacy lifecycle assertion without storing process state."""
 
     action: Literal["set_process_status"] = "set_process_status"
     project_id: str = Field(min_length=1)
     status: ProcessStatus
     edit_at: AwareDatetime
-    started_at: AwareDatetime | None = None
-    finished_at: AwareDatetime | None = None
     note: str | None = None
-
-    @model_validator(mode="after")
-    def _validate_finished_at_order(self) -> SetProcessStatus:
-        if self.started_at is not None and self.started_at > self.edit_at:
-            raise ValueError("started_at must be no later than edit_at.")
-        if self.finished_at is not None and self.finished_at > self.edit_at:
-            raise ValueError("finished_at must be no later than edit_at.")
-        return self
 
     @property
     def changed_at(self):
@@ -185,6 +164,7 @@ class AddBlocker(CommandModel, ProcessIdentityMixin):
     summary: str = Field(min_length=1)
     details: str | None = None
     severity: BlockerSeverity = BlockerSeverity.BLOCKING
+    resolution_owner_resource_id: str | None = Field(default=None, min_length=1)
     created_at: AwareDatetime
 
     @property
@@ -206,6 +186,17 @@ class CommitProjectState(CommandModel):
     committed_at: AwareDatetime
     terminal_process_symbols: list[str] = Field(default_factory=list)
     milestone_id: str | None = Field(default=None, min_length=1)
+    resource_schedule_backend: Literal[
+        "greedy",
+        "mcts",
+    ] = "greedy"
+    include_resource_sensitivity: bool = False
+    resource_schedule_sensitivity_backend: Literal[
+        "greedy",
+        "mcts",
+    ] | None = None
+    resource_schedule_sensitivity_workers: PositiveInt | None = None
+    resource_schedule_sensitivity_process_pool: bool = True
     note: str | None = None
 
     @field_validator("terminal_process_symbols")
@@ -258,6 +249,17 @@ class ResolveBlocker(CommandModel):
     blocker_id: str = Field(min_length=1)
     resolved_at: AwareDatetime
     resolution: str | None = None
+    resolution_owner_resource_id: str | None = Field(default=None, min_length=1)
+
+
+class SetBlockerResolutionOwner(CommandModel):
+    """Set or clear the resource responsible for resolving a blocker."""
+
+    action: Literal["set_blocker_resolution_owner"] = "set_blocker_resolution_owner"
+    project_id: str = Field(min_length=1)
+    blocker_id: str = Field(min_length=1)
+    resolution_owner_resource_id: str | None = Field(default=None, min_length=1)
+    edit_at: AwareDatetime
 
 
 class ReopenBlocker(CommandModel):
@@ -410,6 +412,55 @@ class SetResourceCalendar(CommandModel):
     calendar_id: str = Field(min_length=1)
 
 
+class UpsertProcessRolePin(CommandModel, ProcessIdentityMixin):
+    """Pin one process-role to a resource and forecasted completion date."""
+
+    action: Literal["upsert_process_role_pin"] = "upsert_process_role_pin"
+    project_id: str = Field(min_length=1)
+    pin_id: str | None = Field(default=None, min_length=1)
+    requirement_id: str | None = Field(default=None, min_length=1)
+    role_id: str = Field(min_length=1)
+    resource_id: str = Field(min_length=1)
+    pinned_at: AwareDatetime
+    forecast_finish_at: AwareDatetime
+    status: Literal["pinned_started", "pinned_finished"] = "pinned_started"
+    verified_done_at: AwareDatetime | None = None
+    updated_at: AwareDatetime
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_pin(self) -> UpsertProcessRolePin:
+        if self.pinned_at > self.updated_at:
+            raise ValueError("pinned_at must be no later than updated_at.")
+        if self.status == "pinned_finished" and self.verified_done_at is None:
+            raise ValueError("pinned_finished requires verified_done_at.")
+        if self.status == "pinned_started" and self.verified_done_at is not None:
+            raise ValueError("pinned_started must not set verified_done_at.")
+        if (
+            self.verified_done_at is not None
+            and self.verified_done_at < self.pinned_at
+        ):
+            raise ValueError("verified_done_at must be at or after pinned_at.")
+        if (
+            self.verified_done_at is not None
+            and self.verified_done_at > self.updated_at
+        ):
+            raise ValueError("verified_done_at must be no later than updated_at.")
+        if self.verified_done_at is not None:
+            self.forecast_finish_at = self.verified_done_at
+        if self.forecast_finish_at < self.pinned_at:
+            raise ValueError("forecast_finish_at must be at or after pinned_at.")
+        return self
+
+
+class DeleteProcessRolePin(CommandModel):
+    """Unpin a process-role so it returns to planned mode."""
+
+    action: Literal["delete_process_role_pin"] = "delete_process_role_pin"
+    project_id: str = Field(min_length=1)
+    pin_id: str = Field(min_length=1)
+
+
 class UpsertSlackProjectConfig(CommandModel):
     """Create or update optional Slack integration settings for a project."""
 
@@ -429,8 +480,16 @@ class UpdateSlackContinuityNote(CommandModel):
 
     action: Literal["update_slack_continuity_note"] = "update_slack_continuity_note"
     project_id: str = Field(min_length=1)
-    continuity_note: str = Field(min_length=1)
+    continuity_note: str | None = Field(default=None, max_length=4096)
     updated_at: AwareDatetime
+
+    @field_validator("continuity_note")
+    @classmethod
+    def _normalize_continuity_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class SetResourceSlackUser(CommandModel):
@@ -573,6 +632,72 @@ class MarkSlackOutboxSkipped(CommandModel):
     run_id: str | None = Field(default=None, min_length=1)
 
 
+class RecordPMCommunicationEvidence(CommandModel):
+    """Record proof that a sent outbox message satisfied a PM protocol item."""
+
+    action: Literal["record_pm_communication_evidence"] = (
+        "record_pm_communication_evidence"
+    )
+    project_id: str = Field(min_length=1)
+    evidence_id: str | None = Field(default=None, min_length=1)
+    evidence_type: PMCommunicationEvidenceType
+    resource_id: str | None = Field(default=None, min_length=1)
+    teammate_id: str | None = Field(default=None, min_length=1)
+    slack_user_id: str | None = Field(default=None, min_length=1)
+    slack_channel_id: str | None = Field(default=None, min_length=1)
+    process_id: str | None = Field(default=None, min_length=1)
+    process_symbol: str | None = Field(default=None, min_length=1)
+    obligation_id: str | None = Field(default=None, min_length=1)
+    outbox_id: str = Field(min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
+    content_hash: str | None = Field(default=None, min_length=1)
+    communicated_at: AwareDatetime
+    evidence_note: str | None = Field(default=None, min_length=1)
+
+
+class UpsertProcessEvidenceLineItem(CommandModel, ProcessIdentityMixin):
+    """Update PM evidence recency for one process evidence line item."""
+
+    action: Literal["upsert_process_evidence_line_item"] = (
+        "upsert_process_evidence_line_item"
+    )
+    project_id: str = Field(min_length=1)
+    line_item: str = Field(min_length=1)
+    last_modified_at: AwareDatetime | None = None
+    last_evidence_at: AwareDatetime | None = None
+    evidence_note: str | None = Field(default=None, min_length=1)
+    evidence_source: str | None = Field(default=None, min_length=1)
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _validate_evidence_time(self) -> UpsertProcessEvidenceLineItem:
+        if self.last_evidence_at is not None and self.last_evidence_at > self.updated_at:
+            raise ValueError("last_evidence_at must be no later than updated_at.")
+        return self
+
+
+class UpsertResourceEvidenceLineItem(CommandModel):
+    """Update PM evidence recency for one resource evidence line item."""
+
+    action: Literal["upsert_resource_evidence_line_item"] = (
+        "upsert_resource_evidence_line_item"
+    )
+    project_id: str = Field(min_length=1)
+    resource_id: str = Field(min_length=1)
+    line_item: str = Field(min_length=1)
+    last_modified_at: AwareDatetime | None = None
+    last_evidence_at: AwareDatetime | None = None
+    evidence_note: str | None = Field(default=None, min_length=1)
+    evidence_source: str | None = Field(default=None, min_length=1)
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _validate_evidence_time(self) -> UpsertResourceEvidenceLineItem:
+        if self.last_evidence_at is not None and self.last_evidence_at > self.updated_at:
+            raise ValueError("last_evidence_at must be no later than updated_at.")
+        return self
+
+
 class BatchOperationModel(StrictModel):
     """Base batch operation model."""
 
@@ -713,8 +838,6 @@ class SubgraphProcessCommand(CommandModel):
     description: str = ""
     duration_hours: NonNegativeFloat | None = None
     earliest_start_at: AwareDatetime | None = None
-    status: ProcessStatus = ProcessStatus.PLANNED
-    finished_at: AwareDatetime | None = None
     aliases: list[str] = Field(default_factory=list)
     role_requirements: list[RoleRequirementCommand] = Field(default_factory=list)
 
@@ -734,8 +857,6 @@ class SubgraphProcessCommand(CommandModel):
                 float(requirement.effort_hours)
                 for requirement in self.role_requirements
             )
-        if self.status != ProcessStatus.DONE and self.finished_at is not None:
-            raise ValueError("finished_at is only accepted when status is done.")
         return self
 
 
@@ -803,7 +924,7 @@ class ReplaceProcessWithSubgraph(CommandModel):
                 "process_ids",
             )
         for process in self.processes:
-            _validate_topology_finished_at(process, self.edit_at)
+            process._validate_finished_at_status()
         for field_name in ("root_symbols", "leaf_symbols"):
             if field_name in self.model_fields_set and getattr(self, field_name) == []:
                 raise ValueError(
@@ -832,8 +953,6 @@ class CollapseNewProcessCommand(CommandModel):
     description: str = ""
     duration_hours: NonNegativeFloat | None = None
     earliest_start_at: AwareDatetime | None = None
-    status: ProcessStatus = ProcessStatus.PLANNED
-    finished_at: AwareDatetime | None = None
     aliases: list[str] = Field(default_factory=list)
     role_requirements: list[RoleRequirementCommand] = Field(default_factory=list)
 
@@ -844,8 +963,6 @@ class CollapseNewProcessCommand(CommandModel):
 
     @model_validator(mode="after")
     def _validate_finished_at_status(self) -> CollapseNewProcessCommand:
-        if self.status != ProcessStatus.DONE and self.finished_at is not None:
-            raise ValueError("finished_at is only accepted when status is done.")
         return self
 
 
@@ -866,7 +983,7 @@ class CollapseSubgraph(CommandModel):
 
     @model_validator(mode="after")
     def _validate_new_process_finished_at(self) -> CollapseSubgraph:
-        _validate_topology_finished_at(self.new_process, self.edit_at)
+        self.new_process._validate_finished_at_status()
         return self
 
 
@@ -875,6 +992,7 @@ Command = Annotated[
     | SetProjectDefaultCurrency
     | UpdateProject
     | DeleteProject
+    | DeleteProcess
     | UpsertProcessRevision
     | SetProcessStatus
     | CommitProjectState
@@ -882,6 +1000,7 @@ Command = Annotated[
     | SetMilestoneActive
     | AddBlocker
     | ResolveBlocker
+    | SetBlockerResolutionOwner
     | ReopenBlocker
     | RenameProcess
     | AddProcessAliases
@@ -899,6 +1018,8 @@ Command = Annotated[
     | SetResourceActive
     | SetResourceRoles
     | SetResourceCalendar
+    | UpsertProcessRolePin
+    | DeleteProcessRolePin
     | UpsertSlackProjectConfig
     | UpdateSlackContinuityNote
     | SetResourceSlackUser
@@ -911,7 +1032,10 @@ Command = Annotated[
     | MarkSlackOutboxSent
     | MarkSlackOutboxFailed
     | UpdateSlackOutboxBody
-    | MarkSlackOutboxSkipped,
+    | MarkSlackOutboxSkipped
+    | RecordPMCommunicationEvidence
+    | UpsertProcessEvidenceLineItem
+    | UpsertResourceEvidenceLineItem,
     Field(discriminator="action"),
 ]
 

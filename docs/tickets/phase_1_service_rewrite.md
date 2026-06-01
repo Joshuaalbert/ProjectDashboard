@@ -17,7 +17,7 @@
 
 - Add repository protocol.
 - Implement deterministic in-memory repository.
-- Add LadybugDB adapter bootstrap and schema boundary.
+- Add SQLite adapter bootstrap and schema boundary.
 
 ## Ticket 4: Engine Foundation
 

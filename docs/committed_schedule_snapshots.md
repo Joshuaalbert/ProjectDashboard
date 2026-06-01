@@ -14,10 +14,10 @@ processes.
   It is derived from resource calendars, role effort, lifecycle anchors, and
   dependency readiness. Dependency-only CPM is only graph diagnostic metadata.
 - The schedule is rooted at the project `start_at`.
-- When a process has `started_at`, that process is pinned at that datetime:
-  `ES == LS == started_at`. For resource-aware scheduling, its finish is still
-  derived from fulfilled role effort on resource-hour buckets; downstream
-  processes consume that collapsed finish.
+- When a process has process-role pins, the first pin is its actual start. For
+  resource-aware scheduling, pinned process-role finishes come from resource
+  forecasts or verified finish datetimes; planned process-role finishes are
+  derived from role effort on resource-hour buckets.
 - Resource-aware arithmetic is in timezone-aware hour buckets, not business days.
   A useful implementation model is to expand each process role requirement into
   virtual resource-hour bucket demand, sweep project-time buckets breadth-first
@@ -30,12 +30,11 @@ processes.
   arithmetic. `inferred_duration_hours` is the collapsed active scheduled time
   implied by fulfilled resource-hour buckets; start/end datetimes still preserve
   the wall-clock placement across nights, weekends, and holidays.
-- `started_at` is set when a process enters `in_progress` or `paused`. If no
-  explicit `started_at` is supplied, the status edit datetime is used.
-- Marking a process `done` preserves any previous `started_at`; if none exists,
-  the finish datetime is also used as the start anchor.
-- Reopening a process to `planned` clears lifecycle anchors. Canceling preserves
-  an existing anchor if work had started.
+- `started_at` is derived from process-role pins, not from entering
+  `in_progress` or `paused`.
+- Marking a process `done` requires verified finished process-role pins.
+- Reopening or unpinning clears the derived process lifecycle facts that came
+  from those pins.
 
 ## Slippage Points
 

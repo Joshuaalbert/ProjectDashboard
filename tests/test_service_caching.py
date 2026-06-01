@@ -167,11 +167,12 @@ def test_resource_schedule_cache_clears_after_successful_mutating_command():
     _handle(
         service,
         {
-            "action": "set_process_status",
+            "action": "upsert_process_revision",
             "project_id": project_id,
             "process_id": process_id,
-            "status": "in_progress",
-            "edit_at": _iso(13, 13),
+            "name": "Build",
+            "effective_at": _iso(13, 11),
+            "duration_business_days": 2,
         },
     )
     _query(service, {"action": "query_utilization", **_base_query(project_id)})
