@@ -24,9 +24,10 @@ repeat mistakes specific to this project. Keep learnings compact.
   late/active, or soon-starting processes first, then schedule/message-impacting
   attributes, while periodically refreshing further-out work.
 - PM evidence freshness targets are priority-specific: P0 < 1 day old, P1 < 3
-  days old, P2 < 7 days old, and P3 < 14 days old. P0 means pinned or planned
-  start in the past; P1 means planned start in > 0 and < 3 days; P2 means
-  planned start in > 3 and < 7 days; P3 means planned start in > 7 days.
+  days old, P2 < 7 days old, and P3 < 14 days old. P0 means pinned with status
+  `started`, `early_start`, or `due`, or planned start < 3 days; P1 means
+  planned start in >= 3 and < 7 days; P2 means planned start in >= 7 and < 14
+  days; P3 means planned start >= 14 days.
 - PM Slack runs must include both collected Slack messages and unreconciled
   manual notes as evidence; successful runs archive manual notes under
   `reconciled/manual_notes/<run_id>`, while failed runs leave originals

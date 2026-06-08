@@ -3053,62 +3053,173 @@ def _assignment_process_markdown(
     name = process.get("process_name") or "-"
     priority = process.get("priority") or "-"
     status = process.get("status") or "unknown"
-    lines = [f"{index}. *{priority}* `{symbol}` - {name} ({status})"]
-    lines.append(
-        "   Start: "
-        f"{process.get('planned_start_at') or '-'} | Finish: "
-        f"{process.get('planned_finish_at') or '-'}"
+    mode = process.get("mode") or (
+        "pinned" if process.get("active_pin") else "planned"
     )
-    lines.append(
-        "   "
-        f"{_format_assignment_days(process.get('start_buffer_days'))} pre-buffer | "
-        f"{_format_assignment_days(process.get('duration_days'))} duration | "
-        f"{_format_assignment_days(process.get('finish_buffer_days'))} post-buffer"
+    lines = [f"{index}. *{priority}* `{symbol}` - {name}"]
+    lines.extend(
+        [
+            f"   Type: {_assignment_process_type(process.get('process_type'))}",
+            f"   Mode: {mode}",
+            f"   Status: `{status}`",
+            f"   Role requirement: {_assignment_role_requirement(process)}",
+            f"   Effort hours: {_format_assignment_hours(process.get('effort_hours'))}",
+            f"   Definition: {process.get('done_definition') or 'needs confirmation'}",
+            f"   Parents: {_assignment_braced_symbols(process.get('predecessors'))}",
+            f"   Children: {_assignment_braced_symbols(process.get('successors'))}",
+        ]
     )
-    if process.get("started_at"):
-        started_delta = _format_assignment_delta(
-            process.get("started_at"),
-            process.get("planned_start_at"),
+    if mode == "pinned":
+        lines.extend(_assignment_pinned_lines(process, resource_name))
+    else:
+        lines.extend(
+            [
+                f"   Assigned to: {process.get('assigned_to') or resource_name}",
+                (
+                    "   Planned start: "
+                    f"{_format_assignment_datetime(process.get('planned_start_at'))}"
+                ),
+                (
+                    "   Planned finish: "
+                    f"{_format_assignment_datetime(process.get('planned_finish_at'))}"
+                ),
+                (
+                    "   "
+                    f"{_format_assignment_days(process.get('start_buffer_days'))} "
+                    "pre-buffer | "
+                    f"{_format_assignment_days(process.get('duration_days'))} duration | "
+                    f"{_format_assignment_days(process.get('finish_buffer_days'))} "
+                    "post-buffer"
+                ),
+            ]
         )
-        lines.append(
-            "   Started: "
-            f"{started_delta}"
-        )
-    if process.get("finished_at"):
-        finished_delta = _format_assignment_delta(
-            process.get("finished_at"),
-            process.get("planned_finish_at"),
-        )
-        lines.append(
-            "   Finished: "
-            f"{finished_delta}"
-        )
-    role_text = ", ".join(f"`{role_id}`" for role_id in process.get("role_ids", []))
-    if role_text:
-        if process.get("ownership_evidence_state") == "needs_owner_confirmation":
-            lines.append(
-                "   Planned resource (needs owner confirmation): "
-                f"{resource_name} -> {role_text}"
-            )
-        else:
-            lines.append(f"   Planned resource: {resource_name} -> {role_text}")
-    if process.get("message_caveat"):
-        lines.append(f"   Note: {process['message_caveat']}")
-    if process.get("active_pin"):
-        lines.append(
-            "   Pinned since "
-            f"{process.get('pin_started_at') or '-'}"
-        )
-    blockers = process.get("blockers") or []
-    if blockers:
-        blocker_text = "; ".join(
-            str(blocker.get("summary") or blocker.get("blocker_id") or "blocker")
-            for blocker in blockers
-        )
-        lines.append(f"   Blockers: {blocker_text}")
-    if process.get("done_definition"):
-        lines.append(f"   Done: {process['done_definition']}")
     return "\n".join(lines)
+
+
+def _assignment_process_type(value: Any) -> str:
+    process_type = str(value or "standard")
+    return "normal" if process_type == "standard" else process_type
+
+
+def _assignment_role_requirement(process: dict[str, Any]) -> str:
+    role_text = process.get("role_label")
+    if not role_text:
+        role_text = ", ".join(
+            f"`{role_id}`" for role_id in process.get("role_ids", [])
+        )
+    if not role_text:
+        role_text = "-"
+    requirement_id = process.get("role_requirement_id")
+    if requirement_id:
+        return f"{role_text} | {requirement_id}"
+    return str(role_text)
+
+
+def _format_assignment_hours(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    display_value = int(hours) if hours.is_integer() else round(hours, 1)
+    unit = "hour" if abs(hours - 1) < 0.0001 else "hours"
+    return f"{display_value} {unit}"
+
+
+def _assignment_braced_symbols(value: Any) -> str:
+    if not value:
+        return "{}"
+    if isinstance(value, str):
+        symbols = [value]
+    elif isinstance(value, (list, tuple, set)):
+        symbols = [str(item) for item in value if item]
+    else:
+        symbols = [str(value)]
+    unique = sorted(dict.fromkeys(symbols))
+    return "{" + ", ".join(unique) + "}" if unique else "{}"
+
+
+def _assignment_pinned_lines(
+    process: dict[str, Any],
+    resource_name: str,
+) -> list[str]:
+    pin_history = [
+        pin
+        for pin in process.get("pin_history") or []
+        if isinstance(pin, dict)
+    ]
+    pinned_starts = [
+        parsed
+        for parsed in (
+            _maybe_datetime(pin.get("pinned_at") or pin.get("starts_at"))
+            for pin in pin_history
+        )
+        if parsed is not None
+    ]
+    verified_finishes = [
+        parsed
+        for parsed in (
+            _maybe_datetime(
+                pin.get("verified_finished_at")
+                or pin.get("verified_done_at")
+                or pin.get("ends_at")
+            )
+            for pin in pin_history
+        )
+        if parsed is not None
+    ]
+    forecast_finishes = [
+        parsed
+        for parsed in (
+            _maybe_datetime(pin.get("forecast_finish_at"))
+            for pin in pin_history
+        )
+        if parsed is not None
+    ]
+    pinned_started_at = (
+        min(pinned_starts) if pinned_starts else process.get("pin_started_at")
+    )
+    lines = [
+        f"   Pinned to: {process.get('assigned_to') or resource_name}",
+        (
+            "   Pinned started: "
+            f"{_format_assignment_datetime(pinned_started_at)}"
+        ),
+    ]
+    has_unverified = any(
+        not (
+            pin.get("verified_finished_at")
+            or pin.get("verified_done_at")
+            or pin.get("ends_at")
+        )
+        for pin in pin_history
+    )
+    if has_unverified or not verified_finishes:
+        forecast_finish_at = (
+            max(forecast_finishes)
+            if forecast_finishes
+            else process.get("pin_forecast_finish_at")
+        )
+        lines.append(
+            "   Forecasted finish: "
+            f"{_format_assignment_datetime(forecast_finish_at)}"
+        )
+    else:
+        lines.append(
+            "   Verified finish: "
+            f"{_format_assignment_datetime(max(verified_finishes))}"
+        )
+    return lines
+
+
+def _format_assignment_datetime(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    parsed = _maybe_datetime(value)
+    if parsed is None:
+        return str(value)
+    return parsed.strftime("%Y-%m-%d %H:%M %Z")
 
 
 def _format_assignment_days(value: Any) -> str:

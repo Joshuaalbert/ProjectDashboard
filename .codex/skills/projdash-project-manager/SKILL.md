@@ -273,10 +273,11 @@ also asked to reconcile notes.
 
 Report:
 
-- P0 work: processes past planned finish.
-- P1 work: processes past planned start.
-- P2 work: processes starting within the near planning window.
-- P3 watchlist: later upcoming processes.
+- P0 work: pinned processes with status `started`, `early_start`, or `due`, or
+  planned processes starting within 3 days.
+- P1 work: planned processes starting in 3 to 7 days.
+- P2 work: planned processes starting in 7 to 14 days.
+- P3 watchlist: planned processes starting 14 or more days out.
 - Current blockers, blocker owners if known, and the next unblock action.
 - Makespan-sensitive processes, inferred durations, and estimate uncertainty.
 - Active milestone slippage and the likely reason for movement.

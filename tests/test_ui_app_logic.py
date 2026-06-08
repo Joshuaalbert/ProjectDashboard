@@ -10,10 +10,12 @@ from projdash.ui.app import (
     _blocker_sections,
     _capacity_buckets_for_display,
     _commit_project_state_payload,
+    _completed_process_rows,
     _context_terminal_symbols,
     _decrypt_slack_token_for_ui,
     _dependency_set_operations,
     _encrypt_slack_token_for_ui,
+    _enrich_priority_rows,
     _ensure_resource_schedule,
     _load_context,
     _normalize_slack_users,
@@ -24,8 +26,8 @@ from projdash.ui.app import (
     _priority_markdown,
     _priority_process_markdown,
     _process_child_symbols,
-    _process_role_revision_command,
     _process_revision_defaults_signature,
+    _process_role_revision_command,
     _project_context_markdown,
     _recover_orphaned_slack_run,
     _render_gantt_chart,
@@ -315,13 +317,77 @@ def test_priority_process_markdown_matches_pm_context_shape_without_sensitivity(
     assert "- Role requirement: Engineer (`role_eng`) | `req-a`" in markdown
     assert "- Effort hours: 8 hours" in markdown
     assert "- Definition: Acceptance checklist is complete." in markdown
-    assert "- Parents: `{P}`" in markdown
-    assert "- Children: `{C}`" in markdown
+    assert "- Parents: {P}" in markdown
+    assert "- Children: {C}" in markdown
     assert "- Assigned to: Ada (`res-ada`) for Engineer (`role_eng`)" in markdown
     assert "- Planned start: 2026-05-13 09:00 UTC" in markdown
     assert "- Planned finish: 2026-05-13 17:00 UTC" in markdown
     assert "pre-buffer" in markdown
     assert "Sensitivity" not in markdown
+
+
+def test_enrich_priority_rows_derives_topology_from_graph_edges():
+    graph = {
+        "nodes": [
+            {
+                "process_id": "proc-parent",
+                "process_symbol": "P",
+                "name": "Parent",
+            },
+            {
+                "process_id": "proc-a",
+                "process_symbol": "A",
+                "name": "Task A",
+                "process_type": "standard",
+                "computed_status": "early_start",
+                "description": "Acceptance checklist is complete.",
+                "role_requirements": [
+                    {
+                        "requirement_id": "req-a",
+                        "role_id": "role_eng",
+                        "effort_hours": 8,
+                    }
+                ],
+            },
+            {
+                "process_id": "proc-child",
+                "process_symbol": "C",
+                "name": "Child",
+            },
+        ],
+        "edges": [
+            {
+                "predecessor_process_symbol": "P",
+                "successor_process_symbol": "A",
+            },
+            {
+                "predecessor_process_symbol": "A",
+                "successor_process_symbol": "C",
+            },
+        ],
+    }
+    rows = [
+        {
+            "priority": "P0",
+            "process_id": "proc-a",
+            "process_symbol": "A",
+            "process_name": "Task A",
+            "planned_start_at": "2026-05-13T09:00:00+00:00",
+            "planned_finish_at": "2026-05-13T17:00:00+00:00",
+        }
+    ]
+
+    enriched = _enrich_priority_rows(rows, graph, {"blockers": []})
+
+    assert enriched[0]["predecessors"] == ["P"]
+    assert enriched[0]["successors"] == ["C"]
+    markdown = _priority_process_markdown(
+        enriched[0],
+        "UTC",
+        role_labels={"role_eng": "Engineer (`role_eng`)"},
+    )
+    assert "- Parents: {P}" in markdown
+    assert "- Children: {C}" in markdown
 
 
 def test_priority_process_markdown_shows_pin_mode_fields():
@@ -458,6 +524,48 @@ def test_process_child_symbols_returns_sorted_unique_children():
     assert _process_child_symbols(graph, "A") == ["B", "C"]
 
 
+def test_completed_process_rows_excludes_resource_priority_processes():
+    graph = {
+        "nodes": [
+            {
+                "process_id": "proc-done",
+                "process_symbol": "done-process",
+                "name": "Done process",
+                "computed_status": "finished",
+                "process_type": "standard",
+                "description": "Done definition.",
+                "role_requirements": [
+                    {
+                        "requirement_id": "req-done",
+                        "role_id": "role_eng",
+                        "effort_hours": 1,
+                    }
+                ],
+                "resource_aware": {
+                    "starts_at": "2026-05-13T09:00:00+00:00",
+                    "ends_at": "2026-05-13T10:00:00+00:00",
+                },
+            },
+            {
+                "process_id": "proc-visible",
+                "process_symbol": "visible-process",
+                "computed_status": "finished",
+            },
+            {
+                "process_id": "proc-ready",
+                "process_symbol": "ready-process",
+                "computed_status": "ready",
+            },
+        ]
+    }
+
+    rows = _completed_process_rows(graph, {"visible-process"})
+
+    assert [row["process_symbol"] for row in rows] == ["done-process"]
+    assert rows[0]["completed_group"] == "finished"
+    assert rows[0]["priority"] == "Done"
+
+
 def test_process_revision_defaults_signature_ignores_volatile_as_of_time():
     aggregate = {
         "process_symbols": ["A", "B"],
@@ -550,8 +658,6 @@ def test_priority_markdown_filters_and_formats_priority_fields():
                 "hours_until_planned_finish": 16,
                 "effort_hours": 4,
                 "role_id": "role_qa",
-                "pin_started_at": dt.datetime(2026, 5, 13, 3, tzinfo=dt.UTC),
-                "finished_at": dt.datetime(2026, 5, 14, 21, tzinfo=dt.UTC),
                 "planned_assignments": [
                     {
                         "resource_id": "res_grace",
@@ -569,12 +675,14 @@ def test_priority_markdown_filters_and_formats_priority_fields():
 
     assert "### Role `role_qa`" in markdown
     assert "#### P3 | B | Build" in markdown
-    assert "Start: 2026-05-13 09:00 UTC | Finish: 2026-05-14 09:00 UTC" in markdown
+    assert "- Type: normal" in markdown
+    assert "- Mode: planned" in markdown
+    assert "- Planned start: 2026-05-13 09:00 UTC" in markdown
+    assert "- Planned finish: 2026-05-14 09:00 UTC" in markdown
     assert "0.25 days pre-buffer | 1 day duration | 1 day post-buffer" in markdown
-    assert "Planned resource: Grace (`res_grace`) for QA (`role_qa`)" in markdown
-    assert "Effort: 4 hours" in markdown
-    assert "Pin: `pinned_started`; pinned 2026-05-13 03:00 UTC" in markdown
-    assert "Finished: 0.5 days late" in markdown
+    assert "- Assigned to: Grace (`res_grace`) for QA (`role_qa`)" in markdown
+    assert "- Effort hours: 4 hours" in markdown
+    assert "- Pinned started:" not in markdown
     assert "role_eng" not in markdown
     assert "`A`" not in markdown
 
@@ -596,7 +704,8 @@ def test_priority_markdown_formats_on_time_started_and_finished_as_early():
                 "effort_hours": 2,
                 "role_id": "role_eng",
                 "pin_started_at": planned_start_at,
-                "finished_at": planned_finish_at,
+                "pin_status": "pinned_finished",
+                "pin_verified_done_at": planned_finish_at,
             },
         ],
         "role_id",
@@ -604,8 +713,9 @@ def test_priority_markdown_formats_on_time_started_and_finished_as_early():
         id_label="Role",
     )
 
-    assert "Pin: `pinned_started`; pinned 2026-05-13 09:00 UTC" in markdown
-    assert "Finished: 0 days early" in markdown
+    assert "- Mode: pinned" in markdown
+    assert "- Pinned started: 2026-05-13 09:00 UTC" in markdown
+    assert "- Verified finish: 2026-05-13 17:00 UTC" in markdown
 
 
 def test_priority_expander_sections_group_selected_entities():

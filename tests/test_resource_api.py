@@ -461,10 +461,10 @@ def test_pm_markdown_context_includes_process_evidence_line_items():
     }
     assert evidence_by_item["blockers"]["verification_state"] == "current"
     assert evidence_by_item["blockers"]["evidence_source"] == "slack:D1:123"
-    assert evidence_by_item["blockers"]["process_priority"] == "P1"
-    assert evidence_by_item["blockers"]["target_evidence_age_days"] == 3
+    assert evidence_by_item["blockers"]["process_priority"] == "P0"
+    assert evidence_by_item["blockers"]["target_evidence_age_days"] == 1
     assert evidence_by_item["blockers"]["target_evidence_age_label"] == (
-        "< 3 days old"
+        "< 1 day old"
     )
     assert evidence_by_item["blockers"]["evidence_age_exceeds_target"] is False
     assert evidence_by_item["blockers"]["evidence_is_stale"] is False
@@ -504,7 +504,10 @@ def test_pm_markdown_context_includes_process_evidence_line_items():
     assert (
         "Staleness targets: P0 < 1 day, P1 < 3 days, P2 < 7 days, P3 < 14 days"
     ) in markdown
-    assert "where P0=planned with planned start in the past or pinned" in markdown
+    assert (
+        "where P0=pinned with status started, early_start, or due, "
+        "or planned with planned start < 3 days"
+    ) in markdown
     assert (
         "process-api.blockers last modified 0.08 days ago, "
         "last evidence that it's correct 0.04 days ago."
@@ -589,7 +592,9 @@ def test_pm_evidence_freshness_targets_follow_process_priority():
         ("process-past", _iso(13, 9), 0),
         ("process-two-days-out", _iso(15, 14), 1),
         ("process-five-days-out", _iso(18, 12), 1),
+        ("process-ten-days-out", _iso(24, 12), 1),
         ("process-later", _iso(30, 12), 1),
+        ("process-done", _iso(13, 8), 1),
     ):
         _handle(
             service,
@@ -630,6 +635,23 @@ def test_pm_evidence_freshness_targets_follow_process_priority():
             "updated_at": _iso(13, 13),
         },
     )
+    _handle(
+        service,
+        {
+            "action": "upsert_process_role_pin",
+            "project_id": project_id,
+            "pin_id": "pin-done-eng",
+            "process_id": "process-done",
+            "requirement_id": "req-process-done-eng",
+            "role_id": role_id,
+            "resource_id": "resource-ada",
+            "pinned_at": _iso(13, 10),
+            "forecast_finish_at": _iso(13, 12),
+            "status": "pinned_finished",
+            "verified_done_at": _iso(13, 12),
+            "updated_at": _iso(13, 13),
+        },
+    )
 
     result = _query(
         service,
@@ -650,14 +672,20 @@ def test_pm_evidence_freshness_targets_follow_process_priority():
     assert plan_data_rows["process-past"]["target_evidence_age_days"] == 1
     assert plan_data_rows["process-api"]["process_priority"] == "P0"
     assert plan_data_rows["process-api"]["target_evidence_age_days"] == 1
-    assert plan_data_rows["process-two-days-out"]["process_priority"] == "P1"
-    assert plan_data_rows["process-two-days-out"]["target_evidence_age_days"] == 3
-    assert plan_data_rows["process-five-days-out"]["process_priority"] == "P2"
+    assert plan_data_rows["process-two-days-out"]["process_priority"] == "P0"
+    assert plan_data_rows["process-two-days-out"]["target_evidence_age_days"] == 1
+    assert plan_data_rows["process-five-days-out"]["process_priority"] == "P1"
     assert plan_data_rows["process-five-days-out"][
+        "target_evidence_age_days"
+    ] == 3
+    assert plan_data_rows["process-ten-days-out"]["process_priority"] == "P2"
+    assert plan_data_rows["process-ten-days-out"][
         "target_evidence_age_days"
     ] == 7
     assert plan_data_rows["process-later"]["process_priority"] == "P3"
     assert plan_data_rows["process-later"]["target_evidence_age_days"] == 14
+    assert plan_data_rows["process-done"]["process_priority"] is None
+    assert plan_data_rows["process-done"]["target_evidence_age_days"] is None
 
 
 def test_process_role_pin_forecast_controls_finish_and_resource_capacity():
@@ -967,9 +995,12 @@ def test_pm_markdown_context_follows_specified_project_context_shape():
     assert "Planned finish:" in markdown
     assert "Planned finish:" in markdown and "(in " in markdown
     assert "Planned " + "assignments:" not in markdown
-    assert "Priority: P0 planned start in the past or pinned" in markdown
-    assert "P1 planned start > 0 days and < 3 days" in markdown
-    assert "P2 planned start > 3 days and < 7 days" in markdown
+    assert (
+        "Priority: P0 pinned with status started, early_start, or due, "
+        "or planned start < 3 days"
+    ) in markdown
+    assert "P1 planned start >= 3 days and < 7 days" in markdown
+    assert "P2 planned start >= 7 days and < 14 days" in markdown
     assert "Sensitivity: optimal makespan change from adding 1 hour" in markdown
     assert "Sensitivity:" in markdown
     assert "Status: ready" in markdown
@@ -1231,6 +1262,108 @@ def test_agent_context_terminal_scope_filters_blockers_and_accepts_aliases():
         "resolve-docs-review",
         "resolve-ship-approval",
     }
+
+
+def test_agent_context_target_scope_keeps_direct_topology_labels():
+    service = ProjectService(InMemoryProjectRepository())
+    project_id, role_id, _calendar_id, resource_id, process_id = (
+        _seed_allocatable_project(service)
+    )
+    ship_id = _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-ship",
+            "name": "Ship API",
+            "effective_at": _iso(13),
+            "dependencies": [process_id],
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "role_id": role_id,
+                    "effort_hours": 2,
+                }
+            ],
+        },
+    ).entity_ids["process_id"]
+    _handle(
+        service,
+        {
+            "action": "upsert_process_revision",
+            "project_id": project_id,
+            "process_id": "process-docs",
+            "name": "Write Docs",
+            "effective_at": _iso(13),
+            "dependencies": [ship_id],
+            "duration_business_days": 1,
+            "role_requirements": [
+                {
+                    "requirement_id": "req-docs-eng",
+                    "role_id": role_id,
+                    "effort_hours": 1,
+                }
+            ],
+        },
+    )
+    _handle(
+        service,
+        {
+            "action": "upsert_process_role_pin",
+            "project_id": project_id,
+            "pin_id": "pin-ship-eng",
+            "process_id": ship_id,
+            "requirement_id": "process-ship-requirement-1",
+            "role_id": role_id,
+            "resource_id": resource_id,
+            "pinned_at": _iso(13, 13),
+            "forecast_finish_at": _iso(14, 15),
+            "updated_at": _iso(13, 13),
+        },
+    )
+
+    scope = {"type": "target_process", "process_symbol": "process-ship"}
+    result = _query(
+        service,
+        {
+            "action": "query_agent_context",
+            "project_id": project_id,
+            "as_of": _iso(13, 14),
+            "now": _iso(13, 14),
+            "scope": scope,
+        },
+    )
+
+    assert result.ok is True
+    assert result.data["summary"]["edge_count"] == 0
+    node = result.data["graph"]["nodes"][0]
+    assert node["symbol"] == "process-ship"
+    assert node["computed_status"] == "early_start"
+    assert node["predecessors"] == ["process-api"]
+    assert node["successors"] == ["process-docs"]
+    assert node["role_requirements"][0]["requirement_id"] == (
+        "process-ship-requirement-1"
+    )
+
+    markdown_result = _query(
+        service,
+        {
+            "action": "query_pm_markdown_context",
+            "project_id": project_id,
+            "as_of": _iso(13, 14),
+            "now": _iso(13, 14),
+            "scope": scope,
+        },
+    )
+
+    assert markdown_result.ok is True
+    markdown = markdown_result.data["markdown"]
+    assert (
+        "Role requirement: Engineer (role-engineer) | process-ship-requirement-1"
+        in markdown
+    )
+    assert "Parents: {process-api}" in markdown
+    assert "Children: {process-docs}" in markdown
 
 
 def test_agent_context_propagates_resource_schedule_warnings():

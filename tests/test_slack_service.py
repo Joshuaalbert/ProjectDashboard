@@ -1149,6 +1149,20 @@ def test_pm_communication_protocol_requires_process_update_evidence_pair():
     )
     assert "Task A" in process_row["message_blocks"][0]["text"]["text"]
     assert "Acceptance checklist is complete." in process_row["message_markdown"]
+    assert "- Type: normal" in process_row["message_markdown"]
+    assert "- Mode: planned" in process_row["message_markdown"]
+    assert "- Role requirement:" in process_row["message_markdown"]
+    assert "- Effort hours: 8 hours" in process_row["message_markdown"]
+    assert "- Definition: Acceptance checklist is complete." in (
+        process_row["message_markdown"]
+    )
+    assert "- Parents: {}" in process_row["message_markdown"]
+    assert "- Children: {}" in process_row["message_markdown"]
+    assert "- Planned start: 2026-05-22 09:00 UTC" in (
+        process_row["message_markdown"]
+    )
+    assert "Ownership evidence" not in process_row["message_markdown"]
+    assert "Done definition:" not in process_row["message_markdown"]
     assert obligation["message_artifact"]["content_hash"] == process_hash
 
     pre_start_only_id = _handle(

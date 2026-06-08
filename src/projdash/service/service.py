@@ -2698,22 +2698,22 @@ class ProjectService:
                     )
                     inferred_duration_hours = row.get("inferred_duration_hours")
                     node["inferred_duration_hours"] = inferred_duration_hours
-                    normal_dependencies_finished = self._normal_dependencies_finished(
-                        getattr(self._repository, "processes", {}),
-                        node.get("dependencies") or [],
-                        project_id=query.project_id,
-                        as_of=query.as_of,
+                    completedness = self._process_completedness_facts(
+                        query.project_id,
+                        str(node.get("process_id") or ""),
+                        query.as_of,
                     )
-                    node["computed_status"] = self._completedness_status(
-                        started_at=self._parse_datetime(node.get("started_at")),
-                        finished_at=self._parse_datetime(node.get("finished_at")),
-                        normal_dependencies_finished=normal_dependencies_finished,
-                        has_due_process_role=self._process_has_due_pin(
-                            query.project_id,
-                            str(node.get("process_id") or ""),
-                            query.as_of,
-                        ),
+                    node["started_at"] = (
+                        completedness["started_at"].isoformat()
+                        if completedness["started_at"] is not None
+                        else None
                     )
+                    node["finished_at"] = (
+                        completedness["finished_at"].isoformat()
+                        if completedness["finished_at"] is not None
+                        else None
+                    )
+                    node["computed_status"] = str(completedness["status"])
                     node["status"] = node["computed_status"]
                     if planned_start_at is not None and planned_finish_at is not None:
                         node["work_now_window"] = {
@@ -3858,9 +3858,10 @@ class ProjectService:
         lines = [
             "# Processes",
             (
-                "Priority: P0 planned start in the past or pinned; P1 planned "
-                "start > 0 days and < 3 days; P2 planned start > 3 days and "
-                "< 7 days; P3 planned start > 7 days."
+                "Priority: P0 pinned with status started, early_start, or due, "
+                "or planned start < 3 days; P1 planned start >= 3 days and "
+                "< 7 days; P2 planned start >= 7 days and < 14 days; P3 "
+                "planned start >= 14 days."
             ),
             "Type: normal is project work; blocker is a resolver process for one blocker.",
             (
@@ -4035,10 +4036,11 @@ class ProjectService:
             "## Process Evidence",
             "Staleness targets: P0 < 1 day, P1 < 3 days, P2 < 7 days, P3 < 14 days",
             (
-                "where P0=planned with planned start in the past or pinned, "
-                "P1=planned with planned start > 0 days < 3 days, "
-                "P2=planned with planned start > 3 days < 7 days, "
-                "P3=planned with planned start > 7 days."
+                "where P0=pinned with status started, early_start, or due, "
+                "or planned with planned start < 3 days; "
+                "P1=planned with planned start >= 3 days < 7 days; "
+                "P2=planned with planned start >= 7 days < 14 days; "
+                "P3=planned with planned start >= 14 days."
             ),
             "",
             (
@@ -4379,8 +4381,11 @@ class ProjectService:
                 for requirement in requirements
                 if isinstance(requirement, dict)
             )
-            if is_pinned:
+            status = str(node.get("computed_status") or node.get("status") or "")
+            if is_pinned and status in {"started", "early_start", "due"}:
                 priorities[symbol] = "P0"
+                continue
+            if is_pinned:
                 continue
             priority = self._pm_priority_from_schedule_row(
                 schedule_by_symbol.get(symbol, {}),
@@ -4399,11 +4404,11 @@ class ProjectService:
         if planned_start_at is None:
             return None
         time_until_start = planned_start_at - now
-        if time_until_start <= dt.timedelta(0):
-            return "P0"
         if time_until_start < dt.timedelta(days=3):
-            return "P1"
+            return "P0"
         if time_until_start < dt.timedelta(days=7):
+            return "P1"
+        if time_until_start < dt.timedelta(days=14):
             return "P2"
         return "P3"
 
@@ -4701,6 +4706,8 @@ class ProjectService:
             for node in nodes
             if isinstance(node, dict) and (node.get("symbol") or node.get("process_symbol"))
         }
+        role_names = self._pm_context_role_names_by_id(agent_context)
+        resource_names = self._pm_context_resource_names_by_id(agent_context)
         open_blockers_by_process: dict[str, list[dict[str, object]]] = {}
         for blocker in agent_context.get("blockers") or []:
             if not isinstance(blocker, dict) or blocker.get("is_resolved_as_of"):
@@ -4736,6 +4743,8 @@ class ProjectService:
                 symbol = str(process.get("process_symbol") or "")
                 node = nodes_by_symbol.get(symbol, {})
                 process_id = process.get("process_id") or node.get("process_id")
+                requirement = self._pm_context_single_role_requirement(node)
+                role_id = str(requirement.get("role_id") or "") if requirement else ""
                 pin_history = self._pm_resource_pin_history(node, resource_id)
                 planned_start_at = process.get("planned_start_at")
                 planned_finish_at = process.get("planned_finish_at")
@@ -4761,6 +4770,7 @@ class ProjectService:
                     "process_id": process_id,
                     "process_symbol": symbol,
                     "process_name": process.get("process_name") or node.get("name"),
+                    "process_type": node.get("process_type"),
                     "priority": process.get("priority"),
                     "status": process.get("computed_status")
                     or process.get("status")
@@ -4776,13 +4786,27 @@ class ProjectService:
                     "hours_until_planned_finish": process.get(
                         "hours_until_planned_finish"
                     ),
-                    "role_ids": process.get("role_ids") or [],
-                    "effort_hours": process.get("effort_hours"),
+                    "role_ids": process.get("role_ids") or ([role_id] if role_id else []),
+                    "role_label": (
+                        self._pm_context_role_label([role_id], role_names)
+                        if role_id
+                        else self._pm_markdown_list(process.get("role_ids") or [])
+                    ),
+                    "role_requirement_id": (
+                        requirement.get("requirement_id") if requirement else None
+                    ),
+                    "effort_hours": process.get("effort_hours")
+                    or (requirement.get("effort_hours") if requirement else None),
+                    "mode": "pinned" if pin_history else "planned",
                     "active_pin": bool(process.get("active_pin"))
                     or self._pm_resource_has_active_pin(node, resource_id),
                     "pin_started_at": process.get("pin_started_at")
                     or self._pm_resource_pin_started_at(node, resource_id),
                     "pin_history": pin_history,
+                    "assigned_to": self._pm_context_resource_label(
+                        [resource_id],
+                        resource_names,
+                    ),
                     "assignment_certainty": assignment_certainty,
                     "ownership_evidence_state": ownership_evidence_state,
                     "message_caveat": self._pm_assignment_message_caveat(
@@ -4791,6 +4815,8 @@ class ProjectService:
                     ),
                     "blockers": blockers,
                     "done_definition": node.get("description") or None,
+                    "predecessors": node.get("predecessors") or [],
+                    "successors": node.get("successors") or [],
                     "max_makespan_sensitivity_hours": process.get(
                         "max_makespan_sensitivity_hours"
                     ),
@@ -4975,7 +5001,7 @@ class ProjectService:
         if revision is None:
             raise ServiceValidationError(
                 code="process_revision_not_found",
-                message="Process-role pins require a process revision.",
+                message="Process pins require a process revision.",
                 entity_id=process_id,
             )
         matches: list[tuple[str, str]] = []
@@ -5253,12 +5279,20 @@ class ProjectService:
             "process_id": process_row.get("process_id"),
             "process_symbol": process_row.get("process_symbol"),
             "process_name": process_row.get("process_name"),
+            "process_type": process_row.get("process_type"),
             "priority": process_row.get("priority"),
+            "mode": process_row.get("mode"),
             "status": process_row.get("status"),
             "planned_start_at": process_row.get("planned_start_at"),
             "planned_finish_at": process_row.get("planned_finish_at"),
+            "assigned_to": process_row.get("assigned_to"),
             "role_ids": process_row.get("role_ids"),
+            "role_label": process_row.get("role_label"),
+            "role_requirement_id": process_row.get("role_requirement_id"),
             "effort_hours": process_row.get("effort_hours"),
+            "pin_history": process_row.get("pin_history"),
+            "predecessors": process_row.get("predecessors"),
+            "successors": process_row.get("successors"),
             "blockers": process_row.get("blockers"),
             "done_definition": process_row.get("done_definition"),
             "last_modified_at": process_row.get("last_modified_at"),
@@ -5480,56 +5514,154 @@ class ProjectService:
         return blocks
 
     def _pm_process_detail_lines(self, process: dict[str, object]) -> list[str]:
+        mode = str(
+            process.get("mode")
+            or ("pinned" if process.get("active_pin") else "planned")
+        )
+        role_line = str(
+            process.get("role_label")
+            or self._pm_markdown_list(process.get("role_ids"))
+        )
+        requirement_id = process.get("role_requirement_id")
+        if requirement_id:
+            role_line = f"{role_line} | {requirement_id}"
         lines = [
-            (
-                "- Planned start: "
-                f"{self._pm_markdown_datetime(process.get('planned_start_at'))}"
-                " | planned finish: "
-                f"{self._pm_markdown_datetime(process.get('planned_finish_at'))}"
-            ),
-            f"- Schedule window: {self._pm_schedule_window_line(process)}",
-            f"- Process role: {self._pm_markdown_list(process.get('role_ids'))}",
-            f"- Effort: {self._pm_format_hours(process.get('effort_hours'))}",
+            f"- Type: {self._pm_process_type_label(process.get('process_type'))}",
+            f"- Mode: {mode}",
         ]
         status = process.get("status")
         if status:
             lines.append(f"- Status: `{status}`")
-        if process.get("active_pin"):
-            lines.append(
-                "- Pinned since "
-                f"{self._pm_markdown_datetime(process.get('pin_started_at'))}"
-            )
-        caveat = process.get("message_caveat")
-        if caveat:
-            lines.append(f"- Ownership evidence: {caveat}")
-        blockers = [
-            blocker
-            for blocker in process.get("blockers") or []
-            if isinstance(blocker, dict)
-        ]
-        if blockers:
-            lines.append("- Blockers:")
-            for blocker in blockers:
-                severity = blocker.get("severity") or "blocking"
-                symbol = (
-                    blocker.get("blocker_symbol")
-                    or blocker.get("resolver_process_symbol")
-                    or self._blocker_resolver_symbol(
-                        str(blocker.get("blocker_id") or "")
-                    )
-                )
-                summary = blocker.get("summary") or "Unspecified blocker"
-                details = blocker.get("details")
-                line = f"  - `{severity}` `{symbol}` {summary}"
-                if details:
-                    line += f" - {details}"
-                lines.append(line)
-        done_definition = process.get("done_definition")
-        if done_definition:
-            lines.append(f"- Done definition: {done_definition}")
         else:
-            lines.append("- Done definition: needs confirmation")
+            lines.append("- Status: `unknown`")
+        lines.extend(
+            [
+                f"- Role requirement: {role_line}",
+                f"- Effort hours: {self._pm_format_hours(process.get('effort_hours'))}",
+                (
+                    "- Definition: "
+                    f"{process.get('done_definition') or 'needs confirmation'}"
+                ),
+                (
+                    "- Parents: "
+                    f"{self._pm_context_braced_symbols(process.get('predecessors'))}"
+                ),
+                (
+                    "- Children: "
+                    f"{self._pm_context_braced_symbols(process.get('successors'))}"
+                ),
+            ]
+        )
+        if mode == "pinned":
+            lines.extend(self._pm_process_pinned_detail_lines(process))
+        else:
+            lines.extend(
+                [
+                    f"- Assigned to: {process.get('assigned_to') or '-'}",
+                    (
+                        "- Planned start: "
+                        f"{self._pm_human_datetime(process.get('planned_start_at'))}"
+                    ),
+                    (
+                        "- Planned finish: "
+                        f"{self._pm_human_datetime(process.get('planned_finish_at'))}"
+                    ),
+                    f"- {self._pm_schedule_window_line(process)}",
+                ]
+            )
         return lines
+
+    def _pm_process_pinned_detail_lines(
+        self,
+        process: dict[str, object],
+    ) -> list[str]:
+        pin_history = [
+            pin
+            for pin in process.get("pin_history") or []
+            if isinstance(pin, dict)
+        ]
+        resource_ids = [
+            str(pin.get("resource_id"))
+            for pin in pin_history
+            if pin.get("resource_id")
+        ]
+        pinned_starts = [
+            parsed
+            for parsed in (
+                self._parse_datetime(pin.get("pinned_at") or pin.get("starts_at"))
+                for pin in pin_history
+            )
+            if parsed is not None
+        ]
+        verified_finishes = [
+            parsed
+            for parsed in (
+                self._parse_datetime(
+                    pin.get("verified_finished_at")
+                    or pin.get("verified_done_at")
+                    or pin.get("ends_at")
+                )
+                for pin in pin_history
+            )
+            if parsed is not None
+        ]
+        forecast_finishes = [
+            parsed
+            for parsed in (
+                self._parse_datetime(pin.get("forecast_finish_at"))
+                for pin in pin_history
+            )
+            if parsed is not None
+        ]
+        pinned_to = process.get("assigned_to")
+        if resource_ids:
+            unique_resource_ids = sorted(dict.fromkeys(resource_ids))
+            if len(unique_resource_ids) == 1 and process.get("assigned_to"):
+                pinned_to = process.get("assigned_to")
+            else:
+                pinned_to = ", ".join(unique_resource_ids)
+        pinned_started_at = (
+            min(pinned_starts) if pinned_starts else process.get("pin_started_at")
+        )
+        lines = [
+            f"- Pinned to: {pinned_to or '-'}",
+            (
+                "- Pinned started: "
+                f"{self._pm_human_datetime(pinned_started_at)}"
+            ),
+        ]
+        has_unverified = any(
+            not (
+                pin.get("verified_finished_at")
+                or pin.get("verified_done_at")
+                or pin.get("ends_at")
+            )
+            for pin in pin_history
+        )
+        if has_unverified or not verified_finishes:
+            forecast_finish_at = (
+                max(forecast_finishes)
+                if forecast_finishes
+                else process.get("pin_forecast_finish_at")
+            )
+            lines.append(
+                "- Forecasted finish: "
+                f"{self._pm_human_datetime(forecast_finish_at)}"
+            )
+        else:
+            lines.append(
+                "- Verified finish: "
+                f"{self._pm_human_datetime(max(verified_finishes))}"
+            )
+        return lines
+
+    def _pm_human_datetime(self, value: object) -> str:
+        if value in (None, ""):
+            return "-"
+        parsed = self._parse_datetime(value)
+        if parsed is None:
+            return str(value)
+        return parsed.strftime("%Y-%m-%d %H:%M %Z")
 
     def _pm_schedule_window_line(self, process: dict[str, object]) -> str:
         start_buffer_hours = self._pm_duration_hours(
@@ -6515,8 +6647,8 @@ class ProjectService:
         }
 
     def _agent_graph_context(self, graph: dict[str, object]) -> dict[str, object]:
-        predecessors: dict[str, list[str]] = defaultdict(list)
-        successors: dict[str, list[str]] = defaultdict(list)
+        scoped_predecessors: dict[str, list[str]] = defaultdict(list)
+        scoped_successors: dict[str, list[str]] = defaultdict(list)
         process_symbols = {
             str(node.get("process_symbol")) for node in graph.get("nodes", [])
         }
@@ -6530,8 +6662,8 @@ class ProjectService:
             ):
                 continue
             if predecessor and successor:
-                predecessors[str(successor)].append(str(predecessor))
-                successors[str(predecessor)].append(str(successor))
+                scoped_predecessors[str(successor)].append(str(predecessor))
+                scoped_successors[str(predecessor)].append(str(successor))
             edges.append(
                 {
                     "predecessor": predecessor,
@@ -6539,10 +6671,31 @@ class ProjectService:
                     "dependency_type": edge.get("dependency_type"),
                 }
             )
+        project_id = str(graph.get("project_id") or "")
+        as_of = self._parse_datetime(graph.get("as_of"))
+        process_ids = [
+            str(node.get("process_id"))
+            for node in graph.get("nodes", [])
+            if node.get("process_id")
+        ]
+        topology = None
+        if project_id and as_of is not None:
+            topology = self._agent_direct_topology_symbols(
+                project_id,
+                as_of,
+                set(process_ids),
+            )
         nodes = []
         for node in graph.get("nodes", []):
             resource = node.get("resource_aware") or {}
             symbol = str(node.get("process_symbol"))
+            process_id = str(node.get("process_id") or "")
+            if topology is None:
+                predecessors = sorted(scoped_predecessors.get(symbol, []))
+                successors = sorted(scoped_successors.get(symbol, []))
+            else:
+                predecessors = sorted(topology["predecessors"].get(process_id, []))
+                successors = sorted(topology["successors"].get(process_id, []))
             nodes.append(
                 {
                     "process_id": node.get("process_id"),
@@ -6554,8 +6707,8 @@ class ProjectService:
                     "status": node.get("status"),
                     "computed_status": node.get("computed_status"),
                     "blocker_summary": node.get("blocker_summary"),
-                    "predecessors": sorted(predecessors.get(symbol, [])),
-                    "successors": sorted(successors.get(symbol, [])),
+                    "predecessors": predecessors,
+                    "successors": successors,
                     "role_requirements": node.get("role_requirements") or [],
                     "assumption_note": node.get("assumption_note"),
                     "earliest_start_at": node.get("earliest_start_at"),
@@ -6589,6 +6742,52 @@ class ProjectService:
                 }
             )
         return {"nodes": nodes, "edges": edges}
+
+    def _agent_direct_topology_symbols(
+        self,
+        project_id: str,
+        as_of: dt.datetime,
+        process_ids: set[str],
+    ) -> dict[str, dict[str, list[str]]]:
+        active_ids = set(self._repository.active_process_ids_as_of(project_id, as_of))
+        processes = getattr(self._repository, "processes", {})
+        predecessors: dict[str, set[str]] = defaultdict(set)
+        successors: dict[str, set[str]] = defaultdict(set)
+        for successor_id in active_ids:
+            revision = self._repository.selected_revision_as_of(
+                project_id,
+                successor_id,
+                as_of,
+            )
+            if revision is None:
+                continue
+            for predecessor_id in revision.dependencies:
+                if predecessor_id not in active_ids:
+                    continue
+                predecessor_symbol = getattr(
+                    processes.get(predecessor_id),
+                    "symbol",
+                    predecessor_id,
+                )
+                successor_symbol = getattr(
+                    processes.get(successor_id),
+                    "symbol",
+                    successor_id,
+                )
+                if successor_id in process_ids:
+                    predecessors[successor_id].add(str(predecessor_symbol))
+                if predecessor_id in process_ids:
+                    successors[predecessor_id].add(str(successor_symbol))
+        return {
+            "predecessors": {
+                process_id: sorted(symbols)
+                for process_id, symbols in predecessors.items()
+            },
+            "successors": {
+                process_id: sorted(symbols)
+                for process_id, symbols in successors.items()
+            },
+        }
 
     def _agent_schedule_context(self, graph: dict[str, object]) -> dict[str, object]:
         rows = []
@@ -8571,7 +8770,7 @@ class ProjectService:
             elif pin_row.get("done_resource_ids"):
                 pin_status = "pinned_finished"
             item = {
-                "requirement_id": requirement_id,
+                "requirement_id": resolved_requirement_id,
                 "role_id": requirement.role_id,
                 "effort_hours": self._clean_number(requirement.effort_hours),
                 "pin_status": pin_status,

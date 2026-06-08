@@ -68,9 +68,10 @@ blockers, so I will not touch blockers and will update evidence".
 
 ## Process Evidence
 Staleness targets: P0 < 1 day, P1 < 3 days, P2 < 7 days, P3 < 14 days
-where P0=planned with planned start in the past or pinned, P1=planned with
-planned start > 0 days < 3 days, P2=planned with planned start > 3 days < 7
-days, P3=planned with planned start > 7 days.
+where P0=pinned with status `started`, `early_start`, or `due`, or planned
+with planned start < 3 days; P1=planned with planned start >= 3 days and < 7
+days; P2=planned with planned start >= 7 days and < 14 days; P3=planned with
+planned start >= 14 days.
 
 `blockers`: do we have accurate knowledge of things blocking the process's
 normal completion as well as ensuring those blocker-type processes are getting

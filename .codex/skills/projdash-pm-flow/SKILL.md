@@ -107,9 +107,10 @@ relying on stale assumptions. Use these priority-specific freshness targets:
 - P2 evidence should target < 7 days old.
 - P3 evidence should target < 14 days old.
 
-P0 means a process is pinned or planned with a planned start in the past. P1
-means a planned process starts in > 0 and < 3 days. P2 means a planned process
-starts in > 3 and < 7 days. P3 means a planned process starts in > 7 days.
+P0 means a process is pinned with status `started`, `early_start`, or `due`, or
+planned with planned start < 3 days. P1 means a planned process starts in >= 3
+and < 7 days. P2 means a planned process starts in >= 7 and < 14 days. P3 means
+a planned process starts in >= 14 days.
 
 Prioritize stale evidence in this order:
 
