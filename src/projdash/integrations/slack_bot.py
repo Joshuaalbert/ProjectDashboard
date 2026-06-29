@@ -231,8 +231,12 @@ def _iter_slack_block_text(value: Any) -> Iterable[str]:
             yield from _iter_slack_block_text(item)
 
 
-def _validate_slack_blocks(value: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Validate Block Kit shape and teammate-facing visible text."""
+def _validate_slack_blocks(
+    value: list[dict[str, Any]],
+    *,
+    validate_visible_text: bool = True,
+) -> list[dict[str, Any]]:
+    """Validate Block Kit shape and optionally teammate-facing visible text."""
     if len(value) > 50:
         raise ValueError("Slack messages may contain at most 50 blocks.")
     for index, block in enumerate(value):
@@ -243,9 +247,10 @@ def _validate_slack_blocks(value: list[dict[str, Any]]) -> list[dict[str, Any]]:
         json.dumps(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("Slack blocks must be JSON-serializable.") from exc
-    for text in _iter_slack_block_text(value):
-        if text.strip():
-            _validate_teammate_message_text(text)
+    if validate_visible_text:
+        for text in _iter_slack_block_text(value):
+            if text.strip():
+                _validate_teammate_message_text(text)
     return value
 
 
@@ -285,7 +290,7 @@ def _blocks_for_draft(message_markdown: str) -> list[dict[str, Any]]:
         if paragraph.strip() == "---":
             blocks.append({"type": "divider"})
             if len(blocks) >= 50:
-                return _validate_slack_blocks(blocks)
+                return _validate_slack_blocks(blocks, validate_visible_text=False)
             continue
         lines = paragraph.splitlines()
         heading_match = re.match(r"^(#{1,3})\s+(.+)$", lines[0].strip())
@@ -306,7 +311,7 @@ def _blocks_for_draft(message_markdown: str) -> list[dict[str, Any]]:
                     }
                 )
             if len(blocks) >= 50:
-                return _validate_slack_blocks(blocks)
+                return _validate_slack_blocks(blocks, validate_visible_text=False)
             paragraph = "\n".join(lines[1:]).strip()
             if not paragraph:
                 continue
@@ -318,8 +323,8 @@ def _blocks_for_draft(message_markdown: str) -> list[dict[str, Any]]:
                 }
             )
             if len(blocks) >= 50:
-                return _validate_slack_blocks(blocks)
-    return _validate_slack_blocks(blocks)
+                return _validate_slack_blocks(blocks, validate_visible_text=False)
+    return _validate_slack_blocks(blocks, validate_visible_text=False)
 
 
 def _continuity_note_storage_text(note: SlackContinuityNote | str) -> str:
